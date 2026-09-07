@@ -1,6 +1,6 @@
 ---
 name: cc-usr-question-author
-description: Create a named SQLite-backed batch of repository-based, first-turn 0-1 Coding Agent questions from 项目规范.md, including working folders and a review Markdown file. Do not score model output or analyze trajectories.
+description: Create a named SQLite-backed batch of repository-based, first-turn 0-1 Coding Agent questions from 项目规范.md, including working folders, published GitHub snapshots, and a review Markdown file. Do not score model output or analyze trajectories.
 ---
 
 # CC USR Question Author
@@ -27,7 +27,7 @@ Turn the user's batch name, question count, and authoring requirements into one 
 
 ## Batch creation
 
-The user does not create folders or JSON. Build an internal temporary spec matching the contract, then run:
+The user supplies only the batch name, question count, and authoring requirements. Do not ask the user to create folders, JSON, GitHub repositories, commits, or snapshot links. Build an internal temporary spec matching the contract, then run:
 
 ```bash
 python3 tools/batch_pipeline.py --db production.sqlite3 create-batch \
@@ -36,4 +36,16 @@ python3 tools/batch_pipeline.py --db production.sqlite3 create-batch \
 
 The command creates `<批次名>/`, exactly N question workspaces, and `<批次名>/题目_<批次名>.md`. Prompts and metadata live only in SQLite; do not write prompt files into workspaces. Remove only the temporary spec you created after successful import.
 
-Run mechanical question QC after creation and report every blocked item. A missing accessible GitHub commit permalink remains blocking. Do not mark semantic QC as passed unless you actually performed the repository-based review, and do not record human approval yourself.
+## Publish initial snapshots
+
+Before mechanical QC, complete all of the following for every question without handing steps back to the user:
+
+1. Prepare the intended initial scaffold in its question folder. Ensure `.gitignore` excludes credentials and local environment files, then commit the complete clean baseline.
+2. Create a dedicated repository under the authenticated GitHub account, add it as `origin`, and push the baseline without force-pushing. Use a collision-free repository name tied to the batch and question.
+3. Verify the remote is accessible to the evaluation team and that its default branch resolves to the exact local `HEAD`. A private personal repository is not acceptable.
+4. Build the immutable commit permalink from that 40-character SHA and register it with `tools/batch_pipeline.py set-repo`.
+5. Re-read the SQLite row and verify `repo_url`, `initial_snapshot`, and `local_initial_sha` agree. Do not modify the baseline after registration; any necessary change requires a new normal commit, push, and snapshot registration before QC.
+
+If GitHub authentication, repository creation, push, or accessibility verification fails, keep the question `BLOCKED` and report the concrete blocker. Never claim the batch is complete or ready while any question lacks its published snapshot.
+
+Run mechanical question QC only after every snapshot is registered, then report every blocked item. Do not mark duplicate QC as passed unless you actually performed that review, and do not launch a target model.
