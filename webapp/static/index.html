@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>CC USR 生产控制台</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="主导航">
+      <div class="brand">
+        <div class="brand-mark">CC</div>
+        <div><strong>USR Console</strong><span>用户满意度生产台</span></div>
+      </div>
+      <nav class="nav-list">
+        <button class="nav-item active" data-view="production"><i data-lucide="list-checks"></i><span>生产批次</span></button>
+        <button class="nav-item" data-view="records"><i data-lucide="database"></i><span>交付记录</span></button>
+        <button class="nav-item" data-view="exports"><i data-lucide="file-spreadsheet"></i><span>导出中心</span></button>
+      </nav>
+      <div class="sidebar-status">
+        <span class="status-dot"></span>
+        <div><strong>本地数据已连接</strong><span>production.sqlite3</span></div>
+      </div>
+    </aside>
+
+    <main class="main-content">
+      <header class="page-header">
+        <div>
+          <p class="eyebrow">Coding Agent 用户满意度</p>
+          <h1 id="page-title">生产批次</h1>
+          <p id="page-subtitle">从题目质检到 Excel 交付，状态直接来自本地生产库。</p>
+        </div>
+        <div class="header-meta">
+          <span id="last-updated">尚未刷新</span>
+          <button class="icon-button" id="refresh-button" title="刷新数据" aria-label="刷新数据"><i data-lucide="refresh-cw"></i></button>
+        </div>
+      </header>
+
+      <section class="batch-toolbar" aria-label="批次工具栏">
+        <label class="batch-select-wrap">
+          <span>当前批次</span>
+          <select id="batch-select" aria-label="选择批次"></select>
+        </label>
+        <div class="summary-chips" id="summary-chips"></div>
+        <div class="toolbar-actions">
+          <button class="button secondary" id="open-batch"><i data-lucide="folder-open"></i>打开目录</button>
+          <button class="button secondary" id="qc-check"><i data-lucide="shield-check"></i>复检记录</button>
+          <button class="button primary" id="export-button"><i data-lucide="file-down"></i>导出 Excel</button>
+        </div>
+      </section>
+
+      <section class="pipeline-band" aria-label="生产阶段">
+        <div class="pipeline-track" id="pipeline-track"></div>
+        <div class="selection-bar">
+          <label class="check-label"><input type="checkbox" id="select-all"><span>全选</span></label>
+          <span class="selected-count" id="selected-count">已选 0 道</span>
+          <span class="bar-spacer"></span>
+          <button class="button secondary" id="workflow-button"><i data-lucide="copy"></i>复制当前阶段指令</button>
+          <button class="button danger" id="launch-button" disabled><i data-lucide="play"></i>启动模型</button>
+        </div>
+      </section>
+
+      <section class="list-controls">
+        <div class="search-box"><i data-lucide="search"></i><input id="search-input" type="search" placeholder="搜索题目、任务编号或技术栈" autocomplete="off"></div>
+        <div class="filter-tabs" id="filter-tabs">
+          <button class="filter-tab active" data-filter="all">全部</button>
+          <button class="filter-tab" data-filter="pending">待处理</button>
+          <button class="filter-tab" data-filter="passed">质检通过</button>
+          <button class="filter-tab" data-filter="delivered">已交付</button>
+        </div>
+        <span class="result-count" id="result-count"></span>
+      </section>
+
+      <section class="table-panel" aria-label="题目列表">
+        <div class="table-scroll">
+          <table>
+            <thead>
+              <tr>
+                <th class="select-column"><span class="sr-only">选择</span></th>
+                <th>题目</th>
+                <th>当前阶段</th>
+                <th>模型运行</th>
+                <th>交付记录</th>
+                <th>交付质检</th>
+                <th class="action-column">操作</th>
+              </tr>
+            </thead>
+            <tbody id="question-rows"></tbody>
+          </table>
+        </div>
+        <div class="empty-state" id="empty-state" hidden>
+          <i data-lucide="inbox"></i>
+          <strong>没有符合条件的题目</strong>
+          <span>调整搜索词或筛选条件后再试。</span>
+        </div>
+      </section>
+
+      <section class="export-view" id="export-view" hidden>
+        <div class="section-heading"><div><h2>交付文件</h2><p>按生成时间查看工作簿和原始轨迹副本。</p></div></div>
+        <div class="file-list" id="file-list"></div>
+      </section>
+    </main>
+  </div>
+
+  <div class="drawer-backdrop" id="drawer-backdrop" hidden></div>
+  <aside class="detail-drawer" id="detail-drawer" aria-labelledby="drawer-title" aria-hidden="true" inert>
+    <div class="drawer-header">
+      <div><span id="drawer-task-id"></span><h2 id="drawer-title">题目详情</h2></div>
+      <button class="icon-button" id="drawer-close" title="关闭" aria-label="关闭"><i data-lucide="x"></i></button>
+    </div>
+    <div class="drawer-body" id="drawer-body"></div>
+  </aside>
+
+  <div class="modal-backdrop" id="modal-backdrop" hidden>
+    <section class="confirm-modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <div class="modal-icon"><i data-lucide="alert-circle"></i></div>
+      <h2 id="modal-title">确认操作</h2>
+      <p id="modal-description"></p>
+      <div class="modal-actions">
+        <button class="button secondary" id="modal-cancel">取消</button>
+        <button class="button danger" id="modal-confirm">确认</button>
+      </div>
+    </section>
+  </div>
+
+  <div class="toast-region" id="toast-region" aria-live="polite"></div>
+  <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>
