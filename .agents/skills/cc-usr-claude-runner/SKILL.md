@@ -1,16 +1,16 @@
 ---
 name: cc-usr-claude-runner
-description: Select approved SQLite batch question numbers and launch separate interactive Claude Code sessions in their working folders through iTerm2 using the root .env connection settings. Not for scoring, trajectory inspection, or Excel export.
+description: Select QC-passed SQLite batch question numbers and launch separate interactive Claude Code sessions in their working folders through iTerm2 using the root .env connection settings. Not for scoring, trajectory inspection, or Excel export.
 ---
 
 # CC USR Claude Runner
 
-Launch approved questions without exposing relay credentials or altering prompts.
+Launch QC-passed questions without exposing relay credentials or altering prompts.
 
 ## Preconditions
 
 - Read `项目规范.md` and [references/operator-guide.md](references/operator-guide.md).
-- The selected SQLite question must pass mechanical and semantic question QC, retain the QC prompt fingerprint, and have explicit human approval.
+- The selected SQLite question must pass mechanical and duplicate question QC and retain the QC prompt fingerprint. A duplicate-QC pass is sufficient for `READY`; no separate human approval is required.
 - Root `.env` must contain the relay URL, model name, and key used for this batch.
 - Claude Code and iTerm2 must be available.
 

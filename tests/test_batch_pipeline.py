@@ -1,8 +1,10 @@
+import io
 import json
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 
@@ -10,7 +12,6 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from tools.batch_pipeline import (  # noqa: E402
-    approve_questions,
     check_duplicates,
     connect,
     create_batch,
@@ -145,7 +146,7 @@ class BatchPipelineTests(unittest.TestCase):
             self.assertFalse((root / "0911").exists())
             connection.close()
 
-    def test_qc_and_human_approval_make_question_ready(self):
+    def test_qc_pass_makes_question_ready_without_human_approval(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             connection = connect(root / "production.sqlite3")
@@ -159,15 +160,18 @@ class BatchPipelineTests(unittest.TestCase):
                 f"https://github.com/example/project-1/commit/{row['local_initial_sha']}",
             )
             self.assertEqual(run_mechanical_qc(connection, "0911", "1"), 0)
-            set_semantic_qc(connection, "0911", "1", "pass", "人工查看仓库证据后建议通过")
-            approve_questions(connection, "0911", "1", "reviewer")
+            set_semantic_qc(connection, "0911", "1", "pass", "ignored pass detail")
             row = connection.execute("SELECT * FROM questions").fetchone()
             self.assertEqual(row["status"], "approved")
             self.assertEqual(row["mechanical_qc"], "pass")
             self.assertEqual(row["qc_decision"], "pass")
             self.assertEqual(row["qc_report"], "质检通过")
             self.assertEqual(row["qc_prompt_sha256"], prompt_hash(row["prompt"]))
-            self.assertEqual(row["human_approved"], 1)
+            self.assertEqual(row["human_approved"], 0)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                list_questions(connection, "0911")
+            self.assertIn("READY", output.getvalue())
             connection.close()
 
     def test_mechanical_qc_blocks_missing_snapshot(self):

@@ -17,9 +17,9 @@ Read the duplicate-question rules in `项目规范.md` and [references/qc-rubric
 2. Run the read-only duplicate check with `python3 tools/batch_pipeline.py --db production.sqlite3 duplicate-check --batch <批次> --select <题号或区间>`. It compares the selection with every question in SQLite, including other batches.
 3. Review the prompt pairs semantically for noun-swapped templates, repeated sentence structure, and substantially identical business flows that numeric similarity may miss.
 4. Store the duplicate-review result with `qc-set`. When no duplicate is found, use `--decision pass --report '质检通过'` exactly; do not put metrics or explanations in a passing report. When duplicates are found, use `revise` or `reject` and record the concrete matching task IDs and evidence. If the separate mechanical gate has not passed, report that prerequisite instead of broadening this review.
-5. Give the human reviewer the prompts and concrete duplicate evidence. Do not run `approve` unless the human explicitly states that they reviewed and approved the selected questions.
+5. A passing `qc-set` makes the question immediately `READY` when mechanical QC and the prompt fingerprint are current. This skill only updates readiness; it does not launch Claude Code.
 
-Any prompt edit invalidates prior duplicate QC. Re-run the comparison. A duplicate-QC pass is only a recommendation; human approval remains a separate gate.
+Any prompt edit invalidates prior duplicate QC and makes the question `BLOCKED`. Re-run the comparison to restore `READY`.
 
 ## Decision rules
 

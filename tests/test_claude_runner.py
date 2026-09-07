@@ -70,8 +70,8 @@ class RunnerTests(unittest.TestCase):
         row = connection.execute("SELECT * FROM questions").fetchone()
         connection.execute(
             "UPDATE questions SET mechanical_qc='pass', qc_decision='pass', "
-            "qc_prompt_sha256=?, human_approved=1, human_reviewer='tester', "
-            "approved_at='2026-09-07T10:00:00+08:00', status='approved' WHERE id=?",
+            "qc_prompt_sha256=?, human_approved=0, human_reviewer='', "
+            "approved_at='', status='approved' WHERE id=?",
             (prompt_hash(row["prompt"]), row["id"]),
         )
         connection.commit()

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""List and launch approved SQLite-backed questions in Claude Code through iTerm2."""
+"""List and launch QC-passed SQLite-backed questions in Claude Code through iTerm2."""
 
 from __future__ import annotations
 
@@ -43,7 +43,6 @@ def is_ready(row: sqlite3.Row) -> bool:
     return bool(
         row["mechanical_qc"] == "pass"
         and row["qc_decision"] == "pass"
-        and row["human_approved"]
         and row["qc_prompt_sha256"] == prompt_hash(row["prompt"])
         and row["status"] == "approved"
     )
@@ -51,7 +50,9 @@ def is_ready(row: sqlite3.Row) -> bool:
 
 def validate_question(row: sqlite3.Row) -> Path:
     if not is_ready(row):
-        raise ValueError(f"{row['task_id']}: question is not QC-passed and human-approved")
+        raise ValueError(
+            f"{row['task_id']}: question is not QC-passed with a current prompt fingerprint"
+        )
     folder = Path(row["folder_path"])
     if not folder.is_absolute() or not folder.is_dir():
         raise ValueError(f"{row['task_id']}: workspace folder does not exist")

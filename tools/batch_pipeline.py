@@ -344,7 +344,13 @@ def render_batch(connection: sqlite3.Connection, batch: str) -> Path:
         "> 本文件用于人工查看，production.sqlite3 是唯一数据源。", "",
     ]
     for row in questions:
-        approval = "已批准" if row["human_approved"] else "待人工批准"
+        current = row["qc_prompt_sha256"] == prompt_hash(row["prompt"])
+        ready = (
+            row["mechanical_qc"] == "pass"
+            and row["qc_decision"] == "pass"
+            and row["status"] == "approved"
+            and current
+        )
         lines.extend([
             f"## {row['question_no']}. {row['title']}", "",
             f"- 任务 ID：`{row['task_id']}`",
@@ -354,7 +360,7 @@ def render_batch(connection: sqlite3.Connection, batch: str) -> Path:
             f"- 语言/框架：{row['languages']}",
             f"- 机械质检：{row['mechanical_qc']}",
             f"- 出题质检：{row['qc_decision']}",
-            f"- 人工批准：{approval}", "", "### User Prompt", "", row["prompt"], "", "---", "",
+            f"- 启动状态：{'READY' if ready else 'BLOCKED'}", "", "### User Prompt", "", row["prompt"], "", "---", "",
         ])
     path = Path(batch_data["markdown_path"])
     path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
@@ -633,7 +639,8 @@ def set_semantic_qc(
             "human_approved=0, human_reviewer='', approved_at='', status=?, updated_at=? WHERE id=?",
             (
                 decision, report_text, prompt_hash(row["prompt"]),
-                "rejected" if decision == "reject" else "draft", now(), row["id"],
+                "approved" if decision == "pass" else ("rejected" if decision == "reject" else "draft"),
+                now(), row["id"],
             ),
         )
     connection.commit()
@@ -696,7 +703,6 @@ def list_batches(connection: sqlite3.Connection) -> None:
         ready = sum(
             question["mechanical_qc"] == "pass"
             and question["qc_decision"] == "pass"
-            and bool(question["human_approved"])
             and question["status"] == "approved"
             and question["qc_prompt_sha256"] == prompt_hash(question["prompt"])
             for question in question_rows(connection, row["name"])
@@ -709,7 +715,7 @@ def list_questions(connection: sqlite3.Connection, batch: str) -> None:
         current = row["qc_prompt_sha256"] == prompt_hash(row["prompt"])
         ready = (
             row["mechanical_qc"] == "pass" and row["qc_decision"] == "pass"
-            and bool(row["human_approved"]) and row["status"] == "approved" and current
+            and row["status"] == "approved" and current
         )
         mark = "READY" if ready else "BLOCKED"
         print(f"{row['question_no']:>3}  {mark:<7}  {row['task_id']:<14}  {row['title']}  [{row['folder_name']}]")

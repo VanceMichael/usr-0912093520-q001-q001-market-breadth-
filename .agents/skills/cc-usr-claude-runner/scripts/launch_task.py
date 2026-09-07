@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Load one approved SQLite question and exec Claude Code in its workspace."""
+"""Load one QC-passed SQLite question and exec Claude Code in its workspace."""
 
 from __future__ import annotations
 
@@ -132,11 +132,10 @@ def main() -> int:
         if not (
             question["mechanical_qc"] == "pass"
             and question["qc_decision"] == "pass"
-            and question["human_approved"]
             and question["status"] in {"approved", "running"}
             and question["qc_prompt_sha256"] == prompt_hash(question["prompt"])
         ):
-            raise ValueError("question is no longer approved for production")
+            raise ValueError("question is no longer QC-passed with a current prompt fingerprint")
         folder = Path(question["folder_path"]).resolve(strict=True)
         if not folder.is_dir():
             raise ValueError("question workspace is not a directory")
