@@ -9,3 +9,5 @@ A question passes this skill when all of these duplicate checks pass:
 - The state transitions, entities, constraints, and acceptance evidence do not describe substantially the same task in different words.
 
 Task type, 0-1 intent, difficulty, banned topics, repository validity, snapshots, acceptance coverage, and reproducibility are intentionally outside this skill. Authoring checks, mechanical checks, duplicate review, and human approval remain separate gates.
+
+When all duplicate checks pass, store the report text exactly as `质检通过`. Only failed reviews carry detailed duplicate evidence.

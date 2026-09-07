@@ -622,6 +622,8 @@ def set_semantic_qc(
         raise ValueError("decision must be pass, revise, or reject")
     if not report_text.strip():
         raise ValueError("semantic QC report must contain concrete evidence")
+    if decision == "pass":
+        report_text = "质检通过"
     rows = parse_selection(selection, question_rows(connection, batch))
     for row in rows:
         if decision == "pass" and row["mechanical_qc"] != "pass":

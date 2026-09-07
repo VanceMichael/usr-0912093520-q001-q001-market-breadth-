@@ -16,7 +16,7 @@ Read the duplicate-question rules in `项目规范.md` and [references/qc-rubric
 1. List a batch with `python3 tools/batch_pipeline.py --db production.sqlite3 list --batch <批次>`.
 2. Run the read-only duplicate check with `python3 tools/batch_pipeline.py --db production.sqlite3 duplicate-check --batch <批次> --select <题号或区间>`. It compares the selection with every question in SQLite, including other batches.
 3. Review the prompt pairs semantically for noun-swapped templates, repeated sentence structure, and substantially identical business flows that numeric similarity may miss.
-4. Store the duplicate-review result with `qc-set --decision pass|revise|reject --report '<具体重复证据或无重复证据>'`. A pass records the current prompt fingerprint. If the separate mechanical gate has not passed, report that prerequisite instead of broadening this review.
+4. Store the duplicate-review result with `qc-set`. When no duplicate is found, use `--decision pass --report '质检通过'` exactly; do not put metrics or explanations in a passing report. When duplicates are found, use `revise` or `reject` and record the concrete matching task IDs and evidence. If the separate mechanical gate has not passed, report that prerequisite instead of broadening this review.
 5. Give the human reviewer the prompts and concrete duplicate evidence. Do not run `approve` unless the human explicitly states that they reviewed and approved the selected questions.
 
 Any prompt edit invalidates prior duplicate QC. Re-run the comparison. A duplicate-QC pass is only a recommendation; human approval remains a separate gate.
@@ -28,3 +28,4 @@ Any prompt edit invalidates prior duplicate QC. Re-run the comparison. A duplica
 - Reject same-repository questions whose similarity-tag Jaccard overlap is at least 75%.
 - Reject noun-swapped templates and substantially identical business flows even when the numeric thresholds do not trigger.
 - Do not judge or reject based on task type, 0-1 intent, difficulty, prohibited topic, repository contents, snapshot accessibility, acceptance coverage, or reproducibility. Those belong to authoring and mechanical gates, not this duplicate-only skill.
+- A passing QC report must contain exactly `质检通过`. Keep detailed comparison metrics in the execution output, not in the stored pass remark.

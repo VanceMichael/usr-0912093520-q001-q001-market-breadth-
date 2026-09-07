@@ -165,6 +165,7 @@ class BatchPipelineTests(unittest.TestCase):
             self.assertEqual(row["status"], "approved")
             self.assertEqual(row["mechanical_qc"], "pass")
             self.assertEqual(row["qc_decision"], "pass")
+            self.assertEqual(row["qc_report"], "质检通过")
             self.assertEqual(row["qc_prompt_sha256"], prompt_hash(row["prompt"]))
             self.assertEqual(row["human_approved"], 1)
             connection.close()
