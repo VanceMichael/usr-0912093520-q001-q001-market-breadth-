@@ -4,6 +4,7 @@
   "session_id": "test-session-001",
   "turn_id": "test-turn-001",
   "initial_snapshot": "https://github.com/example/repository/commit/0123456789abcdef0123456789abcdef01234567",
+  "trajectory_file": "test-session-001.jsonl",
   "reproducibility": "无外部依赖",
   "harness": "Claude Code",
   "harness_version": "codex-cli 0.153.1",
@@ -27,5 +28,9 @@
   "submitted_at": "2026-09-07T19:30:00+08:00",
   "parent_record": "",
   "human_authored": true,
-  "human_qc_approved": true
+  "human_qc_approved": true,
+  "delivery_qc_passed": true,
+  "delivery_qc_note": "质检通过",
+  "delivery_qc_checked_at": "2026-09-07T19:35:00+08:00",
+  "delivery_qc_changes": "[]"
 }

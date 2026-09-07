@@ -1,7 +1,7 @@
 interface:
   display_name: "用户满意度交付质检"
-  short_description: "机械检查字段、枚举、轮次、快照、重复记录及同会话环境一致性"
-  default_prompt: "使用 $cc-usr-delivery-qc 对指定 SQLite 批次执行交付结构质检。"
+  short_description: "检查并修正批次交付字段，复检通过后记录质检通过"
+  default_prompt: "使用 $cc-usr-delivery-qc 质检指定批次的全部交付记录，修正所有可核验的不合规字段，复检通过后记录质检通过；不要导出 Excel。"
 
 policy:
   allow_implicit_invocation: true

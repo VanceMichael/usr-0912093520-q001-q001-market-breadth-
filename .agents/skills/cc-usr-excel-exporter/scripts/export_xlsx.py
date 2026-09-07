@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Fill the official CC_Codex template from approved SQLite records."""
+"""Export QC-passed delivery records and their original trajectory files."""
 
 from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import sqlite3
 import sys
 import tempfile
@@ -16,7 +17,12 @@ from xml.etree import ElementTree as ET
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from tools.batch_pipeline import connect  # noqa: E402
+from tools.batch_pipeline import (  # noqa: E402
+    batch_row,
+    connect,
+    parse_selection,
+    question_rows,
+)
 from tools.delivery_records import (  # noqa: E402
     EXPORT_HEADERS as HEADERS,
     EXPORT_KEYS as KEYS,
@@ -42,9 +48,10 @@ def column_name(index: int) -> str:
 def worksheet_path(template: Path) -> str:
     with zipfile.ZipFile(template) as archive:
         workbook = ET.fromstring(archive.read("xl/workbook.xml"))
-        sheet = workbook.find(f"{{{NS_MAIN}}}sheets/{{{NS_MAIN}}}sheet[@name='数据表']")
-        if sheet is None:
-            raise ValueError("template is missing worksheet 数据表")
+        sheets = workbook.findall(f"{{{NS_MAIN}}}sheets/{{{NS_MAIN}}}sheet")
+        if len(sheets) != 1 or sheets[0].attrib.get("name") != "数据表":
+            raise ValueError("template must contain only the 数据表 worksheet")
+        sheet = sheets[0]
         relationship_id = sheet.attrib[f"{{{NS_REL}}}id"]
         rels = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
         relationship = rels.find(f"{{{NS_PKG_REL}}}Relationship[@Id='{relationship_id}']")
@@ -89,30 +96,31 @@ def build_sheet(template: Path, sheet_path: str, records: list[dict]) -> bytes:
     header_cells = rows[0].findall(f"{{{NS_MAIN}}}c")
     actual_headers = [cell_text(cell) for cell in header_cells]
     if actual_headers != HEADERS:
-        raise ValueError("template headers do not match the required 25-column contract")
+        raise ValueError("template headers do not match the required 27-column contract")
     for row in rows[1:]:
         sheet_data.remove(row)
     for row_index, record in enumerate(records, start=2):
         row = ET.SubElement(sheet_data, f"{{{NS_MAIN}}}row", {"r": str(row_index)})
         for column_index, key in enumerate(KEYS, start=1):
-            value = record[key]
+            # The uploaded trajectory URL is filled manually after submission.
+            value = "" if key == "trajectory_file" else record[key]
             if key == "languages" and isinstance(value, list):
                 value = ", ".join(str(item) for item in value)
             reference = f"{column_name(column_index)}{row_index}"
             row.append(make_cell(reference, value, key in SCORE_KEYS))
     dimension = root.find(f"{{{NS_MAIN}}}dimension")
     if dimension is not None:
-        dimension.set("ref", f"A1:Y{len(records) + 1}")
+        dimension.set("ref", f"A1:{column_name(len(KEYS))}{len(records) + 1}")
     ET.register_namespace("", NS_MAIN)
     ET.register_namespace("r", NS_REL)
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
 
-def export(template: Path, output: Path, records: list[dict], force: bool) -> None:
+def export(template: Path, output: Path, records: list[dict]) -> None:
     if template.resolve() == output.resolve():
         raise ValueError("output must not overwrite the template")
-    if output.exists() and not force:
-        raise FileExistsError(f"output exists: {output}; use --force to replace it")
+    if output.exists():
+        raise FileExistsError(f"output exists: {output}")
     sheet_path = worksheet_path(template)
     sheet_xml = build_sheet(template, sheet_path, records)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -138,39 +146,140 @@ def export(template: Path, output: Path, records: list[dict], force: bool) -> No
             temporary.unlink()
 
 
+def question_label(numbers: list[int]) -> str:
+    if not numbers:
+        raise ValueError("cannot build a file name without question numbers")
+    ranges: list[str] = []
+    start = previous = numbers[0]
+    for number in numbers[1:]:
+        if number == previous + 1:
+            previous = number
+            continue
+        ranges.append(str(start) if start == previous else f"{start}-{previous}")
+        start = previous = number
+    ranges.append(str(start) if start == previous else f"{start}-{previous}")
+    return "第" + "_".join(ranges) + "题"
+
+
+def unique_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    for suffix in range(2, 10_000):
+        candidate = path.with_name(f"{path.stem}_{suffix}{path.suffix}")
+        if not candidate.exists():
+            return candidate
+    raise ValueError(f"too many existing exports for {path.name}")
+
+
+def trajectory_sources(claude_root: Path, records: list[dict]) -> list[tuple[int, Path]]:
+    requested: dict[tuple[int, str, str], None] = {}
+    for record in records:
+        requested[(
+            int(record["question_no"]),
+            str(record["session_id"]),
+            str(record["trajectory_file"]),
+        )] = None
+    by_name: dict[str, list[Path]] = {}
+    for path in claude_root.rglob("*.jsonl"):
+        if path.is_file():
+            by_name.setdefault(path.name, []).append(path)
+    located: list[tuple[int, Path]] = []
+    for question_no, session_id, filename in requested:
+        candidates = sorted(by_name.get(filename, []))
+        if not candidates:
+            raise FileNotFoundError(
+                f"trajectory not found for question {question_no}: {filename}"
+            )
+        exact = [path for path in candidates if path.stem == session_id]
+        if exact:
+            candidates = exact
+        if len(candidates) != 1:
+            raise ValueError(
+                f"trajectory is ambiguous for question {question_no}: {filename}"
+            )
+        located.append((question_no, candidates[0]))
+    return located
+
+
+def copy_trajectories(
+    sources: list[tuple[int, Path]], batch: str, batch_directory: Path
+) -> list[Path]:
+    copied: list[Path] = []
+    for question_no, source in sources:
+        destination = unique_path(
+            batch_directory / f"轨迹_{batch}_第{question_no}题_{source.name}"
+        )
+        shutil.copy2(source, destination)
+        copied.append(destination)
+    return copied
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--db", type=Path, default=Path("production.sqlite3"))
     parser.add_argument("--batch", required=True)
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--select", help="question numbers, for example 1,3-5")
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--claude-root", type=Path, default=Path.home() / ".claude/projects")
     parser.add_argument(
         "--template", type=Path,
         default=Path(__file__).resolve().parent.parent / "assets" / "CC_Codex 用户满意度标注（试标）.xlsx",
     )
-    parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
     try:
         template = args.template.resolve()
         if not template.is_file():
             raise FileNotFoundError(f"template not found: {template}")
         connection = connect(args.db.resolve())
-        records = load_database_records(
-            connection, args.batch, only_human_approved=True
-        )
+        batch = batch_row(connection, args.batch)
+        records = load_database_records(connection, args.batch)
+        if args.select:
+            selected_questions = parse_selection(
+                args.select, question_rows(connection, args.batch)
+            )
+            selected_numbers = {
+                int(question["question_no"]) for question in selected_questions
+            }
+            records = [
+                record for record in records
+                if int(record["question_no"]) in selected_numbers
+            ]
+            missing = selected_numbers - {
+                int(record["question_no"]) for record in records
+            }
+            if missing:
+                missing_text = ", ".join(str(number) for number in sorted(missing))
+                raise ValueError(f"selected questions have no delivery records: {missing_text}")
         connection.close()
         if not records:
-            raise ValueError(f"batch has no human-QC-approved records: {args.batch}")
-        errors, warnings = validate_records(records, require_human_qc=True)
+            raise ValueError(f"batch has no delivery records: {args.batch}")
+        errors, warnings = validate_records(records, require_delivery_qc=True)
         if errors:
-            raise ValueError("approved records failed structural QC: " + "; ".join(errors))
+            raise ValueError("QC-passed records failed export validation: " + "; ".join(errors))
         if warnings:
-            raise ValueError("approved records have unresolved warnings: " + "; ".join(warnings))
-        output = args.output.resolve()
-        export(template, output, records, args.force)
+            raise ValueError("QC-passed records have unresolved warnings: " + "; ".join(warnings))
+        numbers = sorted({int(record["question_no"]) for record in records})
+        batch_directory = Path(batch["folder_path"]).resolve()
+        if not batch_directory.is_dir():
+            raise FileNotFoundError(f"batch directory not found: {batch_directory}")
+        if args.output:
+            output = args.output.resolve()
+            if output.parent != batch_directory:
+                raise ValueError("output must be placed directly in the batch directory")
+        else:
+            output = unique_path(
+                batch_directory
+                / f"CC_Codex 用户满意度标注（{args.batch}-{question_label(numbers)}）.xlsx"
+            )
+        sources = trajectory_sources(args.claude_root.resolve(), records)
+        export(template, output, records)
+        trajectories = copy_trajectories(sources, args.batch, batch_directory)
     except (OSError, ValueError, sqlite3.Error) as exc:
         print(f"Export failed: {exc}", file=sys.stderr)
         return 1
     print(f"Exported {len(records)} records to {output}")
+    for trajectory in trajectories:
+        print(f"Exported trajectory: {trajectory}")
     print("Duplicate record IDs: 0; duplicate SessionID + TurnID pairs: 0")
     return 0
 

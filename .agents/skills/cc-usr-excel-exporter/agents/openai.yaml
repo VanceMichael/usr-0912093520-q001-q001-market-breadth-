@@ -1,7 +1,7 @@
 interface:
   display_name: "用户满意度 Excel 导出"
-  short_description: "将质检通过的逐轮记录按 25 列官方模板生成最终交付 Excel"
-  default_prompt: "使用 $cc-usr-excel-exporter 将指定 SQLite 批次中已通过质检的记录导出为最终 Excel。"
+  short_description: "导出质检通过的 27 列工作簿和对应原始轨迹"
+  default_prompt: "使用 $cc-usr-excel-exporter 将指定批次中交付质检通过的记录导出为全新的 27 列 Excel，并把对应原始轨迹复制到批次根目录。"
 
 policy:
   allow_implicit_invocation: true

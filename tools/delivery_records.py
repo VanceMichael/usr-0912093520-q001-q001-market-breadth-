@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import sqlite3
 from collections import Counter, defaultdict
@@ -27,20 +28,20 @@ SNAPSHOT_RE = re.compile(
 
 EXPORT_HEADERS = [
     "User Prompt", "SessionID", "TurnID/PromptID", "初始环境快照",
-    "环境可复现等级", "Harness", "Harness 版本", "操作系统", "任务类型",
-    "任务难度", "语言/框架", "交付完整性", "交付完整性 - 描述",
+    "轨迹文件", "环境可复现等级", "Harness", "Harness 版本", "操作系统",
+    "任务类型", "任务难度", "语言/框架", "交付完整性", "交付完整性 - 描述",
     "指令遵循", "指令遵循 - 描述", "任务规划", "任务规划 - 描述",
     "推理能力", "推理能力 - 描述", "执行能力", "执行能力 - 描述",
-    "其他问题", "提交人", "提交时间", "父记录",
+    "其他问题", "提交人", "提交时间", "父记录", "审核备注",
 ]
 EXPORT_KEYS = [
     "user_prompt", "session_id", "turn_id", "initial_snapshot",
-    "reproducibility", "harness", "harness_version", "operating_system",
-    "task_type", "difficulty", "languages", "delivery_score",
+    "trajectory_file", "reproducibility", "harness", "harness_version",
+    "operating_system", "task_type", "difficulty", "languages", "delivery_score",
     "delivery_description", "instruction_score", "instruction_description",
     "planning_score", "planning_description", "reasoning_score",
     "reasoning_description", "execution_score", "execution_description",
-    "other_issues", "submitter", "submitted_at", "parent_record",
+    "other_issues", "submitter", "submitted_at", "parent_record", "delivery_qc_note",
 ]
 SCORE_KEYS = {f"{prefix}_score" for prefix in SCORE_PREFIXES}
 DESCRIPTION_META_PATTERNS = (
@@ -63,6 +64,7 @@ def as_record(row: sqlite3.Row | dict) -> dict:
     record = dict(row)
     record["human_authored"] = bool(record.get("human_authored"))
     record["human_qc_approved"] = bool(record.get("human_qc_approved"))
+    record["delivery_qc_passed"] = bool(record.get("delivery_qc_passed"))
     return record
 
 
@@ -116,13 +118,17 @@ def _description_style_errors(description: str) -> list[str]:
     return errors
 
 
-def validate_one(record: dict, require_human_qc: bool = False) -> tuple[list[str], list[str]]:
+def validate_one(
+    record: dict,
+    require_human_qc: bool = False,
+    require_delivery_qc: bool = False,
+) -> tuple[list[str], list[str]]:
     record_id = str(record.get("record_id") or "<unknown>")
     errors: list[str] = []
     warnings: list[str] = []
     required_text = (
         "record_id", "user_prompt", "session_id", "turn_id", "initial_snapshot",
-        "harness_version", "languages", "submitter",
+        "trajectory_file", "harness_version", "languages", "submitter",
     )
     for key in required_text:
         if not isinstance(record.get(key), str) or not record[key].strip():
@@ -136,6 +142,13 @@ def validate_one(record: dict, require_human_qc: bool = False) -> tuple[list[str
             errors.append(f"{record_id}: {key} must be text")
     if not SNAPSHOT_RE.fullmatch(str(record.get("initial_snapshot", ""))):
         errors.append(f"{record_id}: invalid initial_snapshot")
+    trajectory_file = str(record.get("trajectory_file", ""))
+    if (
+        not trajectory_file.endswith(".jsonl")
+        or "/" in trajectory_file
+        or "\\" in trajectory_file
+    ):
+        errors.append(f"{record_id}: trajectory_file must be a JSONL file name")
     for key, allowed in (
         ("reproducibility", REPRODUCIBILITY), ("harness", HARNESSES),
         ("operating_system", OPERATING_SYSTEMS), ("task_type", TASK_TYPES),
@@ -170,6 +183,30 @@ def validate_one(record: dict, require_human_qc: bool = False) -> tuple[list[str
         errors.append(f"{record_id}: human_qc_approved must be boolean")
     elif require_human_qc and record["human_qc_approved"] is not True:
         errors.append(f"{record_id}: human qualitative QC is not approved")
+    if not isinstance(record.get("delivery_qc_passed"), bool):
+        errors.append(f"{record_id}: delivery_qc_passed must be boolean")
+    elif require_delivery_qc and record["delivery_qc_passed"] is not True:
+        errors.append(f"{record_id}: delivery QC is not passed")
+    if record.get("delivery_qc_passed") is True:
+        if record.get("delivery_qc_note") != "质检通过":
+            errors.append(f"{record_id}: delivery_qc_note must be 质检通过")
+        _parse_timestamp(
+            record.get("delivery_qc_checked_at"),
+            "delivery_qc_checked_at",
+            record_id,
+            errors,
+        )
+    changes = record.get("delivery_qc_changes")
+    if not isinstance(changes, str):
+        errors.append(f"{record_id}: delivery_qc_changes must be JSON text")
+    else:
+        try:
+            parsed_changes = json.loads(changes)
+        except ValueError:
+            errors.append(f"{record_id}: delivery_qc_changes must be valid JSON")
+        else:
+            if not isinstance(parsed_changes, list):
+                errors.append(f"{record_id}: delivery_qc_changes must contain an array")
 
     completed = _parse_timestamp(
         record.get("turn_completed_at"), "turn_completed_at", record_id, errors
@@ -201,12 +238,16 @@ def validate_one(record: dict, require_human_qc: bool = False) -> tuple[list[str
 
 
 def validate_records(
-    records: list[dict], require_human_qc: bool = False
+    records: list[dict],
+    require_human_qc: bool = False,
+    require_delivery_qc: bool = False,
 ) -> tuple[list[str], list[str]]:
     errors: list[str] = []
     warnings: list[str] = []
     for record in records:
-        item_errors, item_warnings = validate_one(record, require_human_qc)
+        item_errors, item_warnings = validate_one(
+            record, require_human_qc, require_delivery_qc
+        )
         errors.extend(item_errors)
         warnings.extend(item_warnings)
 
@@ -228,7 +269,10 @@ def validate_records(
     sessions: dict[str, list[dict]] = defaultdict(list)
     for record in records:
         sessions[str(record.get("session_id", ""))].append(record)
-    stable_fields = ("initial_snapshot", "harness", "harness_version", "operating_system")
+    stable_fields = (
+        "initial_snapshot", "trajectory_file", "harness", "harness_version",
+        "operating_system",
+    )
     for session_id, items in sessions.items():
         if not session_id:
             continue

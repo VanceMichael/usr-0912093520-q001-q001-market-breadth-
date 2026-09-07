@@ -57,6 +57,7 @@ def collect_fields(turn_no: int) -> dict:
     data: dict[str, object] = {
         "session_id": ask("SessionID（人工从当前 Claude Code 会话记录复制）"),
         "turn_id": ask("PromptID（人工从本轮 user 消息复制）"),
+        "trajectory_file": ask("轨迹文件名（例如 SessionID.jsonl）"),
     }
     if turn_no > 1:
         data.update({
@@ -131,7 +132,7 @@ def build_record(
     supplied: dict,
 ) -> dict:
     required_input = {
-        "session_id", "turn_id", "delivery_score", "delivery_description",
+        "session_id", "turn_id", "trajectory_file", "delivery_score", "delivery_description",
         "instruction_score", "instruction_description", "planning_score",
         "planning_description", "reasoning_score", "reasoning_description",
         "execution_score", "execution_description", "other_issues", "submitter",
@@ -160,6 +161,7 @@ def build_record(
         "session_id": supplied["session_id"],
         "turn_id": supplied["turn_id"],
         "initial_snapshot": question["initial_snapshot"],
+        "trajectory_file": supplied["trajectory_file"],
         "reproducibility": question["reproducibility"],
         "harness": run["harness"],
         "harness_version": run["harness_version"],
@@ -176,6 +178,10 @@ def build_record(
         "human_qc_approved": False,
         "human_qc_reviewer": "",
         "human_qc_approved_at": "",
+        "delivery_qc_passed": False,
+        "delivery_qc_note": "",
+        "delivery_qc_checked_at": "",
+        "delivery_qc_changes": "[]",
         "created_at": now(),
     }
     for prefix in SCORE_PREFIXES:

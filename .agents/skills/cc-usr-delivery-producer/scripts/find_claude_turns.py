@@ -123,6 +123,7 @@ def locate(
         raise ValueError("matching Claude Code session lacks SessionID or user PromptID")
     return {
         "trajectory_path": str(path),
+        "trajectory_file": path.name,
         "session_id": session_id,
         "candidate_count": len(candidates),
         "turns": turns,

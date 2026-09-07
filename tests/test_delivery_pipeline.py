@@ -37,32 +37,33 @@ def data_sheet_path(archive: zipfile.ZipFile) -> str:
     return target if target.startswith("xl/") else f"xl/{target}"
 
 
-def spec() -> dict:
+def spec(count: int = 1) -> dict:
     return {
         "batch": "0911",
         "brief": "交付测试",
         "questions": [{
-            "folder": "q001",
-            "task_id": "0911-001",
-            "title": "跨模块事件协作服务",
+            "folder": f"q{number:03d}",
+            "task_id": f"0911-{number:03d}",
+            "title": f"跨模块事件协作服务 {number}",
             "prompt": "从零构建一套事件协作服务，覆盖事件接入、顺序处理、持久化、状态推送、断线重连和完整验证场景。",
             "task_type": "0-1 代码生成",
             "difficulty": "困难",
             "languages": ["Go", "TypeScript"],
-            "repo_url": "https://github.com/example/project",
+            "repo_url": f"https://github.com/example/project-{number}",
             "initial_snapshot": "",
             "reproducibility": "无外部依赖",
             "expected_areas": ["service", "web", "tests"],
             "difficulty_evidence": ["跨模块事件顺序"],
-            "similarity_tags": ["state-ordering"],
-        }],
+            "similarity_tags": [f"state-ordering-{number}"],
+        } for number in range(1, count + 1)],
     }
 
 
-def automated_record() -> dict:
+def automated_record(number: int = 1) -> dict:
     values = {
-        "session_id": "session-001",
-        "turn_id": "turn-001",
+        "session_id": f"session-{number:03d}",
+        "turn_id": f"turn-{number:03d}",
+        "trajectory_file": f"session-{number:03d}.jsonl",
         "other_issues": "",
         "submitter": "测试提交人",
         "turn_completed_at": "2026-09-07T10:00:00+08:00",
@@ -83,30 +84,34 @@ def automated_record() -> dict:
 
 
 class DeliveryPipelineTests(unittest.TestCase):
-    def prepare(self, root: Path) -> Path:
+    def prepare(self, root: Path, count: int = 1) -> Path:
         database = root / "production.sqlite3"
         spec_path = root / "spec.json"
-        spec_path.write_text(json.dumps(spec(), ensure_ascii=False), encoding="utf-8")
+        spec_path.write_text(json.dumps(spec(count), ensure_ascii=False), encoding="utf-8")
         connection = connect(database)
         create_batch(connection, root, spec_path)
-        question = connection.execute("SELECT * FROM questions").fetchone()
-        set_repository(
-            connection,
-            "0911",
-            1,
-            "https://github.com/example/project",
-            f"https://github.com/example/project/commit/{question['local_initial_sha']}",
-        )
-        question = connection.execute("SELECT * FROM questions").fetchone()
+        questions = connection.execute(
+            "SELECT * FROM questions ORDER BY question_no"
+        ).fetchall()
+        for question in questions:
+            repository = f"https://github.com/example/project-{question['question_no']}"
+            set_repository(
+                connection,
+                "0911",
+                question["question_no"],
+                repository,
+                f"{repository}/commit/{question['local_initial_sha']}",
+            )
         connection.execute(
-            "UPDATE questions SET status='running' WHERE id=?", (question["id"],)
+            "UPDATE questions SET status='running'"
         )
-        connection.execute(
-            "INSERT INTO runs(question_id, batch_run_id, launched_at, harness, harness_version) "
-            "VALUES(?, 'run-001', '2026-09-07T09:00:00+08:00', "
-            "'Claude Code', '2.1.259 (Claude Code)')",
-            (question["id"],),
-        )
+        for question in questions:
+            connection.execute(
+                "INSERT INTO runs(question_id, batch_run_id, launched_at, harness, harness_version) "
+                "VALUES(?, ?, '2026-09-07T09:00:00+08:00', "
+                "'Claude Code', '2.1.259 (Claude Code)')",
+                (question["id"], f"run-{question['question_no']:03d}"),
+            )
         connection.commit()
         connection.close()
         return database
@@ -116,7 +121,7 @@ class DeliveryPipelineTests(unittest.TestCase):
             command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False
         )
 
-    def test_automated_record_qc_approval_and_excel_export(self):
+    def test_delivery_qc_finalize_and_excel_export(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             database = self.prepare(root)
@@ -140,20 +145,34 @@ class DeliveryPipelineTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout)
             result = self.run_command([
                 sys.executable, str(QC), "--db", str(database), "--batch", "0911",
-                "--approve", "0911-001-T01", "--reviewer", "human-qc",
-                "--confirm-human-review", "YES",
+                "--finalize",
             ])
             self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertIn("质检通过", result.stdout)
+            connection = connect(database)
+            qc_record = connection.execute("SELECT * FROM records").fetchone()
+            connection.close()
+            self.assertEqual(qc_record["delivery_qc_passed"], 1)
+            self.assertEqual(qc_record["delivery_qc_note"], "质检通过")
+            self.assertTrue(qc_record["delivery_qc_checked_at"])
 
-            output = root / "CC_Codex 用户满意度标注（0911）.xlsx"
+            claude_root = root / "claude-projects"
+            claude_root.mkdir()
+            (claude_root / "session-001.jsonl").write_text(
+                '{"sessionId":"session-001"}\n', encoding="utf-8"
+            )
             result = self.run_command([
                 sys.executable, str(EXPORTER), "--db", str(database), "--batch", "0911",
-                "--template", str(TEMPLATE), "--output", str(output),
+                "--template", str(TEMPLATE), "--claude-root", str(claude_root),
             ])
             self.assertEqual(result.returncode, 0, result.stdout)
+            output = root / "0911/CC_Codex 用户满意度标注（0911-第1题）.xlsx"
             self.assertTrue(output.is_file())
             with zipfile.ZipFile(output) as archive:
                 self.assertIsNone(archive.testzip())
+                workbook = ET.fromstring(archive.read("xl/workbook.xml"))
+                sheets = workbook.findall(f"{{{NS}}}sheets/{{{NS}}}sheet")
+                self.assertEqual([sheet.attrib["name"] for sheet in sheets], ["数据表"])
                 root_xml = ET.fromstring(archive.read(data_sheet_path(archive)))
             rows = root_xml.findall(f"{{{NS}}}sheetData/{{{NS}}}row")
             self.assertEqual(len(rows), 2)
@@ -162,12 +181,180 @@ class DeliveryPipelineTests(unittest.TestCase):
                 node = cell.find(f"{{{NS}}}is/{{{NS}}}t")
                 headers.append("" if node is None else node.text)
             self.assertEqual(headers, EXPORT_HEADERS)
-            harness_cell = rows[1].find(f"{{{NS}}}c[@r='F2']/{{{NS}}}is/{{{NS}}}t")
+            trajectory_cell = rows[1].find(f"{{{NS}}}c[@r='E2']/{{{NS}}}is/{{{NS}}}t")
+            self.assertIsNotNone(trajectory_cell)
+            self.assertIsNone(trajectory_cell.text)
+            harness_cell = rows[1].find(f"{{{NS}}}c[@r='G2']/{{{NS}}}is/{{{NS}}}t")
             self.assertIsNotNone(harness_cell)
             self.assertEqual(harness_cell.text, "Claude Code")
-            score_cell = rows[1].find(f"{{{NS}}}c[@r='L2']")
+            note_cell = rows[1].find(f"{{{NS}}}c[@r='AA2']/{{{NS}}}is/{{{NS}}}t")
+            self.assertIsNotNone(note_cell)
+            self.assertEqual(note_cell.text, "质检通过")
+            score_cell = rows[1].find(f"{{{NS}}}c[@r='M2']")
             self.assertIsNotNone(score_cell)
             self.assertEqual(score_cell.attrib.get("t"), "n")
+            trajectories = list((root / "0911").glob("轨迹_0911_第1题_session-001*.jsonl"))
+            self.assertEqual(len(trajectories), 1)
+            self.assertEqual(
+                trajectories[0].read_text(encoding="utf-8"),
+                '{"sessionId":"session-001"}\n',
+            )
+
+            result = self.run_command([
+                sys.executable, str(EXPORTER), "--db", str(database), "--batch", "0911",
+                "--template", str(TEMPLATE), "--claude-root", str(claude_root),
+            ])
+            self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertTrue(
+                (root / "0911/CC_Codex 用户满意度标注（0911-第1题）_2.xlsx").is_file()
+            )
+            self.assertEqual(
+                len(list((root / "0911").glob("轨迹_0911_第1题_session-001*.jsonl"))),
+                2,
+            )
+
+    def test_excel_export_selects_questions_and_all_their_turns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = self.prepare(root, count=2)
+            for question_no in (1, 2):
+                input_path = root / f"score-{question_no}.json"
+                input_path.write_text(
+                    json.dumps(automated_record(question_no), ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                result = self.run_command([
+                    sys.executable, str(COLLECTOR), "--db", str(database),
+                    "--batch", "0911", "--question", str(question_no),
+                    "--turn", "1", "--from-json", str(input_path),
+                ])
+                self.assertEqual(result.returncode, 0, result.stdout)
+            result = self.run_command([
+                sys.executable, str(QC), "--db", str(database), "--batch", "0911",
+                "--finalize",
+            ])
+            self.assertEqual(result.returncode, 0, result.stdout)
+            claude_root = root / "claude-projects"
+            claude_root.mkdir()
+            for question_no in (1, 2):
+                (claude_root / f"session-{question_no:03d}.jsonl").write_text(
+                    json.dumps({"sessionId": f"session-{question_no:03d}"}) + "\n",
+                    encoding="utf-8",
+                )
+            result = self.run_command([
+                sys.executable, str(EXPORTER), "--db", str(database), "--batch", "0911",
+                "--select", "2", "--template", str(TEMPLATE),
+                "--claude-root", str(claude_root),
+            ])
+            self.assertEqual(result.returncode, 0, result.stdout)
+            output = root / "0911/CC_Codex 用户满意度标注（0911-第2题）.xlsx"
+            self.assertTrue(output.is_file())
+            with zipfile.ZipFile(output) as archive:
+                root_xml = ET.fromstring(archive.read(data_sheet_path(archive)))
+            rows = root_xml.findall(f"{{{NS}}}sheetData/{{{NS}}}row")
+            self.assertEqual(len(rows), 2)
+            session_cell = rows[1].find(f"{{{NS}}}c[@r='B2']/{{{NS}}}is/{{{NS}}}t")
+            self.assertEqual(session_cell.text, "session-002")
+            self.assertFalse(list((root / "0911").glob("轨迹_0911_第1题_*.jsonl")))
+            self.assertEqual(
+                len(list((root / "0911").glob("轨迹_0911_第2题_*.jsonl"))), 1
+            )
+
+    def test_delivery_qc_applies_audited_fix_before_finalize(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = self.prepare(root)
+            input_path = root / "score.json"
+            input_path.write_text(
+                json.dumps(automated_record(), ensure_ascii=False), encoding="utf-8"
+            )
+            result = self.run_command([
+                sys.executable, str(COLLECTOR), "--db", str(database), "--batch", "0911",
+                "--question", "1", "--turn", "1", "--from-json", str(input_path),
+            ])
+            self.assertEqual(result.returncode, 0, result.stdout)
+            connection = connect(database)
+            connection.execute("UPDATE records SET submitter='Codex'")
+            connection.commit()
+            connection.close()
+
+            result = self.run_command([
+                sys.executable, str(QC), "--db", str(database), "--batch", "0911",
+            ])
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("real person's name", result.stdout)
+
+            fixes = {
+                "records": [{
+                    "record_id": "0911-001-T01",
+                    "reason": "提交人误写为工具名称，按已确认的真实提交人修正",
+                    "changes": {"submitter": "测试提交人"},
+                }]
+            }
+            fixes_path = root / "fixes.json"
+            fixes_path.write_text(json.dumps(fixes, ensure_ascii=False), encoding="utf-8")
+            result = self.run_command([
+                sys.executable, str(QC), "--db", str(database), "--batch", "0911",
+                "--fixes", str(fixes_path),
+            ])
+            self.assertEqual(result.returncode, 0, result.stdout)
+            connection = connect(database)
+            fixed = connection.execute("SELECT * FROM records").fetchone()
+            connection.close()
+            self.assertEqual(fixed["submitter"], "测试提交人")
+            self.assertEqual(fixed["delivery_qc_passed"], 0)
+            changes = json.loads(fixed["delivery_qc_changes"])
+            self.assertEqual(changes[0]["changes"]["submitter"]["before"], "Codex")
+            self.assertEqual(changes[0]["changes"]["submitter"]["after"], "测试提交人")
+
+            result = self.run_command([
+                sys.executable, str(QC), "--db", str(database), "--batch", "0911",
+                "--finalize",
+            ])
+            self.assertEqual(result.returncode, 0, result.stdout)
+            self.assertIn("质检通过", result.stdout)
+
+    def test_excel_export_rejects_records_without_delivery_qc(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = self.prepare(root)
+            input_path = root / "score.json"
+            input_path.write_text(
+                json.dumps(automated_record(), ensure_ascii=False), encoding="utf-8"
+            )
+            result = self.run_command([
+                sys.executable, str(COLLECTOR), "--db", str(database), "--batch", "0911",
+                "--question", "1", "--turn", "1", "--from-json", str(input_path),
+            ])
+            self.assertEqual(result.returncode, 0, result.stdout)
+            output = root / "unpassed.xlsx"
+            result = self.run_command([
+                sys.executable, str(EXPORTER), "--db", str(database), "--batch", "0911",
+                "--template", str(TEMPLATE), "--output", str(output),
+            ])
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("delivery QC is not passed", result.stdout)
+            self.assertFalse(output.exists())
+
+    def test_delivery_qc_rejects_launched_question_without_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = self.prepare(root, count=2)
+            input_path = root / "score.json"
+            input_path.write_text(
+                json.dumps(automated_record(), ensure_ascii=False), encoding="utf-8"
+            )
+            result = self.run_command([
+                sys.executable, str(COLLECTOR), "--db", str(database), "--batch", "0911",
+                "--question", "1", "--turn", "1", "--from-json", str(input_path),
+            ])
+            self.assertEqual(result.returncode, 0, result.stdout)
+            result = self.run_command([
+                sys.executable, str(QC), "--db", str(database), "--batch", "0911",
+                "--finalize",
+            ])
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("0911-002: launched question has no delivery record", result.stdout)
 
     def test_automated_record_rejects_meta_and_template_language(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -266,6 +453,7 @@ class DeliveryPipelineTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout)
             located = json.loads(result.stdout)
             self.assertEqual(located["session_id"], "session-claude-001")
+            self.assertEqual(located["trajectory_file"], "session-claude-001.jsonl")
             self.assertEqual(
                 [turn["prompt_id"] for turn in located["turns"]],
                 ["prompt-001", "prompt-002"],

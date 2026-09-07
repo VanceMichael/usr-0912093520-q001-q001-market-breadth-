@@ -16,7 +16,7 @@ from datetime import datetime
 from pathlib import Path
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 TASK_TYPES = {
     "0-1 代码生成", "Feature 迭代", "Bug 修复", "代码理解",
     "代码重构", "工程化", "代码测试",
@@ -125,6 +125,7 @@ CREATE TABLE IF NOT EXISTS records (
     session_id TEXT NOT NULL,
     turn_id TEXT NOT NULL,
     initial_snapshot TEXT NOT NULL,
+    trajectory_file TEXT NOT NULL,
     reproducibility TEXT NOT NULL,
     harness TEXT NOT NULL,
     harness_version TEXT NOT NULL,
@@ -151,6 +152,10 @@ CREATE TABLE IF NOT EXISTS records (
     human_qc_approved INTEGER NOT NULL DEFAULT 0 CHECK (human_qc_approved IN (0, 1)),
     human_qc_reviewer TEXT NOT NULL DEFAULT '',
     human_qc_approved_at TEXT NOT NULL DEFAULT '',
+    delivery_qc_passed INTEGER NOT NULL DEFAULT 0 CHECK (delivery_qc_passed IN (0, 1)),
+    delivery_qc_note TEXT NOT NULL DEFAULT '',
+    delivery_qc_checked_at TEXT NOT NULL DEFAULT '',
+    delivery_qc_changes TEXT NOT NULL DEFAULT '[]',
     created_at TEXT NOT NULL,
     UNIQUE (session_id, turn_id),
     UNIQUE (question_id, turn_no)
@@ -173,6 +178,10 @@ def connect(database: Path) -> sqlite3.Connection:
     record_columns = {
         row["name"] for row in connection.execute("PRAGMA table_info(records)")
     }
+    if "trajectory_file" not in record_columns:
+        connection.execute(
+            "ALTER TABLE records ADD COLUMN trajectory_file TEXT NOT NULL DEFAULT ''"
+        )
     if "human_qc_reviewer" not in record_columns:
         connection.execute(
             "ALTER TABLE records ADD COLUMN human_qc_reviewer TEXT NOT NULL DEFAULT ''"
@@ -180,6 +189,23 @@ def connect(database: Path) -> sqlite3.Connection:
     if "human_qc_approved_at" not in record_columns:
         connection.execute(
             "ALTER TABLE records ADD COLUMN human_qc_approved_at TEXT NOT NULL DEFAULT ''"
+        )
+    if "delivery_qc_passed" not in record_columns:
+        connection.execute(
+            "ALTER TABLE records ADD COLUMN delivery_qc_passed INTEGER NOT NULL DEFAULT 0 "
+            "CHECK (delivery_qc_passed IN (0, 1))"
+        )
+    if "delivery_qc_note" not in record_columns:
+        connection.execute(
+            "ALTER TABLE records ADD COLUMN delivery_qc_note TEXT NOT NULL DEFAULT ''"
+        )
+    if "delivery_qc_checked_at" not in record_columns:
+        connection.execute(
+            "ALTER TABLE records ADD COLUMN delivery_qc_checked_at TEXT NOT NULL DEFAULT ''"
+        )
+    if "delivery_qc_changes" not in record_columns:
+        connection.execute(
+            "ALTER TABLE records ADD COLUMN delivery_qc_changes TEXT NOT NULL DEFAULT '[]'"
         )
     run_columns = {
         row["name"] for row in connection.execute("PRAGMA table_info(runs)")
