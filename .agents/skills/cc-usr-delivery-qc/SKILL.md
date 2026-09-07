@@ -21,6 +21,8 @@ python3 .agents/skills/cc-usr-delivery-qc/scripts/validate_records.py \
 ```
 
 2. Review all 27 export fields, not just the reported mechanical errors. Confirm exact prompts, identifiers and trajectory file names, valid enums and score ranges, snapshot and session consistency, timestamps, parent chains, score-description agreement, and natural evidence-based descriptions. `审核备注` is populated only by finalization.
+   - For every row, open the original JSONL named by `trajectory_file` and match the exact `(SessionID, PromptID, user_prompt)` triple. A terminal `stream-json` output, an execution summary, a prior-turn prompt, or a homepage URL is not evidence and must fail QC. A `继续` turn must contain the literal current user text `继续` while inheriting only the allowed classification metadata.
+   - Apply the score ceilings in the producer scoring rubric. In particular, prose admitting no plan/status tracking cannot carry planning 4/5; prose admitting several failures, repeated retries, or unresolved verification cannot carry execution 4/5. Do not “fix” contradiction by deleting the evidence; lower the score or recover stronger evidence.
 3. Do not stop after listing a correctable issue. Resolve it from authoritative evidence: SQLite question/run metadata for inherited fields; the matched session for SessionID, PromptID, prompts, turns, timestamps, and process evidence; and the initial snapshot plus resulting workspace for product evidence. Never guess a missing value.
 4. Put supported corrections in a temporary JSON file. Each changed record needs a concrete reason:
 

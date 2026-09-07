@@ -16,6 +16,7 @@ Turn the user's batch name, question count, and authoring requirements into one 
 ## Authoring rules
 
 - Create exactly the requested number of distinct first-turn tasks. Every task must use `task_type: "0-1 代码生成"` and be `中等`, `困难`, or `地狱` from a human execution perspective. Bug, Feature, understanding, refactoring, engineering, and test prompts are reserved for later turns and must not be authored into a new batch.
+- Apply the difficulty gate before writing the batch spec. Count the independent high-complexity traits in the actual prompt and scaffold: cross-module or cross-service state, event/version ordering, idempotency or concurrency, transaction boundaries, timezone or cross-midnight rules, durable SQLite/database state, restart/recovery behavior, container/build/deployment constraints, permission/security boundaries, or substantial integration testing. Three or more traits require `困难` at minimum; five or more traits, hidden constraints, or architecture-level choices that are likely to defeat a strong engineer require `地狱`. `中等` is reserved for local-to-cross-module work with only a few ordinary edge cases. Record the concrete traits in `difficulty_evidence`; never choose a difficulty from the prompt's apparent length or from the expected model success rate.
 - Make the prompt's first action and overall intent ask for a complete project or a complete module that does not already exist. Do not relabel an extension, repair, or isolated function as 0-1.
 - Write each User Prompt as one coherent natural-language paragraph in a realistic user voice. Start from the scenario, role, or pain point; avoid headings, checklist formatting, canned openings, and a reusable engineering-requirements tail.
 - Keep prompts business-led. Mention implementation technology only when the user explicitly requires it or it is the core subject of the task; otherwise put language and framework choices in metadata and let the prepared repository constrain them.
@@ -45,6 +46,13 @@ Before mechanical QC, complete all of the following for every question without h
 3. Verify the remote is accessible to the evaluation team and that its default branch resolves to the exact local `HEAD`. A private personal repository is not acceptable.
 4. Build the immutable commit permalink from that 40-character SHA and register it with `tools/batch_pipeline.py set-repo`.
 5. Re-read the SQLite row and verify `repo_url`, `initial_snapshot`, and `local_initial_sha` agree. Do not modify the baseline after registration; any necessary change requires a new normal commit, push, and snapshot registration before QC.
+
+Snapshot hard gate (run for every question before mechanical QC):
+
+- `local_initial_sha` must equal `git -C <question-folder> rev-parse HEAD` and must match exactly 40 hexadecimal characters. A short SHA, branch URL, tag URL, repository homepage, or latest-commit URL is invalid.
+- `initial_snapshot` must match `https://github.com/<org>/<repo>/commit/<same-40-char-SHA>` and `repo_url` must be the same repository without the `/commit/...` suffix.
+- Verify the remote commit with `git ls-remote origin HEAD` (or the resolved default branch) and verify the GitHub permalink is reachable. If either check fails, leave the question blocked; do not substitute a plausible URL or continue to launch.
+- After `set-repo`, query SQLite again and compare all three values (`repo_url`, `initial_snapshot`, `local_initial_sha`) to the values just verified. Capture the command output or a small audit note in the run log so a later reviewer can reproduce the check.
 
 If GitHub authentication, repository creation, push, or accessibility verification fails, keep the question `BLOCKED` and report the concrete blocker. Never claim the batch is complete or ready while any question lacks its published snapshot.
 

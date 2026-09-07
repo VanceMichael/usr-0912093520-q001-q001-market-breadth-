@@ -23,6 +23,16 @@ Do not invent a step number, command, file, function, exception, test result, re
 
 Scores are integers from 1 to 5 and must follow the anchors in `项目规范.md`. Do not force all dimensions to the same score.
 
+## Calibration guardrails from observed evidence
+
+Use these as upper bounds when the trajectory contains the corresponding fact; a polished final answer cannot mask a weak process.
+
+- `任务规划`: no explicit plan/decomposition and no checkable state tracking is the 2 anchor, not 4. A broad plan with substantial tracking gaps is at most 3. Score 4 only when the agent decomposes the work and tracks status for most of the turn; score 5 requires clear decomposition, sustained updates, and appropriate clarification of ambiguity.
+- `执行能力`: several test/command failures, repeated retries, or multi-round script/container repair is at most 3 unless the failures are demonstrably external and the agent's recovery is otherwise precise. Score 4 allows only a small amount of harmless redundancy and no material unresolved verification issue. Score 5 requires a minimal, accurate tool path and successful verification without meaningful rework. Count actual failed/error calls rather than relying on a claim that the work was completed.
+- `交付完整性`: a successful final response does not erase a failing test, missing requirement, or unverified artifact. Keep the concrete defect in the description and lower the score to the matching anchor.
+
+Before insertion, compare each score with its own description and then read all five together. If the prose says “没有计划/状态记录”, “多次失败后仍有失败”, “未验证”, or equivalent, the corresponding score cannot be 4 or 5. If a 4/5 score is justified, the description must name the observed plan, successful verification, or efficient recovery that earns it. Never use a higher score to compensate for a good result in another dimension.
+
 ## Description requirements
 
 Every description is required, including scores of 5. Write as a programmer reporting a concrete review finding to another programmer. A reader should be able to tell, without labels or a prescribed format, where the issue surfaced, what actually happened, and what it changed or prevented. Add the likely cause and the better engineering approach when the available evidence supports both.
