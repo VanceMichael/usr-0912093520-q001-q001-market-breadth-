@@ -1,0 +1,7 @@
+interface:
+  display_name: "用户满意度出题质检"
+  short_description: "检查题目难度、多样性、禁题范围、仓库快照与环境可复现性"
+  default_prompt: "使用 $cc-usr-question-qc 质检指定 SQLite 批次，并输出可核验的问题清单。"
+
+policy:
+  allow_implicit_invocation: true

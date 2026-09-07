@@ -1,0 +1,7 @@
+interface:
+  display_name: "用户满意度出题"
+  short_description: "按批次创建题目目录、查看页和 SQLite 题目记录"
+  default_prompt: "使用 $cc-usr-question-author 按批次名、数量和要求创建一批合规题目。"
+
+policy:
+  allow_implicit_invocation: true

@@ -1,0 +1,13 @@
+.env
+09*/
+.tmp-*-spec.json
+production.sqlite3
+production.sqlite3-shm
+production.sqlite3-wal
+runs/
+.runs/
+records/
+outputs/
+__pycache__/
+*.py[cod]
+.DS_Store

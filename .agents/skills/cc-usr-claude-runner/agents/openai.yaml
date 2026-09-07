@@ -1,0 +1,7 @@
+interface:
+  display_name: "Claude Code 批量运行"
+  short_description: "读取根目录三项配置，按题号在 iTerm2 启动 Claude Code"
+  default_prompt: "使用 $cc-usr-claude-runner 列出指定 SQLite 批次的可运行题目并预览选择。"
+
+policy:
+  allow_implicit_invocation: true

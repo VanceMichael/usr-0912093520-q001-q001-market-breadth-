@@ -1,0 +1,7 @@
+interface:
+  display_name: "用户满意度交付生产"
+  short_description: "逐轮采集人工评分和依据并写入生产 SQLite"
+  default_prompt: "使用 $cc-usr-delivery-producer 把一轮人工完成的评分与描述写入指定批次。"
+
+policy:
+  allow_implicit_invocation: true
