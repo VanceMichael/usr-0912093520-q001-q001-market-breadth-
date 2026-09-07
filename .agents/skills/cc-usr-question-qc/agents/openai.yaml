@@ -1,7 +1,7 @@
 interface:
   display_name: "用户满意度出题质检"
-  short_description: "检查首轮 0-1 意图、难度、多样性、仓库快照与可复现性"
-  default_prompt: "使用 $cc-usr-question-qc 质检指定 SQLite 批次，确认全部首轮题都是真正的 0-1 代码生成任务，并输出可核验的问题清单。"
+  short_description: "检查批次内及跨批次题目是否重复或套用同一模板"
+  default_prompt: "使用 $cc-usr-question-qc 检查指定 SQLite 批次与完整题库是否存在重复题或模板化改写，并输出可核验的相似度证据。"
 
 policy:
   allow_implicit_invocation: true

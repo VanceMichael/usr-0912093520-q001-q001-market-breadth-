@@ -464,8 +464,6 @@ def check_question(connection: sqlite3.Connection, row: sqlite3.Row) -> dict:
     warnings: list[str] = []
     prompt = row["prompt"].strip()
     combined = normalize(row["title"] + "\n" + prompt)
-    if row["task_type"] != FIRST_TURN_TASK_TYPE:
-        errors.append(f"首轮任务类型必须是 {FIRST_TURN_TASK_TYPE}")
     if "\n" in prompt or "\r" in prompt:
         errors.append("首轮 User Prompt 必须是一个自然语言段落")
     if row["difficulty"] == "简单":
@@ -529,6 +527,72 @@ def check_question(connection: sqlite3.Connection, row: sqlite3.Row) -> dict:
         "errors": list(dict.fromkeys(errors)),
         "warnings": list(dict.fromkeys(warnings)),
     }
+
+
+def check_duplicates(connection: sqlite3.Connection, row: sqlite3.Row) -> dict:
+    prompt = row["prompt"].strip()
+    current_tags = set(json.loads(row["similarity_tags"]))
+    comparisons = []
+    for other in connection.execute(
+        "SELECT task_id, prompt, repo_url, similarity_tags FROM questions WHERE id != ?",
+        (row["id"],),
+    ).fetchall():
+        ratio = difflib.SequenceMatcher(None, normalize(prompt), normalize(other["prompt"])).ratio()
+        tri = trigram_similarity(prompt, other["prompt"])
+        longest = difflib.SequenceMatcher(
+            None, normalize(prompt), normalize(other["prompt"])
+        ).find_longest_match().size
+        other_tags = set(json.loads(other["similarity_tags"]))
+        tag_overlap = 0.0
+        if current_tags and other_tags:
+            tag_overlap = len(current_tags & other_tags) / len(current_tags | other_tags)
+        same_repo = bool(row["repo_url"]) and row["repo_url"] == other["repo_url"]
+        reasons = []
+        if ratio >= 0.82:
+            reasons.append("overall_similarity")
+        if tri >= 0.30:
+            reasons.append("trigram_similarity")
+        if longest >= 50:
+            reasons.append("longest_common_substring")
+        if same_repo and tag_overlap >= 0.75:
+            reasons.append("same_repo_tag_overlap")
+        comparisons.append({
+            "task_id": other["task_id"],
+            "overall_similarity": round(ratio, 4),
+            "trigram_similarity": round(tri, 4),
+            "longest_common_substring": longest,
+            "same_repository": same_repo,
+            "tag_overlap": round(tag_overlap, 4),
+            "duplicate_reasons": reasons,
+        })
+    comparisons.sort(
+        key=lambda item: (
+            bool(item["duplicate_reasons"]),
+            item["trigram_similarity"],
+            item["overall_similarity"],
+            item["longest_common_substring"],
+        ),
+        reverse=True,
+    )
+    return {
+        "task_id": row["task_id"],
+        "question_no": row["question_no"],
+        "prompt_sha256": prompt_hash(prompt),
+        "duplicates": [item for item in comparisons if item["duplicate_reasons"]],
+        "closest": comparisons[:3],
+    }
+
+
+def run_duplicate_qc(
+    connection: sqlite3.Connection, batch: str, selection: str | None
+) -> int:
+    batch_row(connection, batch)
+    rows = question_rows(connection, batch)
+    if selection:
+        rows = parse_selection(selection, rows)
+    reports = [check_duplicates(connection, row) for row in rows]
+    print(json.dumps({"batch": batch, "questions": reports}, ensure_ascii=False, indent=2))
+    return 1 if any(report["duplicates"] for report in reports) else 0
 
 
 def run_mechanical_qc(connection: sqlite3.Connection, batch: str, selection: str | None) -> int:
@@ -663,6 +727,9 @@ def main() -> int:
     qc_parser = subparsers.add_parser("qc-check")
     qc_parser.add_argument("--batch", required=True)
     qc_parser.add_argument("--select")
+    duplicate_parser = subparsers.add_parser("duplicate-check")
+    duplicate_parser.add_argument("--batch", required=True)
+    duplicate_parser.add_argument("--select")
     set_qc_parser = subparsers.add_parser("qc-set")
     set_qc_parser.add_argument("--batch", required=True)
     set_qc_parser.add_argument("--select", required=True)
@@ -691,6 +758,8 @@ def main() -> int:
             list_questions(connection, args.batch) if args.batch else list_batches(connection)
         elif args.command == "qc-check":
             return run_mechanical_qc(connection, args.batch, args.select)
+        elif args.command == "duplicate-check":
+            return run_duplicate_qc(connection, args.batch, args.select)
         elif args.command == "qc-set":
             set_semantic_qc(connection, args.batch, args.select, args.decision, args.report)
             print(f"Stored {args.decision} question QC for {args.batch}: {args.select}")

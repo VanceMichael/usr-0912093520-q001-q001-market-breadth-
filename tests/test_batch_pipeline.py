@@ -11,10 +11,12 @@ sys.path.insert(0, str(ROOT))
 
 from tools.batch_pipeline import (  # noqa: E402
     approve_questions,
+    check_duplicates,
     connect,
     create_batch,
     list_questions,
     prompt_hash,
+    run_duplicate_qc,
     run_mechanical_qc,
     set_repository,
     set_semantic_qc,
@@ -182,7 +184,7 @@ class BatchPipelineTests(unittest.TestCase):
             )
             connection.close()
 
-    def test_mechanical_qc_blocks_legacy_non_zero_to_one_first_turn(self):
+    def test_mechanical_qc_does_not_judge_legacy_task_type(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             connection = connect(root / "production.sqlite3")
@@ -199,11 +201,36 @@ class BatchPipelineTests(unittest.TestCase):
                 "UPDATE questions SET task_type='Feature 迭代' WHERE id=?", (row["id"],)
             )
             connection.commit()
-            self.assertEqual(run_mechanical_qc(connection, "0911", "1"), 1)
-            report = json.loads(
-                connection.execute("SELECT qc_report FROM questions").fetchone()[0]
+            self.assertEqual(run_mechanical_qc(connection, "0911", "1"), 0)
+            self.assertEqual(
+                connection.execute("SELECT mechanical_qc FROM questions").fetchone()[0],
+                "pass",
             )
-            self.assertIn("首轮任务类型必须是 0-1 代码生成", report["errors"])
+            connection.close()
+
+    def test_duplicate_qc_checks_all_stored_questions_without_mutating_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = json.loads(self.write_spec(root, count=2).read_text(encoding="utf-8"))
+            spec["questions"][1]["prompt"] = spec["questions"][0]["prompt"]
+            path = root / "spec.json"
+            path.write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
+            connection = connect(root / "production.sqlite3")
+            create_batch(connection, root, path)
+            before = connection.execute(
+                "SELECT mechanical_qc, qc_decision FROM questions ORDER BY question_no"
+            ).fetchall()
+            self.assertEqual(run_duplicate_qc(connection, "0911", "1"), 1)
+            report = check_duplicates(
+                connection,
+                connection.execute("SELECT * FROM questions WHERE question_no=1").fetchone(),
+            )
+            self.assertEqual(report["duplicates"][0]["task_id"], "0911-002")
+            self.assertIn("overall_similarity", report["duplicates"][0]["duplicate_reasons"])
+            after = connection.execute(
+                "SELECT mechanical_qc, qc_decision FROM questions ORDER BY question_no"
+            ).fetchall()
+            self.assertEqual([tuple(row) for row in before], [tuple(row) for row in after])
             connection.close()
 
     def test_mechanical_qc_blocks_legacy_multi_paragraph_prompt(self):
