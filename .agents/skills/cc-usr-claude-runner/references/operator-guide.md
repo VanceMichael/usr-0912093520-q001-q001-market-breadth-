@@ -10,6 +10,6 @@ Preview shows the exact working directory while hiding all three configuration v
 
 Each helper re-reads `.env`, maps the three values to Claude Code environment variables, changes into the question folder, and invokes exactly `claude <SQLite 原始 prompt>`. It does not use `-p` or add any CLI option. Claude Code therefore remains interactive and writes its native original trajectory. The runner never reads that trajectory.
 
-One selected question starts one new session. Keep each conversation to at most ten counted turns. Network failures do not count; a human `继续` after thinking-limit exhaustion does count. The human records SessionID and PromptID.
+One selected question starts one new session. Keep each conversation to at most ten counted turns. Network failures do not count; a human `继续` after thinking-limit exhaustion does count.
 
-After each valid turn, the human copies the session's `SessionID` and that user message's `PromptID`, reviews and writes the five scores and descriptions, then uses `$cc-usr-delivery-producer` to store the turn. The runner must not inspect Claude Code trajectories or attempt to collect those identifiers itself.
+After the run finishes, use `$cc-usr-delivery-producer` as the next step. It locates the matching trajectory, extracts `SessionID` and each user message's `PromptID`, assesses every valid turn and resulting product, and stores the scored records. The runner itself does not inspect trajectories.

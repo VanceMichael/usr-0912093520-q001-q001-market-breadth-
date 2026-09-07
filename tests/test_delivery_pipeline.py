@@ -16,6 +16,7 @@ from tools.delivery_records import EXPORT_HEADERS  # noqa: E402
 
 
 COLLECTOR = ROOT / ".agents/skills/cc-usr-delivery-producer/scripts/collect_record.py"
+LOCATOR = ROOT / ".agents/skills/cc-usr-delivery-producer/scripts/find_claude_turns.py"
 QC = ROOT / ".agents/skills/cc-usr-delivery-qc/scripts/validate_records.py"
 EXPORTER = ROOT / ".agents/skills/cc-usr-excel-exporter/scripts/export_xlsx.py"
 TEMPLATE = ROOT / ".agents/skills/cc-usr-excel-exporter/assets/CC_Codex 用户满意度标注（试标）.xlsx"
@@ -58,19 +59,19 @@ def spec() -> dict:
     }
 
 
-def human_record() -> dict:
+def ai_record() -> dict:
     values = {
         "session_id": "session-001",
         "turn_id": "turn-001",
         "other_issues": "",
-        "submitter": "human-a",
+        "submitter": "Codex",
         "turn_completed_at": "2026-09-07T10:00:00+08:00",
         "submitted_at": "2026-09-07T11:00:00+08:00",
-        "human_authored": True,
+        "human_authored": False,
     }
     for prefix in ("delivery", "instruction", "planning", "reasoning", "execution"):
         values[f"{prefix}_score"] = 5
-        values[f"{prefix}_description"] = f"人工核对后记录的 {prefix} 具体依据。"
+        values[f"{prefix}_description"] = f"AI 基于轨迹与产物记录的 {prefix} 具体依据。"
     return values
 
 
@@ -108,17 +109,23 @@ class DeliveryPipelineTests(unittest.TestCase):
             command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False
         )
 
-    def test_human_record_qc_approval_and_excel_export(self):
+    def test_ai_record_qc_approval_and_excel_export(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             database = self.prepare(root)
-            input_path = root / "human.json"
-            input_path.write_text(json.dumps(human_record(), ensure_ascii=False), encoding="utf-8")
+            input_path = root / "ai-score.json"
+            input_path.write_text(json.dumps(ai_record(), ensure_ascii=False), encoding="utf-8")
             result = self.run_command([
                 sys.executable, str(COLLECTOR), "--db", str(database), "--batch", "0911",
                 "--question", "1", "--turn", "1", "--from-json", str(input_path),
             ])
             self.assertEqual(result.returncode, 0, result.stdout)
+            connection = connect(database)
+            stored = connection.execute("SELECT * FROM records").fetchone()
+            run = connection.execute("SELECT * FROM runs").fetchone()
+            connection.close()
+            self.assertEqual(stored["human_authored"], 0)
+            self.assertEqual(run["session_id"], "session-001")
 
             result = self.run_command([
                 sys.executable, str(QC), "--db", str(database), "--batch", "0911",
@@ -154,6 +161,59 @@ class DeliveryPipelineTests(unittest.TestCase):
             score_cell = rows[1].find(f"{{{NS}}}c[@r='L2']")
             self.assertIsNotNone(score_cell)
             self.assertEqual(score_cell.attrib.get("t"), "n")
+
+    def test_locator_extracts_session_and_each_prompt_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = self.prepare(root)
+            connection = connect(database)
+            question = connection.execute("SELECT * FROM questions").fetchone()
+            connection.close()
+            claude_root = root / "claude-projects/project"
+            claude_root.mkdir(parents=True)
+            events = [
+                {
+                    "type": "user",
+                    "cwd": question["folder_path"],
+                    "sessionId": "session-claude-001",
+                    "uuid": "prompt-001",
+                    "timestamp": "2026-09-07T09:00:05+08:00",
+                    "message": {"role": "user", "content": question["prompt"]},
+                },
+                {
+                    "type": "assistant",
+                    "sessionId": "session-claude-001",
+                    "timestamp": "2026-09-07T09:01:00+08:00",
+                    "message": {"role": "assistant", "content": "done"},
+                },
+                {
+                    "type": "user",
+                    "cwd": question["folder_path"],
+                    "sessionId": "session-claude-001",
+                    "promptId": "prompt-002",
+                    "timestamp": "2026-09-07T09:02:00+08:00",
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": "继续"}],
+                    },
+                },
+            ]
+            trajectory = claude_root / "session-claude-001.jsonl"
+            trajectory.write_text(
+                "\n".join(json.dumps(event, ensure_ascii=False) for event in events) + "\n",
+                encoding="utf-8",
+            )
+            result = self.run_command([
+                sys.executable, str(LOCATOR), "--db", str(database), "--batch", "0911",
+                "--question", "1", "--claude-root", str(root / "claude-projects"),
+            ])
+            self.assertEqual(result.returncode, 0, result.stdout)
+            located = json.loads(result.stdout)
+            self.assertEqual(located["session_id"], "session-claude-001")
+            self.assertEqual(
+                [turn["prompt_id"] for turn in located["turns"]],
+                ["prompt-001", "prompt-002"],
+            )
 
 
 if __name__ == "__main__":

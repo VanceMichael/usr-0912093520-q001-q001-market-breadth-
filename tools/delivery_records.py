@@ -126,8 +126,8 @@ def validate_one(record: dict, require_human_qc: bool = False) -> tuple[list[str
         description = record.get(f"{prefix}_description")
         if not isinstance(description, str) or not description.strip():
             errors.append(f"{record_id}: {prefix}_description is required")
-    if record.get("human_authored") is not True:
-        errors.append(f"{record_id}: human_authored must be true")
+    if not isinstance(record.get("human_authored"), bool):
+        errors.append(f"{record_id}: human_authored must be boolean")
     if not isinstance(record.get("human_qc_approved"), bool):
         errors.append(f"{record_id}: human_qc_approved must be boolean")
     elif require_human_qc and record["human_qc_approved"] is not True:

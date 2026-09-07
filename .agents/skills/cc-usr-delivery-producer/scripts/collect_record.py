@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Insert one human-authored delivery record into the production database."""
+"""Insert one evidence-backed delivery record into the production database."""
 
 from __future__ import annotations
 
@@ -52,8 +52,8 @@ def ask_score(label: str) -> int:
         print("Score must be an integer from 1 to 5.")
 
 
-def collect_human_fields(turn_no: int) -> dict:
-    print("只填写人工已经确认的内容。本工具不会读取轨迹、评分或改写描述。")
+def collect_fields(turn_no: int) -> dict:
+    print("请填写已经确认的记录内容；自动评分请使用 --from-json。")
     data: dict[str, object] = {
         "session_id": ask("SessionID（人工从当前 Claude Code 会话记录复制）"),
         "turn_id": ask("PromptID（人工从本轮 user 消息复制）"),
@@ -75,20 +75,20 @@ def collect_human_fields(turn_no: int) -> dict:
     for prefix in SCORE_PREFIXES:
         label = labels[prefix]
         data[f"{prefix}_score"] = ask_score(label)
-        data[f"{prefix}_description"] = ask(f"{label} - 描述（人工原文）")
+        data[f"{prefix}_description"] = ask(f"{label} - 描述")
     data.update({
         "other_issues": ask("其他问题（没有可留空）", allow_blank=True),
         "submitter": ask("提交人"),
         "turn_completed_at": ask("本轮完成时间（ISO 8601，含时区）"),
         "submitted_at": now(),
-        "human_authored": ask("确认评分和描述均由本人完成，输入 YES") == "YES",
+        "human_authored": ask("评分和描述是否完全由人工撰写，输入 YES 或 NO") == "YES",
     })
     return data
 
 
 def load_input(path: Path | None, turn_no: int) -> dict:
     if path is None:
-        return collect_human_fields(turn_no)
+        return collect_fields(turn_no)
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -130,7 +130,7 @@ def build_record(
     turn_no: int,
     supplied: dict,
 ) -> dict:
-    human_required = {
+    required_input = {
         "session_id", "turn_id", "delivery_score", "delivery_description",
         "instruction_score", "instruction_description", "planning_score",
         "planning_description", "reasoning_score", "reasoning_description",
@@ -138,10 +138,10 @@ def build_record(
         "turn_completed_at", "human_authored",
     }
     if turn_no > 1:
-        human_required.update({"user_prompt", "task_type", "difficulty", "languages"})
-    missing = sorted(key for key in human_required if key not in supplied)
+        required_input.update({"user_prompt", "task_type", "difficulty", "languages"})
+    missing = sorted(key for key in required_input if key not in supplied)
     if missing:
-        raise ValueError("missing human-provided fields: " + ", ".join(missing))
+        raise ValueError("missing scored input fields: " + ", ".join(missing))
 
     previous = connection.execute(
         "SELECT record_id, session_id FROM records WHERE question_id=? AND turn_no=?",
@@ -194,6 +194,17 @@ def insert_record(connection: sqlite3.Connection, record: dict) -> None:
     connection.commit()
 
 
+def register_session(
+    connection: sqlite3.Connection, run: sqlite3.Row, session_id: str
+) -> None:
+    existing = str(run["session_id"]).strip()
+    if existing and existing != session_id:
+        raise ValueError("SessionID does not match the registered Claude Code run")
+    connection.execute(
+        "UPDATE runs SET session_id=? WHERE id=?", (session_id, run["id"])
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--db", type=Path, default=Path("production.sqlite3"))
@@ -212,6 +223,7 @@ def main() -> int:
         errors, _warnings = validate_one(record)
         if errors:
             raise ValueError("; ".join(errors))
+        register_session(connection, run, record["session_id"])
         insert_record(connection, record)
     except (OSError, ValueError, sqlite3.Error) as exc:
         print(f"Record not stored: {exc}", file=sys.stderr)

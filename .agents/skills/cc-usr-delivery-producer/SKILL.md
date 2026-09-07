@@ -1,33 +1,41 @@
 ---
 name: cc-usr-delivery-producer
-description: After a Claude Code turn, store the human-provided SessionID, PromptID, scores, and descriptions as one delivery record in the production SQLite database. Normalize mechanical metadata, but never inspect trajectories, score performance, or write rating descriptions.
+description: After Claude Code runs, locate its sessions, extract SessionID and PromptID, inspect each turn and resulting code, assign five evidence-based scores, write concrete descriptions, and store delivery records in production SQLite. Do not change target-model output or author questions.
 ---
 
 # CC USR Delivery Producer
 
-Create one SQLite record for every valid user-prompt/model-response turn.
+Produce one scored SQLite delivery record for every valid Claude Code user-prompt/model-response turn.
 
-## Human-only fields
+## Required context
 
-The human expert must personally inspect the process and product, choose all five scores, write all five descriptions, and decide `其他问题`. Never read model trajectories or output, recommend scores, paraphrase evidence, complete descriptions, or improve their wording. If a required human value is missing, request that exact value.
+Read `项目规范.md`, [references/scoring-rubric.md](references/scoring-rubric.md), and [references/record-contract.md](references/record-contract.md). Work only on launched questions in the requested batch. This skill is the immediate next step after the target-model run finishes.
 
-The human must also copy the exact identifiers from Claude Code: the session's `SessionID` and the current user message's `PromptID`. Never search, open, or parse `~/.claude/projects` to obtain them. Do not substitute the task ID, batch run ID, question ID, or record ID. All turns in one Claude window use the same `SessionID`; every turn uses a distinct `PromptID`.
+## Evidence boundary
 
-## Handoff after a run
+- Read the SQLite question and registered run, the matching Claude Code trajectory under `~/.claude/projects`, and the question workspace produced by that run.
+- Use the trajectory only to locate turns, assess the model's process, and extract the exact `SessionID`, each user message's `PromptID`, prompts, timestamps, tool calls, and responses.
+- Inspect the initial snapshot, current Git diff and code, and relevant verification results to assess the product. Run reasonable read-only or test commands when needed, but never repair, rewrite, or improve the target-model output.
+- Do not infer evidence that is absent. If the trajectory match, turn boundary, identifier, or product state is ambiguous, stop and report the blocker instead of guessing.
 
-This is the immediate next skill after a human finishes reviewing a Claude Code turn. Ask for the batch, question number, and turn number, plus the human-only fields, then store the record. For a first turn, the tool copies the original prompt, initial snapshot, task metadata, and registered Claude Code version from SQLite. The user does not re-enter those values.
+## Workflow
 
-## Use
-
-Read `项目规范.md` and [references/record-contract.md](references/record-contract.md), then run:
+1. Query SQLite for the selected question, initial prompt, workspace, snapshot, and latest registered Claude Code run.
+2. Locate the matching session with:
 
 ```bash
-python3 .agents/skills/cc-usr-delivery-producer/scripts/collect_record.py \
-  --db production.sqlite3 --batch 0911 --question 1 --turn 1
+python3 .agents/skills/cc-usr-delivery-producer/scripts/find_claude_turns.py \
+  --db production.sqlite3 --batch <批次> --question <题号>
 ```
 
-For prepared human input, add `--from-json <人工填写文件>`. The tool copies first-turn prompt, snapshot, reproducibility, language, task type, difficulty, and Claude Code version from SQLite. It requires the actual SessionID, PromptID, scores, descriptions, completion time, and confirmation from the human. Later turns also require that turn's exact prompt, type, difficulty, and languages.
+3. Confirm the locator matched the exact workspace and first-turn prompt. Read the selected trajectory and split it into valid turns. Exclude pure network or model-service failures; count a human `继续` after thinking-limit exhaustion.
+4. For every valid turn, extract the exact session ID and user-message prompt ID. All turns from one window must share a `SessionID`; every turn must have a distinct `PromptID`.
+5. Evaluate that turn against the five score dimensions in `项目规范.md`. Compare claims in the response with actual tool activity, repository changes, code, and verification evidence.
+6. Write all five descriptions. For deficiencies, include When, What, and Impact, then add the supported root cause and correct approach. Cover process and product separately when both have issues. Even a score of 5 needs concrete verification evidence.
+7. Create a temporary input JSON matching the record contract, set `human_authored` to `false`, use `Codex` as `submitter`, and store it with `collect_record.py --from-json`. Delete only that temporary input after a successful insert.
+8. Store turns in chronological order. First-turn metadata comes from SQLite; later turns use that turn's exact prompt, task type, difficulty, and languages. Never overwrite an existing question/turn record.
+9. After every valid turn is stored, hand the batch to `$cc-usr-delivery-qc`. Do not approve records or export Excel in this skill.
 
-Records are inserted as unapproved drafts. Existing record IDs and question/turn pairs are never overwritten. Do not include engineering/network failure-only turns; do include human `继续` turns caused by thinking limits.
+## Output quality
 
-Store turns in order. For a one-turn task, run this skill once with `--turn 1`. For a multi-turn task, repeat it after each valid turn with increasing turn numbers, the same `SessionID`, and that turn's distinct `PromptID`. After all records for the batch are stored, hand off to `$cc-usr-delivery-qc`; do not approve or export records in this skill.
+Keep scores and descriptions internally consistent. Name exact steps, commands, files, functions, errors, constraints, or missing requirements. Do not use unsupported adjectives or generic claims such as “表现一般”, “代码有 bug”, or “任务没完成”. Do not blame network or environment failures on model capability.

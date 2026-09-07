@@ -1,4 +1,4 @@
-# Human-only QC checklist
+# Delivery QC checklist
 
 The human reviewer must personally confirm:
 
@@ -9,6 +9,7 @@ The human reviewer must personally confirm:
 - File names, functions, errors, missed requirements, and tool calls are factual.
 - Scores and descriptions do not contradict each other.
 - No obvious issue was omitted.
-- The descriptions were written by the expert, not generated or rewritten by AI.
+- AI-authored records are transparently marked `human_authored=false`.
+- The AI-generated descriptions are supported by the cited trajectory and product evidence rather than generic or fabricated claims.
 
-This checklist cannot be delegated to a model. The approval command only records the reviewer's completed decision.
+The approval command only records the reviewer's completed decision; it does not rewrite scores or descriptions.
