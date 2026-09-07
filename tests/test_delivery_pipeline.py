@@ -59,19 +59,26 @@ def spec() -> dict:
     }
 
 
-def ai_record() -> dict:
+def automated_record() -> dict:
     values = {
         "session_id": "session-001",
         "turn_id": "turn-001",
         "other_issues": "",
-        "submitter": "Codex",
+        "submitter": "测试提交人",
         "turn_completed_at": "2026-09-07T10:00:00+08:00",
         "submitted_at": "2026-09-07T11:00:00+08:00",
         "human_authored": False,
     }
+    descriptions = {
+        "delivery": "接口、持久化和状态推送均已实现，集成测试覆盖断线重连后继续接收事件，完整测试集通过。",
+        "instruction": "逐项核对 prompt 后，指定技术栈、目录边界和禁止项都与提交内容一致，没有发现越界改动。",
+        "planning": "实现顺序先固定数据流和状态约束，再完成服务端与页面联调，最后收敛到测试验证，阶段衔接清楚。",
+        "reasoning": "顺序处理和重连恢复共享同一游标语义，代码中的边界判断与测试场景一致，关键设计没有自相矛盾。",
+        "execution": "文件检索、修改和验证都围绕目标模块展开，失败命令得到及时纠正，最终构建与测试均正常结束。",
+    }
     for prefix in ("delivery", "instruction", "planning", "reasoning", "execution"):
         values[f"{prefix}_score"] = 5
-        values[f"{prefix}_description"] = f"AI 基于轨迹与产物记录的 {prefix} 具体依据。"
+        values[f"{prefix}_description"] = descriptions[prefix]
     return values
 
 
@@ -109,12 +116,12 @@ class DeliveryPipelineTests(unittest.TestCase):
             command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False
         )
 
-    def test_ai_record_qc_approval_and_excel_export(self):
+    def test_automated_record_qc_approval_and_excel_export(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             database = self.prepare(root)
-            input_path = root / "ai-score.json"
-            input_path.write_text(json.dumps(ai_record(), ensure_ascii=False), encoding="utf-8")
+            input_path = root / "score.json"
+            input_path.write_text(json.dumps(automated_record(), ensure_ascii=False), encoding="utf-8")
             result = self.run_command([
                 sys.executable, str(COLLECTOR), "--db", str(database), "--batch", "0911",
                 "--question", "1", "--turn", "1", "--from-json", str(input_path),
@@ -161,6 +168,55 @@ class DeliveryPipelineTests(unittest.TestCase):
             score_cell = rows[1].find(f"{{{NS}}}c[@r='L2']")
             self.assertIsNotNone(score_cell)
             self.assertEqual(score_cell.attrib.get("t"), "n")
+
+    def test_automated_record_rejects_meta_and_template_language(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = self.prepare(root)
+            values = automated_record()
+            values["delivery_description"] = "AI 分析认为功能已经完成。"
+            values["planning_description"] = "When: 修改配置；What: 没有验证；Impact: 交付状态不确定。"
+            input_path = root / "score.json"
+            input_path.write_text(json.dumps(values, ensure_ascii=False), encoding="utf-8")
+            result = self.run_command([
+                sys.executable, str(COLLECTOR), "--db", str(database), "--batch", "0911",
+                "--question", "1", "--turn", "1", "--from-json", str(input_path),
+            ])
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("evaluator self-reference", result.stdout)
+            self.assertIn("prohibited fixed label", result.stdout)
+
+    def test_automated_record_rejects_repeated_descriptions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = self.prepare(root)
+            values = automated_record()
+            repeated = "指定模块已实现并通过测试，代码与用户要求一致，没有发现影响交付的问题。"
+            for prefix in ("delivery", "instruction", "planning", "reasoning", "execution"):
+                values[f"{prefix}_description"] = repeated
+            input_path = root / "score.json"
+            input_path.write_text(json.dumps(values, ensure_ascii=False), encoding="utf-8")
+            result = self.run_command([
+                sys.executable, str(COLLECTOR), "--db", str(database), "--batch", "0911",
+                "--question", "1", "--turn", "1", "--from-json", str(input_path),
+            ])
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("must not repeat verbatim", result.stdout)
+
+    def test_automated_record_rejects_tool_as_submitter(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = self.prepare(root)
+            values = automated_record()
+            values["submitter"] = "Codex"
+            input_path = root / "score.json"
+            input_path.write_text(json.dumps(values, ensure_ascii=False), encoding="utf-8")
+            result = self.run_command([
+                sys.executable, str(COLLECTOR), "--db", str(database), "--batch", "0911",
+                "--question", "1", "--turn", "1", "--from-json", str(input_path),
+            ])
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("real person's name", result.stdout)
 
     def test_locator_extracts_session_and_each_prompt_id(self):
         with tempfile.TemporaryDirectory() as directory:

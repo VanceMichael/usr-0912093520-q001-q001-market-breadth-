@@ -18,4 +18,4 @@ other_issues, submitter, turn_completed_at, human_authored
 
 For turns after the first, the human also supplies `user_prompt`, `task_type`, `difficulty`, and `languages` because classification is based on that turn's actual intent.
 
-Scores are integers 1 through 5. Every description is non-empty even for score 5. Set `human_authored` to false for AI-produced scores and descriptions; never mislabel AI output as human-authored. Timestamps use ISO 8601 with a timezone. The first record has no parent; later records automatically point to the immediately previous stored turn.
+Scores are integers 1 through 5. Every description is non-empty even for score 5. Set `human_authored` to false for automatically produced scores and descriptions; never mislabel them as human-authored. Keep provenance in this internal field, not in exported descriptions. `submitter` is the real person's configured or explicitly supplied name, never a tool or invented identity. Timestamps use ISO 8601 with a timezone. The first record has no parent; later records automatically point to the immediately previous stored turn.

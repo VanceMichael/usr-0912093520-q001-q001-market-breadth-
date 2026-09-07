@@ -25,33 +25,27 @@ Scores are integers from 1 to 5 and must follow the anchors in `项目规范.md`
 
 ## Description requirements
 
-Every description is required, including scores of 5. A supported deficiency must contain:
+Every description is required, including scores of 5. Write as a programmer reporting a concrete review finding to another programmer. A reader should be able to tell, without labels or a prescribed format, where the issue surfaced, what actually happened, and what it changed or prevented. Add the likely cause and the better engineering approach when the available evidence supports both.
 
-1. **When**: the stage, step, tool call, or file edit where it occurred.
-2. **What**: the exact behavior or product defect.
-3. **Impact**: the requirement or business outcome affected.
-4. **Root cause and correction** when the evidence supports them.
+Do not turn those ingredients into visible headings, a checklist, or a repeated sentence frame. Vary the opening, rhythm, and level of detail according to the evidence. Some findings read most naturally from the failed requirement to the code evidence; others should start with a command failure, a mistaken decision, or a specific file. Use “根因是” or “正确做法是” only when it genuinely improves clarity, not as a mandatory tail.
 
-Use these shapes when useful:
+When process and product problems are causally related, explain that connection in ordinary prose. When they are independent, discuss both without inventing a connection.
 
-```text
-过程：在【步骤/环节】，模型【具体行为】，导致【影响】；根因是【依据充分的原因】，正确做法是【可执行做法】。
-产物：产物在【文件/功能】存在【具体问题】，证据是【报错/缺失需求/行为】，因此无法满足【需求】。
-```
+The descriptions are production feedback, not an audit note. They must not identify or discuss the evaluator, the writing process, automation, internal provenance, or how the text was generated. Do not use self-referential wording such as `AI 分析认为`, `Codex 认为`, “自动生成” or “基于轨迹生成”. An exact product, API, or business-domain term may be retained only when it is necessary to describe the task evidence.
 
-When process and product problems are causally related, close the loop in one precise explanation. When they are independent, describe both without forcing a connection.
+Before storing a turn, read the five descriptions as a set. They must not be identical paraphrases with only the dimension name changed, and they must not start with fixed labels such as `When:`、`What:`、`Impact:`、“过程：”或“产物：”. Openers such as “经检查”“根据轨迹”“综合来看” also expose a writing formula instead of getting to the engineering fact. Do not use arrows or bracketed placeholders.
 
 ## Calibration examples
 
 - Weak: `没完成任务，不满意。`
-  Strong: `prompt 要求支持分页，产物只实现列表查询且未处理分页参数，导致大数据量下无法按页读取结果，交付不完整。`
+  Strong: `分页是 prompt 中的核心能力，但查询入口只接收筛选条件，响应结构里也没有页码和总数；数据量增长后调用方仍只能一次取回全部记录。`
 - Weak: `代码有 bug。`
-  Strong: `产物 utils/date.py 的 parse() 未处理时区，输入带 Z 的 ISO 字符串会抛出 ValueError，导致合法时间数据无法导入。`
+  Strong: `utils/date.py` 的 `parse()` 直接交给无时区格式解析，带 `Z` 的合法 ISO 时间会抛出 `ValueError`，导入任务因此会在第一条 UTC 数据处中断。
 - Weak: `过程比较乱。`
-  Strong: `规划阶段后，模型在第 2、4、6 步重复读取 config.py，第 5 步修改后也未运行验证，增加了无效调用并留下未验证交付。`
+  Strong: `完成配置修改后没有执行任何验证，随后又三次回读同一个 config.py，却始终没检查配置是否能被应用加载；这些重复操作没有降低交付风险，最终状态仍未经确认。`
 - Weak: `越改问题越多。`
-  Strong: `终端返回 npm install 版本冲突后，模型连续三次执行相同安装命令，没有检查 package.json 的依赖范围，导致冲突未解决且浪费执行步骤；正确做法是先定位冲突依赖再调整兼容版本。`
+  Strong: `npm install 首次报告 peer dependency 冲突后，相同命令又原样执行了两次。package.json 中的版本范围没有被核对，冲突当然不会自行消失；这里应先定位不兼容的直接依赖，再选择匹配版本。`
 - Weak: `写的代码不符合需求。`
-  Strong: `prompt 明确限制只修改前端缓存逻辑，模型却修改后端数据库查询，违反作用域约束并扩大回归风险；规划阶段应先固定允许修改的边界。`
+  Strong: `需求把修改范围限定在前端缓存层，提交中却包含后端查询重写。这个改动既没有改善指定缓存路径，还把数据库行为纳入回归范围，说明动手前没有固定任务边界。`
 
 For a score of 5, still state what was checked, for example which requirements were implemented, which verification passed, and why no material omission or false success remains.

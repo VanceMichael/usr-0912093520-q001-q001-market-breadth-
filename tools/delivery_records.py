@@ -43,6 +43,20 @@ EXPORT_KEYS = [
     "other_issues", "submitter", "submitted_at", "parent_record",
 ]
 SCORE_KEYS = {f"{prefix}_score" for prefix in SCORE_PREFIXES}
+DESCRIPTION_META_PATTERNS = (
+    re.compile(r"(?i)(?:^|[^A-Za-z])AI\s*(?:分析|生成|评分|撰写|认为)"),
+    re.compile(r"(?:由|作为|本)\s*(?:AI|Codex)\b", re.IGNORECASE),
+    re.compile(r"Codex\s*(?:分析|生成|评分|撰写|认为)", re.IGNORECASE),
+    re.compile(r"(?:自动生成|基于轨迹生成|根据轨迹生成|本评分由)"),
+)
+DESCRIPTION_TEMPLATE_PATTERNS = (
+    re.compile(r"(?:^|[\s；;。])(?:When|What|Impact)\s*[:：]", re.IGNORECASE),
+    re.compile(r"^\s*(?:过程|产物)\s*[:：]"),
+    re.compile(r"^\s*对(?:过程|产物)不满意的原因\s*[:：]"),
+    re.compile(r"^\s*(?:经检查|通过检查|根据轨迹|从轨迹看|结合轨迹|综合来看|总体来看)[，,:：]?"),
+    re.compile(r"[→➡]"),
+    re.compile(r"【(?:第几步|哪个环节|具体行为|什么后果|根因|正确做法|哪个文件|哪个功能)】"),
+)
 
 
 def as_record(row: sqlite3.Row | dict) -> dict:
@@ -93,6 +107,15 @@ def _parse_timestamp(
     return parsed
 
 
+def _description_style_errors(description: str) -> list[str]:
+    errors: list[str] = []
+    if any(pattern.search(description) for pattern in DESCRIPTION_META_PATTERNS):
+        errors.append("contains evaluator self-reference or generation-process wording")
+    if any(pattern.search(description) for pattern in DESCRIPTION_TEMPLATE_PATTERNS):
+        errors.append("uses a prohibited fixed label, arrow, or placeholder template")
+    return errors
+
+
 def validate_one(record: dict, require_human_qc: bool = False) -> tuple[list[str], list[str]]:
     record_id = str(record.get("record_id") or "<unknown>")
     errors: list[str] = []
@@ -104,6 +127,10 @@ def validate_one(record: dict, require_human_qc: bool = False) -> tuple[list[str
     for key in required_text:
         if not isinstance(record.get(key), str) or not record[key].strip():
             errors.append(f"{record_id}: {key} must be non-empty text")
+    if record.get("human_authored") is False:
+        submitter = str(record.get("submitter", "")).strip().casefold()
+        if submitter in {"ai", "codex", "claude", "claude code", "自动", "系统"}:
+            errors.append(f"{record_id}: submitter must be a real person's name")
     for key in ("other_issues", "parent_record"):
         if not isinstance(record.get(key), str):
             errors.append(f"{record_id}: {key} must be text")
@@ -126,6 +153,17 @@ def validate_one(record: dict, require_human_qc: bool = False) -> tuple[list[str
         description = record.get(f"{prefix}_description")
         if not isinstance(description, str) or not description.strip():
             errors.append(f"{record_id}: {prefix}_description is required")
+        elif record.get("human_authored") is False:
+            for style_error in _description_style_errors(description):
+                errors.append(f"{record_id}: {prefix}_description {style_error}")
+    if record.get("human_authored") is False:
+        descriptions = [
+            re.sub(r"\s+", "", str(record.get(f"{prefix}_description", "")))
+            for prefix in SCORE_PREFIXES
+        ]
+        repeated = [text for text, count in Counter(descriptions).items() if text and count > 1]
+        if repeated:
+            errors.append(f"{record_id}: score descriptions must not repeat verbatim")
     if not isinstance(record.get("human_authored"), bool):
         errors.append(f"{record_id}: human_authored must be boolean")
     if not isinstance(record.get("human_qc_approved"), bool):
