@@ -25,6 +25,7 @@ SCORE_PREFIXES = ("delivery", "instruction", "planning", "reasoning", "execution
 SNAPSHOT_RE = re.compile(
     r"^https://github\.com/[^/]+/[^/]+/commit/[0-9a-fA-F]{40}$"
 )
+NUMERIC_HARNESS_VERSION_RE = re.compile(r"^\d+(?:\.\d+)+$")
 
 EXPORT_HEADERS = [
     "User Prompt", "SessionID", "TurnID/PromptID", "初始环境快照",
@@ -156,6 +157,13 @@ def validate_one(
     ):
         if record.get(key) not in allowed:
             errors.append(f"{record_id}: invalid {key}")
+    if (
+        record.get("harness") == "Claude Code"
+        and not NUMERIC_HARNESS_VERSION_RE.fullmatch(
+            str(record.get("harness_version", "")).strip()
+        )
+    ):
+        errors.append(f"{record_id}: Claude Code harness_version must be numeric only")
     turn_no = record.get("turn_no")
     if isinstance(turn_no, bool) or not isinstance(turn_no, int) or not 1 <= turn_no <= 10:
         errors.append(f"{record_id}: turn_no must be integer 1-10")

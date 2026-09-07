@@ -109,7 +109,7 @@ class DeliveryPipelineTests(unittest.TestCase):
             connection.execute(
                 "INSERT INTO runs(question_id, batch_run_id, launched_at, harness, harness_version) "
                 "VALUES(?, ?, '2026-09-07T09:00:00+08:00', "
-                "'Claude Code', '2.1.259 (Claude Code)')",
+                "'Claude Code', '2.1.259')",
                 (question["id"], f"run-{question['question_no']:03d}"),
             )
         connection.commit()

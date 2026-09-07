@@ -94,6 +94,21 @@ class RunnerTests(unittest.TestCase):
         command = launch_task.build_claude_command("/usr/local/bin/claude", prompt)
         self.assertEqual(command, ["/usr/local/bin/claude", prompt])
 
+    def test_claude_version_keeps_only_numeric_version(self):
+        completed = subprocess.CompletedProcess(
+            ["claude", "--version"], 0, "2.1.259 (Claude Code)\n", ""
+        )
+        with mock.patch.object(run_tasks.subprocess, "run", return_value=completed):
+            self.assertEqual(run_tasks.claude_version("/usr/local/bin/claude"), "2.1.259")
+
+    def test_claude_version_requires_numeric_version(self):
+        completed = subprocess.CompletedProcess(
+            ["claude", "--version"], 0, "Claude Code\n", ""
+        )
+        with mock.patch.object(run_tasks.subprocess, "run", return_value=completed):
+            with self.assertRaisesRegex(RuntimeError, "numeric version"):
+                run_tasks.claude_version("/usr/local/bin/claude")
+
     def test_root_env_maps_to_claude_environment_without_cli_options(self):
         with tempfile.TemporaryDirectory() as directory:
             config = launch_task.load_claude_config(self.write_env(Path(directory)))
@@ -136,7 +151,7 @@ class RunnerTests(unittest.TestCase):
             with mock.patch.object(sys, "argv", argv), mock.patch.object(
                 run_tasks, "find_claude", return_value="/usr/local/bin/claude"
             ), mock.patch.object(
-                run_tasks, "claude_version", return_value="2.1.259 (Claude Code)"
+                run_tasks, "claude_version", return_value="2.1.259"
             ), redirect_stdout(stdout):
                 self.assertEqual(run_tasks.main(), 0)
             output = stdout.getvalue()
@@ -158,7 +173,7 @@ class RunnerTests(unittest.TestCase):
             with mock.patch.object(sys, "argv", argv), mock.patch.object(
                 run_tasks, "find_claude", return_value="/usr/local/bin/claude"
             ), mock.patch.object(
-                run_tasks, "claude_version", return_value="2.1.259 (Claude Code)"
+                run_tasks, "claude_version", return_value="2.1.259"
             ), mock.patch.object(
                 run_tasks, "iterm_available", return_value=True
             ), mock.patch.object(
@@ -184,7 +199,8 @@ class RunnerTests(unittest.TestCase):
             ).fetchone()[0]
             connection.close()
             self.assertEqual(run["harness"], "Claude Code")
-            self.assertEqual(run["harness_version"], "2.1.259 (Claude Code)")
+            self.assertEqual(run["codex_version"], "2.1.259")
+            self.assertEqual(run["harness_version"], "2.1.259")
             self.assertEqual(status, "running")
 
     def test_changed_prompt_is_blocked_after_qc(self):

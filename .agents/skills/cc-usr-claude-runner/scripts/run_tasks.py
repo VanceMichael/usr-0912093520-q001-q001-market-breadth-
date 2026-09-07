@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import platform
+import re
 import shlex
 import shutil
 import sqlite3
@@ -36,7 +37,13 @@ def claude_version(claude: str) -> str:
     )
     if result.returncode:
         raise RuntimeError(result.stdout.strip() or "claude --version failed")
-    return result.stdout.strip()
+    match = re.search(r"\b\d+(?:\.\d+)+\b", result.stdout)
+    if not match:
+        raise RuntimeError(
+            "claude --version did not contain a numeric version: "
+            + (result.stdout.strip() or "<empty output>")
+        )
+    return match.group(0)
 
 
 def is_ready(row: sqlite3.Row) -> bool:
