@@ -55,8 +55,8 @@ def ask_score(label: str) -> int:
 def collect_human_fields(turn_no: int) -> dict:
     print("只填写人工已经确认的内容。本工具不会读取轨迹、评分或改写描述。")
     data: dict[str, object] = {
-        "session_id": ask("SessionID"),
-        "turn_id": ask("TurnID/PromptID"),
+        "session_id": ask("SessionID（人工从当前 Claude Code 会话记录复制）"),
+        "turn_id": ask("PromptID（人工从本轮 user 消息复制）"),
     }
     if turn_no > 1:
         data.update({
@@ -220,6 +220,7 @@ def main() -> int:
         if connection is not None:
             connection.close()
     print(f"Stored draft record {record['record_id']} in {args.db.resolve()}")
+    print("下一步：按顺序录入其余有效轮次；批次全部录入后执行交付质检。")
     return 0
 
 
