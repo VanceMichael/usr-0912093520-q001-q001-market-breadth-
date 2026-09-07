@@ -23,9 +23,9 @@ from tools.batch_pipeline import (  # noqa: E402
 
 def make_question(index: int, *, difficulty: str = "困难") -> dict:
     domains = {
-        1: ("结算重试状态机", "梳理支付回调、任务队列和账务落库之间的状态流，修复重复回调时的竞态，并补齐故障恢复测试。", "payment-race"),
-        2: ("文档协作离线合并", "为现有编辑器、同步服务和冲突存储增加离线变更合并能力，覆盖重连、乱序事件和权限变化。", "offline-merge"),
-        3: ("媒体处理背压", "重构上传入口、转码队列与进度推送的背压策略，保持外部协议兼容并加入压力场景验证。", "media-backpressure"),
+        1: ("结算重试状态机", "从零构建一套支付结算服务，贯通回调接收、任务调度、账务记录和故障恢复，并保证重复通知与并发处理下的状态一致。", "payment-race"),
+        2: ("文档协作离线合并", "从零构建一套文档协作服务，完整处理本地编辑、离线变更、重连合并、乱序事件、权限变化和冲突留痕。", "offline-merge"),
+        3: ("媒体处理背压", "从零构建一套媒体处理服务，覆盖上传接入、转码排队、流量背压、进度通知、失败恢复和压力场景验证。", "media-backpressure"),
     }
     title, prompt, tag = domains[index]
     return {
@@ -33,7 +33,7 @@ def make_question(index: int, *, difficulty: str = "困难") -> dict:
         "task_id": f"0911-{index:03d}",
         "title": title,
         "prompt": prompt,
-        "task_type": "Feature 迭代",
+        "task_type": "0-1 代码生成",
         "difficulty": difficulty,
         "languages": ["Go", "TypeScript"],
         "repo_url": f"https://github.com/example/project-{index}",
@@ -117,6 +117,32 @@ class BatchPipelineTests(unittest.TestCase):
             self.assertFalse((root / "0911").exists())
             connection.close()
 
+    def test_non_zero_to_one_first_turn_is_rejected_without_creating_folder(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = json.loads(self.write_spec(root, count=1).read_text(encoding="utf-8"))
+            spec["questions"][0]["task_type"] = "Feature 迭代"
+            path = root / "spec.json"
+            path.write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
+            connection = connect(root / "production.sqlite3")
+            with self.assertRaisesRegex(ValueError, "first-turn task_type must be 0-1 代码生成"):
+                create_batch(connection, root, path)
+            self.assertFalse((root / "0911").exists())
+            connection.close()
+
+    def test_multi_paragraph_first_turn_is_rejected_without_creating_folder(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            spec = json.loads(self.write_spec(root, count=1).read_text(encoding="utf-8"))
+            spec["questions"][0]["prompt"] += "\n第二段验收要求。"
+            path = root / "spec.json"
+            path.write_text(json.dumps(spec, ensure_ascii=False), encoding="utf-8")
+            connection = connect(root / "production.sqlite3")
+            with self.assertRaisesRegex(ValueError, "first-turn prompt must be one paragraph"):
+                create_batch(connection, root, path)
+            self.assertFalse((root / "0911").exists())
+            connection.close()
+
     def test_qc_and_human_approval_make_question_ready(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -154,6 +180,55 @@ class BatchPipelineTests(unittest.TestCase):
                 connection.execute("SELECT mechanical_qc FROM questions").fetchone()[0],
                 "reject",
             )
+            connection.close()
+
+    def test_mechanical_qc_blocks_legacy_non_zero_to_one_first_turn(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            connection = connect(root / "production.sqlite3")
+            create_batch(connection, root, self.write_spec(root, count=1))
+            row = connection.execute("SELECT * FROM questions").fetchone()
+            set_repository(
+                connection,
+                "0911",
+                1,
+                "https://github.com/example/project-1",
+                f"https://github.com/example/project-1/commit/{row['local_initial_sha']}",
+            )
+            connection.execute(
+                "UPDATE questions SET task_type='Feature 迭代' WHERE id=?", (row["id"],)
+            )
+            connection.commit()
+            self.assertEqual(run_mechanical_qc(connection, "0911", "1"), 1)
+            report = json.loads(
+                connection.execute("SELECT qc_report FROM questions").fetchone()[0]
+            )
+            self.assertIn("首轮任务类型必须是 0-1 代码生成", report["errors"])
+            connection.close()
+
+    def test_mechanical_qc_blocks_legacy_multi_paragraph_prompt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            connection = connect(root / "production.sqlite3")
+            create_batch(connection, root, self.write_spec(root, count=1))
+            row = connection.execute("SELECT * FROM questions").fetchone()
+            set_repository(
+                connection,
+                "0911",
+                1,
+                "https://github.com/example/project-1",
+                f"https://github.com/example/project-1/commit/{row['local_initial_sha']}",
+            )
+            connection.execute(
+                "UPDATE questions SET prompt=prompt || char(10) || '第二段' WHERE id=?",
+                (row["id"],),
+            )
+            connection.commit()
+            self.assertEqual(run_mechanical_qc(connection, "0911", "1"), 1)
+            report = json.loads(
+                connection.execute("SELECT qc_report FROM questions").fetchone()[0]
+            )
+            self.assertIn("首轮 User Prompt 必须是一个自然语言段落", report["errors"])
             connection.close()
 
 

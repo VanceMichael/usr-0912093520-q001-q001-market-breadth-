@@ -21,6 +21,7 @@ TASK_TYPES = {
     "0-1 代码生成", "Feature 迭代", "Bug 修复", "代码理解",
     "代码重构", "工程化", "代码测试",
 }
+FIRST_TURN_TASK_TYPE = "0-1 代码生成"
 DIFFICULTIES = {"简单", "中等", "困难", "地狱"}
 REPRODUCIBILITY = {
     "无外部依赖", "有外部依赖，未容器化", "已容器化，可一键起环境",
@@ -395,8 +396,14 @@ def create_batch(connection: sqlite3.Connection, workspace: Path, spec_path: Pat
         reproducibility = str(item.get("reproducibility", "无外部依赖")).strip()
         if not prompt or not title:
             raise ValueError(f"question {index} requires title and prompt")
+        if "\n" in prompt or "\r" in prompt:
+            raise ValueError(f"question {index} first-turn prompt must be one paragraph")
         if task_type not in TASK_TYPES:
             raise ValueError(f"question {index} has invalid task_type")
+        if task_type != FIRST_TURN_TASK_TYPE:
+            raise ValueError(
+                f"question {index} first-turn task_type must be {FIRST_TURN_TASK_TYPE}"
+            )
         if difficulty not in DIFFICULTIES or difficulty == "简单":
             raise ValueError(f"question {index} first-turn difficulty must be 中等/困难/地狱")
         if not isinstance(languages, list) or not languages or not all(
@@ -457,6 +464,10 @@ def check_question(connection: sqlite3.Connection, row: sqlite3.Row) -> dict:
     warnings: list[str] = []
     prompt = row["prompt"].strip()
     combined = normalize(row["title"] + "\n" + prompt)
+    if row["task_type"] != FIRST_TURN_TASK_TYPE:
+        errors.append(f"首轮任务类型必须是 {FIRST_TURN_TASK_TYPE}")
+    if "\n" in prompt or "\r" in prompt:
+        errors.append("首轮 User Prompt 必须是一个自然语言段落")
     if row["difficulty"] == "简单":
         errors.append("首轮题目不能是简单")
     banned = sorted(term for term in BANNED_TERMS if term in combined)

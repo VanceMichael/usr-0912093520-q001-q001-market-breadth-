@@ -12,7 +12,7 @@ Use an internal JSON object only as input to `tools/batch_pipeline.py create-bat
       "task_id": "0911-001",
       "title": "简短题名",
       "prompt": "首轮完整 User Prompt 原文",
-      "task_type": "Feature 迭代",
+      "task_type": "0-1 代码生成",
       "difficulty": "困难",
       "languages": ["Go", "React"],
       "repo_url": "https://github.com/org/repo",
@@ -26,8 +26,10 @@ Use an internal JSON object only as input to `tools/batch_pipeline.py create-bat
 }
 ```
 
-Allowed task types: `0-1 代码生成`, `Feature 迭代`, `Bug 修复`, `代码理解`, `代码重构`, `工程化`, `代码测试`.
+For batch authoring, every first-turn `task_type` must be `0-1 代码生成`. Other task types remain valid only for later conversation turns and delivery records; they are not accepted by `create-batch`.
 
 Allowed first-turn difficulties: `中等`, `困难`, `地狱`.
 
-Each question folder is the exact working directory later passed to Codex. The folder starts as a clean Git repository. Prepare or copy the intended baseline into it, commit and publish it, then store its accessible GitHub permalink before production QC. Never put `.env`, API keys, prompts, QC reports, ratings, or internal difficulty evidence inside the question workspace.
+Each prompt is one natural-language paragraph whose primary action is to build a complete project or a complete module from zero. It must not describe extending or repairing an already implemented capability.
+
+Each question folder is the exact working directory later passed to Codex. The folder starts as a clean Git repository. Prepare or copy only the intended scaffold, contracts, fixtures, or other genuine starting context; do not pre-implement the requested complete project or module. Commit and publish it, then store its accessible GitHub permalink before production QC. Never put `.env`, API keys, prompts, QC reports, ratings, or internal difficulty evidence inside the question workspace.

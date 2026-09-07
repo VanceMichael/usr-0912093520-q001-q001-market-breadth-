@@ -43,9 +43,9 @@ def spec() -> dict:
         "questions": [{
             "folder": "q001",
             "task_id": "0911-001",
-            "title": "跨模块一致性修复",
-            "prompt": "修复服务端事件乱序导致的前端状态回退，覆盖持久化、推送和重连测试。",
-            "task_type": "Bug 修复",
+            "title": "跨模块事件协作服务",
+            "prompt": "从零构建一套事件协作服务，覆盖事件接入、顺序处理、持久化、状态推送、断线重连和完整验证场景。",
+            "task_type": "0-1 代码生成",
             "difficulty": "困难",
             "languages": ["Go", "TypeScript"],
             "repo_url": "https://github.com/example/project",

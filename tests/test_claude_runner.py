@@ -37,9 +37,9 @@ def question_spec(batch: str) -> dict:
         "questions": [{
             "folder": "q001",
             "task_id": f"{batch}-001",
-            "title": "跨模块状态一致性",
-            "prompt": "检查现有前端状态流和后端事件处理，修复并发更新时的状态不一致，并补充跨模块回归测试。",
-            "task_type": "Bug 修复",
+            "title": "跨模块状态服务",
+            "prompt": "从零构建一套跨模块状态服务，覆盖事件接收、持久化、推送、重连恢复、并发更新冲突和完整验证场景。",
+            "task_type": "0-1 代码生成",
             "difficulty": "困难",
             "languages": ["Python", "TypeScript"],
             "repo_url": "https://github.com/example/project",
