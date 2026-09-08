@@ -8,11 +8,14 @@ const state = {
   view: "production",
   pendingAction: null,
   config: null,
+  environment: null,
   authorJobs: [],
   pipelineJobs: [],
 };
 let drawerCloseTimer = null;
 let authorJobsTimer = null;
+let authorJobsSignature = "";
+let pipelineJobsSignature = "";
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
@@ -191,6 +194,36 @@ function renderSettings() {
   $("#config-codex-concurrency").value = state.config.codex_concurrency || 2;
 }
 
+function renderEnvironment() {
+  const container = $("#environment-status");
+  if (!container || !state.environment) return;
+  const status = state.environment;
+  const summary = "<div class=\"environment-summary " + (status.ok ? "ok" : "failed") + "\"><span class=\"status-dot\"></span><strong>" + (status.ok ? "环境可用" : "环境不可用") + "</strong><small>检测于 " + escapeHtml(formatDate(status.checked_at)) + "</small></div>";
+  const checks = (status.checks || []).map((check) =>
+    "<div class=\"environment-check " + (check.ok ? "ok" : "failed") + "\"><i data-lucide=\"" + (check.ok ? "check-circle-2" : "x-circle") + "\"></i><div><strong>" + escapeHtml(check.name) + "</strong><span>" + escapeHtml(check.detail) + "</span></div></div>"
+  ).join("");
+  const messages = (status.repair_messages || []).map((message) =>
+    "<p class=\"environment-message\">" + escapeHtml(message) + "</p>"
+  ).join("");
+  container.innerHTML = summary + "<div class=\"environment-checks\">" + checks + "</div>" + messages;
+  refreshIcons();
+}
+
+async function loadEnvironment(repair = false) {
+  const button = $("#environment-repair");
+  if (button) button.disabled = true;
+  try {
+    state.environment = await api(repair ? "/api/actions/environment-repair" : "/api/environment", repair ? { method: "POST", body: "{}" } : {});
+    renderEnvironment();
+    if (!state.environment.ok) toast("运行环境不可用，请先修复", true);
+    else if (repair) toast("运行环境已通过检测");
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
 function pipelineStatus(status) {
   return ({
     queued: "排队中",
@@ -208,6 +241,17 @@ function pipelineStatus(status) {
   })[status] || status;
 }
 
+function pipelineItemLabel(item) {
+  if (item.status !== "model_running") return pipelineStatus(item.status);
+  return ({
+    starting: "模型容器启动中",
+    healthy: "模型运行正常",
+    idle: "模型运行中，暂时无新轨迹",
+    unavailable: "模型容器状态异常",
+    stalled: "模型运行已停滞",
+  })[item.health_status] || "模型运行中，等待健康确认";
+}
+
 function scrollJobLogsToLatest() {
   document.querySelectorAll(".author-job-output").forEach((output) => {
     output.scrollTop = output.scrollHeight;
@@ -223,23 +267,59 @@ function renderPipelineJobs() {
   }
   list.innerHTML = state.pipelineJobs.map((job) => `
     <article class="pipeline-job status-${escapeHtml(job.status)}">
-      <div class="pipeline-job-head"><div><strong>#${job.id} · ${escapeHtml(job.batch_name)}</strong><span>${job.question_count} 题 · Docker ${escapeHtml(job.docker_image)}</span></div><span class="job-status">${escapeHtml(pipelineStatus(job.status))}</span></div>
-      <div class="pipeline-job-meta"><span>质检并发 ${job.qc_concurrency}</span><span>模型并发 ${job.model_concurrency}</span><span>交付并发 ${job.codex_concurrency}</span><span>${escapeHtml(formatDate(job.created_at))}</span></div>
-      <div class="pipeline-item-grid">${(job.items || []).map((item) => `<span class="pipeline-item status-${escapeHtml(item.status.replaceAll("_", "-"))}"${item.error ? ` title="${escapeHtml(item.error)}"` : ""}>第 ${item.question_no} 题：${escapeHtml(pipelineStatus(item.status))}</span>`).join("")}</div>
+      <div class="pipeline-job-head"><div><strong>#${job.id} · ${escapeHtml(job.batch_name)}</strong><span>${job.question_count} 题 · Docker ${escapeHtml(job.docker_image)}</span></div><div class="job-actions">${job.can_retry ? `<button class="button secondary compact" type="button" data-pipeline-retry="${job.id}"><i data-lucide="rotate-ccw"></i>从失败处重试</button>` : ""}<span class="job-status">${escapeHtml(pipelineStatus(job.status))}</span></div></div>
+      <div class="pipeline-job-meta"><span>质检并发 ${job.qc_concurrency}</span><span>模型并发 ${job.model_concurrency}</span><span>交付并发 ${job.codex_concurrency}</span>${job.retry_of_job_id ? `<span>重试自 #${job.retry_of_job_id}</span>` : ""}<span>${escapeHtml(formatDate(job.created_at))}</span></div>
+      <div class="pipeline-item-grid">${(job.items || []).map((item) => `<span class="pipeline-item status-${escapeHtml(item.status.replaceAll("_", "-"))} health-${escapeHtml(item.health_status || "unknown")}"${item.error ? ` title="${escapeHtml(item.error)}"` : ""}><span>第 ${item.question_no} 题：${escapeHtml(pipelineItemLabel(item))}</span>${item.status === "model_running" && item.health_detail ? `<small>${escapeHtml(item.health_detail)} · 最近活动 ${escapeHtml(formatDate(item.activity_at || item.heartbeat_at))}</small>` : ""}</span>`).join("")}</div>
       ${job.error ? `<div class="author-job-error">${escapeHtml(job.error)}</div>` : ""}
       <pre class="author-job-output">${escapeHtml(job.output || job.last_message || "等待流水线启动...")}</pre>
     </article>`).join("");
   scrollJobLogsToLatest();
+  refreshIcons();
+}
+
+function retryPipelineJob(jobId) {
+  openModal("从失败处重试", `将保留任务 #${jobId} 的日志和原始轨迹，跳过已有有效结果，从首个失败阶段继续。`, "开始重试", async () => {
+    closeModal();
+    const button = document.querySelector(`[data-pipeline-retry="${jobId}"]`);
+    if (button) button.disabled = true;
+    try {
+      const result = await api("/api/actions/auto-pipeline-retry", {
+        method: "POST", body: JSON.stringify({ job_id: jobId }),
+      });
+      toast(result.message || "重试任务已启动");
+      await loadPipelineJobs();
+    } catch (error) {
+      toast(error.message, true);
+      if (button) button.disabled = false;
+    }
+  });
 }
 
 let pipelineJobsTimer = null;
 async function loadPipelineJobs() {
+  if (document.hidden) return;
   try {
     const result = await api("/api/pipeline-jobs");
-    state.pipelineJobs = result.jobs || [];
-    renderPipelineJobs();
+    const seenBatches = new Set();
+    state.pipelineJobs = (result.jobs || []).filter((job) => {
+      if (seenBatches.has(job.batch_name)) return false;
+      seenBatches.add(job.batch_name);
+      return true;
+    }).map((job) => ({ ...job, output: (job.output || "").slice(-30000) }));
+    const signature = JSON.stringify(state.pipelineJobs.map((job) => ({
+      id: job.id, status: job.status, outputLength: job.output_length,
+      lastMessage: job.last_message, error: job.error,
+      items: (job.items || []).map((item) => [
+        item.id, item.status, item.heartbeat_at, item.activity_at,
+        item.health_status, item.health_detail, item.error,
+      ]),
+    })));
+    if (signature !== pipelineJobsSignature) {
+      pipelineJobsSignature = signature;
+      renderPipelineJobs();
+    }
     const active = state.pipelineJobs.some((job) => job.status === "queued" || job.status === "running");
-    if (active && !pipelineJobsTimer) pipelineJobsTimer = setInterval(loadPipelineJobs, 1500);
+    if (active && !pipelineJobsTimer) pipelineJobsTimer = setInterval(loadPipelineJobs, 6000);
     if (!active && pipelineJobsTimer) { clearInterval(pipelineJobsTimer); pipelineJobsTimer = null; }
   } catch (error) { toast(error.message, true); }
 }
@@ -285,13 +365,22 @@ function renderAuthorJobs() {
 }
 
 async function loadAuthorJobs() {
+  if (document.hidden) return;
   try {
     const result = await api("/api/author-jobs");
-    state.authorJobs = result.jobs || [];
-    renderAuthorJobs();
+    state.authorJobs = (result.jobs || []).slice(0, 20).map((job) => ({
+      ...job, output: (job.output || "").slice(-30000),
+    }));
+    const signature = JSON.stringify(state.authorJobs.map((job) => [
+      job.id, job.status, job.output_length, job.last_message, job.error,
+    ]));
+    if (signature !== authorJobsSignature) {
+      authorJobsSignature = signature;
+      renderAuthorJobs();
+    }
     const active = state.authorJobs.some((job) => job.status === "queued" || job.status === "running");
     if (active && !authorJobsTimer) {
-      authorJobsTimer = setInterval(loadAuthorJobs, 1200);
+      authorJobsTimer = setInterval(loadAuthorJobs, 6000);
     } else if (!active && authorJobsTimer) {
       clearInterval(authorJobsTimer);
       authorJobsTimer = null;
@@ -656,6 +745,7 @@ $("#settings-form").addEventListener("submit", async (event) => {
     refreshIcons();
   }
 });
+$("#environment-repair").addEventListener("click", () => loadEnvironment(true));
 $("#toggle-api-key").addEventListener("click", () => {
   const input = $("#config-api-key");
   const showing = input.type === "text";
@@ -671,6 +761,16 @@ $("#file-list").addEventListener("click", (event) => {
 });
 $("#auto-pipeline-button").addEventListener("click", startAutoPipeline);
 $("#pipeline-jobs-refresh").addEventListener("click", loadPipelineJobs);
+$("#pipeline-job-list").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-pipeline-retry]");
+  if (button) retryPipelineJob(Number(button.dataset.pipelineRetry));
+});
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) {
+    loadPipelineJobs();
+    loadAuthorJobs();
+  }
+});
 $("#drawer-close").addEventListener("click", closeDrawer);
 $("#drawer-backdrop").addEventListener("click", closeDrawer);
 $("#modal-cancel").addEventListener("click", closeModal);
@@ -690,5 +790,6 @@ refreshIcons();
 renderAuthorCommand();
 loadDashboard();
 loadConfig();
+loadEnvironment();
 loadAuthorJobs();
 loadPipelineJobs();

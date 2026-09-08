@@ -40,6 +40,10 @@ PIPELINE_ENV_KEYS = (
 AUTHOR_JOB_OUTPUT_LIMIT = 200_000
 AUTHOR_JOB_STATUSES = {"queued", "running", "completed", "failed", "interrupted"}
 
+sys.path.insert(0, str(PROJECT_ROOT))
+from tools.runtime_environment import docker_info, repair_docker_engine  # noqa: E402
+from tools.batch_pipeline import SCHEMA_VERSION  # noqa: E402
+
 AUTHOR_JOB_SCHEMA = """
 CREATE TABLE IF NOT EXISTS author_jobs (
     id INTEGER PRIMARY KEY,
@@ -74,6 +78,7 @@ CREATE TABLE IF NOT EXISTS pipeline_jobs (
     last_message TEXT NOT NULL DEFAULT '',
     error TEXT NOT NULL DEFAULT '',
     pid INTEGER,
+    retry_of_job_id INTEGER REFERENCES pipeline_jobs(id) ON DELETE SET NULL,
     created_at TEXT NOT NULL,
     started_at TEXT NOT NULL DEFAULT '',
     finished_at TEXT NOT NULL DEFAULT ''
@@ -86,6 +91,10 @@ CREATE TABLE IF NOT EXISTS pipeline_items (
     status TEXT NOT NULL DEFAULT 'queued',
     output TEXT NOT NULL DEFAULT '',
     error TEXT NOT NULL DEFAULT '',
+    heartbeat_at TEXT NOT NULL DEFAULT '',
+    activity_at TEXT NOT NULL DEFAULT '',
+    health_status TEXT NOT NULL DEFAULT '',
+    health_detail TEXT NOT NULL DEFAULT '',
     started_at TEXT NOT NULL DEFAULT '',
     finished_at TEXT NOT NULL DEFAULT '',
     UNIQUE (pipeline_job_id, question_id)
@@ -196,6 +205,23 @@ class ConsoleData:
             }
             if "pid" not in columns:
                 connection.execute("ALTER TABLE pipeline_jobs ADD COLUMN pid INTEGER")
+            if "retry_of_job_id" not in columns:
+                connection.execute(
+                    "ALTER TABLE pipeline_jobs ADD COLUMN retry_of_job_id INTEGER REFERENCES pipeline_jobs(id) ON DELETE SET NULL"
+                )
+            item_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(pipeline_items)")
+            }
+            for name in ("heartbeat_at", "activity_at", "health_status", "health_detail"):
+                if name not in item_columns:
+                    connection.execute(
+                        f"ALTER TABLE pipeline_items ADD COLUMN {name} TEXT NOT NULL DEFAULT ''"
+                    )
+            connection.execute(
+                "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(SCHEMA_VERSION),),
+            )
             timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
             active_ids = [
                 int(row["id"]) for row in connection.execute(
@@ -261,30 +287,53 @@ class ConsoleData:
             raise ValueError("业务关键词不能为空")
         return batch, count, values[0], values[1], values[2]
 
-    def author_jobs(self, limit: int = 50) -> list[dict]:
+    def author_jobs(self, limit: int = 20) -> list[dict]:
         with closing(self.connect()) as connection:
             rows = connection.execute(
-                "SELECT * FROM author_jobs ORDER BY created_at DESC, id DESC LIMIT ?",
-                (max(1, min(limit, 100)),),
+                "SELECT id,batch_name,question_count,business,technology,notes,prompt,status,"
+                "substr(output,-30000) AS output,length(output) AS output_length,last_message,"
+                "error,pid,created_at,started_at,finished_at FROM author_jobs "
+                "ORDER BY created_at DESC,id DESC LIMIT ?",
+                (max(1, min(limit, 50)),),
             ).fetchall()
         return [dict(row) for row in rows]
 
     def pipeline_jobs(self, limit: int = 20) -> list[dict]:
         with closing(self.connect()) as connection:
             jobs = connection.execute(
-                "SELECT * FROM pipeline_jobs ORDER BY created_at DESC, id DESC LIMIT ?",
+                "SELECT p.id,p.batch_name,p.question_count,p.qc_concurrency,p.model_concurrency,"
+                "p.codex_concurrency,p.docker_image,p.docker_command,p.status,"
+                "substr(p.output,-30000) AS output,length(p.output) AS output_length,"
+                "p.last_message,p.error,p.pid,p.retry_of_job_id,p.created_at,p.started_at,p.finished_at "
+                "FROM pipeline_jobs p WHERE p.id=(SELECT MAX(latest.id) FROM pipeline_jobs latest "
+                "WHERE latest.batch_name=p.batch_name) ORDER BY p.created_at DESC,p.id DESC LIMIT ?",
                 (max(1, min(limit, 50)),),
             ).fetchall()
-            items = connection.execute(
-                "SELECT * FROM pipeline_items WHERE pipeline_job_id IN "
-                "(SELECT id FROM pipeline_jobs ORDER BY created_at DESC, id DESC LIMIT ?) "
-                "ORDER BY pipeline_job_id DESC, question_no",
-                (max(1, min(limit, 50)),),
-            ).fetchall()
+            job_ids = [int(job["id"]) for job in jobs]
+            if job_ids:
+                placeholders = ",".join("?" for _ in job_ids)
+                items = connection.execute(
+                    "SELECT id,pipeline_job_id,question_id,question_no,status,error,"
+                    "heartbeat_at,activity_at,health_status,health_detail,started_at,finished_at "
+                    f"FROM pipeline_items WHERE pipeline_job_id IN ({placeholders}) "
+                    "ORDER BY pipeline_job_id DESC,question_no",
+                    job_ids,
+                ).fetchall()
+            else:
+                items = []
         by_job: dict[int, list[dict]] = {}
         for item in items:
             by_job.setdefault(int(item["pipeline_job_id"]), []).append(dict(item))
-        return [{**dict(job), "items": by_job.get(int(job["id"]), [])} for job in jobs]
+        return [
+            {
+                **dict(job),
+                "items": by_job.get(int(job["id"]), []),
+                "can_retry": (
+                    job["status"] in {"failed", "interrupted"}
+                ),
+            }
+            for job in jobs
+        ]
 
     def create_pipeline_job(self, body: dict[str, object]) -> dict[str, object]:
         batch = str(body.get("batch", "")).strip()
@@ -347,6 +396,72 @@ class ConsoleData:
             qc_concurrency, model_concurrency, codex_concurrency, script,
         )
         return {"ok": True, "job_id": job_id, "message": f"一键流水线 #{job_id} 已启动"}
+
+    def retry_pipeline_job(self, body: dict[str, object]) -> dict[str, object]:
+        try:
+            source_job_id = int(body.get("job_id", 0))
+        except (TypeError, ValueError):
+            raise ValueError("重试任务编号无效") from None
+        if source_job_id <= 0:
+            raise ValueError("重试任务编号无效")
+        with closing(self._write_connection()) as connection:
+            source = connection.execute(
+                "SELECT * FROM pipeline_jobs WHERE id=?", (source_job_id,)
+            ).fetchone()
+            if source is None:
+                raise ValueError("原流水线任务不存在")
+            if source["status"] not in {"failed", "interrupted"}:
+                raise ValueError("只有失败或中断的流水线任务可以重试")
+            latest = connection.execute(
+                "SELECT id FROM pipeline_jobs WHERE batch_name=? ORDER BY id DESC LIMIT 1",
+                (source["batch_name"],),
+            ).fetchone()
+            if latest is None or int(latest["id"]) != source_job_id:
+                raise ValueError("该批次已有更新的流水线任务，请从最新任务重试")
+            active = connection.execute(
+                "SELECT 1 FROM pipeline_jobs WHERE batch_name=? AND status IN ('queued','running')",
+                (source["batch_name"],),
+            ).fetchone()
+            if active:
+                raise ValueError(f"批次 {source['batch_name']} 已有正在执行的一键任务")
+            rows = connection.execute(
+                "SELECT question_id, question_no FROM pipeline_items "
+                "WHERE pipeline_job_id=? ORDER BY question_no",
+                (source_job_id,),
+            ).fetchall()
+            if not rows:
+                raise ValueError("原流水线任务没有可重试的题目")
+            created = datetime.now().astimezone().isoformat(timespec="seconds")
+            cursor = connection.execute(
+                "INSERT INTO pipeline_jobs(batch_name,question_count,qc_concurrency,model_concurrency,"
+                "codex_concurrency,docker_image,docker_command,retry_of_job_id,created_at,output,last_message) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    source["batch_name"], len(rows), source["qc_concurrency"],
+                    source["model_concurrency"], source["codex_concurrency"],
+                    source["docker_image"], source["docker_command"], source_job_id,
+                    created, f"从失败任务 #{source_job_id} 继续执行\n",
+                    f"等待从任务 #{source_job_id} 的失败位置继续",
+                ),
+            )
+            job_id = int(cursor.lastrowid)
+            connection.executemany(
+                "INSERT INTO pipeline_items(pipeline_job_id,question_id,question_no) VALUES(?,?,?)",
+                [(job_id, row["question_id"], row["question_no"]) for row in rows],
+            )
+            connection.commit()
+        script = self.project_root / "tools" / "auto_pipeline.py"
+        self.pipeline_executor.submit(
+            self._run_pipeline_process, job_id, source["batch_name"], source["docker_image"],
+            source["docker_command"], int(source["qc_concurrency"]),
+            int(source["model_concurrency"]), int(source["codex_concurrency"]), script,
+        )
+        return {
+            "ok": True,
+            "job_id": job_id,
+            "retry_of_job_id": source_job_id,
+            "message": f"重试任务 #{job_id} 已从失败位置启动",
+        }
 
     def _run_pipeline_process(self, job_id: int, batch: str, image: str, command: str, qc_concurrency: int, model_concurrency: int, codex_concurrency: int, script: Path) -> None:
         flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
@@ -637,6 +752,110 @@ class ConsoleData:
             "qc_concurrency": env_int("CC_PIPELINE_QC_CONCURRENCY", 2),
             "model_concurrency": env_int("CC_PIPELINE_MODEL_CONCURRENCY", 2),
             "codex_concurrency": env_int("CC_PIPELINE_CODEX_CONCURRENCY", 2),
+        }
+
+    def environment_status(self, repair: bool = False) -> dict[str, object]:
+        """Check local tools and repair the bundled Claude image when possible."""
+        checks: list[dict[str, object]] = []
+        repair_messages: list[str] = []
+
+        def add(name: str, ok: bool, detail: str, repairable: bool = False) -> None:
+            checks.append({"name": name, "ok": ok, "detail": detail, "repairable": repairable})
+
+        codex = shutil.which("codex")
+        codex_ok = False
+        codex_detail = str(codex or "未找到 codex，请安装后加入 PATH")
+        if codex:
+            try:
+                codex_probe = subprocess.run(
+                    [codex, "--version"], text=True, stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT, check=False, timeout=30,
+                )
+                codex_output = codex_probe.stdout.strip()
+                codex_ok = codex_probe.returncode == 0 and bool(re.search(r"\d+(?:\.\d+)+", codex_output))
+                codex_detail = codex_output[-300:] if codex_output else "Codex CLI 未返回版本"
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                codex_detail = f"Codex CLI 无法运行：{exc}"
+        add("Codex CLI", codex_ok, codex_detail)
+        docker = shutil.which("docker")
+        add("Docker CLI", bool(docker), str(docker or "未找到 docker，请安装 Docker Desktop"))
+        image = self.read_env().get("CC_CLAUDE_DOCKER_IMAGE", "").strip() or "claude-cli:latest"
+        command = self.read_env().get("CC_CLAUDE_DOCKER_COMMAND", "").strip() or "claude"
+        docker_ready = False
+        if docker:
+            info = docker_info(docker)
+            docker_ready = info.returncode == 0
+            if not docker_ready and repair:
+                docker_ready, repair_detail = repair_docker_engine(docker)
+                repair_messages.append(repair_detail)
+            add("Docker 引擎", docker_ready, "运行中" if docker_ready else info.stdout.strip()[-300:] or "无法连接 Docker 引擎", True)
+        if docker and docker_ready:
+            inspect = subprocess.run(
+                [docker, "image", "inspect", image], text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False, timeout=15,
+            )
+            image_ok = inspect.returncode == 0
+            image_user = ""
+            nonroot_label = False
+            if image_ok:
+                try:
+                    config = json.loads(inspect.stdout)[0].get("Config", {})
+                    image_user = str(config.get("User") or "").strip().lower()
+                    nonroot_label = (config.get("Labels") or {}).get("ccusr.claude.nonroot") == "true"
+                except (ValueError, TypeError, IndexError):
+                    image_ok = False
+            needs_repair = image == "claude-cli:latest" and (not image_ok or image_user in {"", "root", "0", "0:0"} or not nonroot_label)
+            if needs_repair and repair:
+                dockerfile = self.project_root / "docker" / "claude-cli" / "Dockerfile"
+                if dockerfile.is_file():
+                    built = subprocess.run(
+                        [docker, "build", "-t", image, str(dockerfile.parent)],
+                        cwd=self.project_root, text=True, stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT, check=False, timeout=1800,
+                    )
+                    if built.returncode == 0:
+                        repair_messages.append("已重建非 root Claude CLI 镜像")
+                        inspect = subprocess.run(
+                            [docker, "image", "inspect", image], text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False, timeout=15,
+                        )
+                        image_ok = inspect.returncode == 0
+                        if image_ok:
+                            try:
+                                config = json.loads(inspect.stdout)[0].get("Config", {})
+                                image_user = str(config.get("User") or "").strip().lower()
+                                nonroot_label = (config.get("Labels") or {}).get("ccusr.claude.nonroot") == "true"
+                            except (ValueError, TypeError, IndexError):
+                                image_ok = False
+                    else:
+                        repair_messages.append("Claude CLI 镜像重建失败：" + built.stdout.strip()[-300:])
+            image_ready = image_ok and (
+                image != "claude-cli:latest"
+                or (image_user not in {"", "root", "0", "0:0"} and nonroot_label)
+            )
+            detail = f"{image}，用户 {image_user or 'root'}"
+            if not image_ok:
+                detail = f"{image} 不存在"
+            add("Claude Docker 镜像", image_ready, detail, image == "claude-cli:latest")
+            if image_ready:
+                user_probe = subprocess.run(
+                    [docker, "run", "--rm", "--user", "1000:1000", image, "id", "-u"],
+                    text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False, timeout=60,
+                )
+                probe = subprocess.run(
+                    [docker, "run", "--rm", "--user", "1000:1000", "-e", "HOME=/home/node", image, command, "--version"],
+                    text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False, timeout=60,
+                )
+                probe_ok = user_probe.returncode == 0 and user_probe.stdout.strip() != "0" and probe.returncode == 0
+                probe_detail = probe.stdout.strip()[-300:] or user_probe.stdout.strip()[-300:] or "探针失败"
+                add("Claude CLI 运行探针", probe_ok, probe_detail)
+        ok = all(bool(check["ok"]) for check in checks)
+        return {
+            "ok": ok,
+            "checked_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "checks": checks,
+            "repair_attempted": repair,
+            "repair_messages": repair_messages,
         }
 
     @staticmethod
@@ -1144,6 +1363,9 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/config":
                 self.send_json(self.data.env_config())
                 return
+            if parsed.path == "/api/environment":
+                self.send_json(self.data.environment_status())
+                return
             if parsed.path == "/api/author-jobs":
                 self.send_json({"jobs": self.data.author_jobs()})
                 return
@@ -1184,10 +1406,15 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 result = self.data.export(body.get("batch"), body.get("numbers"))
             elif self.path == "/api/config":
                 result = self.data.update_env(body)
+            elif self.path == "/api/actions/environment-repair":
+                result = self.data.environment_status(repair=True)
+                result["message"] = "环境检测与修复已完成" if result["ok"] else "环境仍不可用，请查看检测结果"
             elif self.path == "/api/actions/codex-author":
                 result = self.data.create_author_job(body)
             elif self.path == "/api/actions/auto-pipeline":
                 result = self.data.create_pipeline_job(body)
+            elif self.path == "/api/actions/auto-pipeline-retry":
+                result = self.data.retry_pipeline_job(body)
             else:
                 self.send_error_json("操作不存在", HTTPStatus.NOT_FOUND)
                 return

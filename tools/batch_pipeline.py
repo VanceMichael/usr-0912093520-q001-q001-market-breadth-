@@ -17,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 
 
-SCHEMA_VERSION = 8
+SCHEMA_VERSION = 10
 TASK_TYPES = {
     "0-1 代码生成", "Feature 迭代", "Bug 修复", "代码理解",
     "代码重构", "工程化", "代码测试",
@@ -225,6 +225,7 @@ CREATE TABLE IF NOT EXISTS pipeline_jobs (
     last_message TEXT NOT NULL DEFAULT '',
     error TEXT NOT NULL DEFAULT '',
     pid INTEGER,
+    retry_of_job_id INTEGER REFERENCES pipeline_jobs(id) ON DELETE SET NULL,
     created_at TEXT NOT NULL,
     started_at TEXT NOT NULL DEFAULT '',
     finished_at TEXT NOT NULL DEFAULT ''
@@ -238,6 +239,10 @@ CREATE TABLE IF NOT EXISTS pipeline_items (
     status TEXT NOT NULL DEFAULT 'queued',
     output TEXT NOT NULL DEFAULT '',
     error TEXT NOT NULL DEFAULT '',
+    heartbeat_at TEXT NOT NULL DEFAULT '',
+    activity_at TEXT NOT NULL DEFAULT '',
+    health_status TEXT NOT NULL DEFAULT '',
+    health_detail TEXT NOT NULL DEFAULT '',
     started_at TEXT NOT NULL DEFAULT '',
     finished_at TEXT NOT NULL DEFAULT '',
     UNIQUE (pipeline_job_id, question_id)
@@ -320,6 +325,18 @@ def connect(database: Path) -> sqlite3.Connection:
     }
     if "pid" not in pipeline_job_columns:
         connection.execute("ALTER TABLE pipeline_jobs ADD COLUMN pid INTEGER")
+    if "retry_of_job_id" not in pipeline_job_columns:
+        connection.execute(
+            "ALTER TABLE pipeline_jobs ADD COLUMN retry_of_job_id INTEGER REFERENCES pipeline_jobs(id) ON DELETE SET NULL"
+        )
+    pipeline_item_columns = {
+        row["name"] for row in connection.execute("PRAGMA table_info(pipeline_items)")
+    }
+    for name in ("heartbeat_at", "activity_at", "health_status", "health_detail"):
+        if name not in pipeline_item_columns:
+            connection.execute(
+                f"ALTER TABLE pipeline_items ADD COLUMN {name} TEXT NOT NULL DEFAULT ''"
+            )
     connection.execute(
         "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",

@@ -15,16 +15,22 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
+from queue import Empty, Queue
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import closing
 from datetime import datetime
 from pathlib import Path
 
 OUTPUT_LIMIT = 200_000
+MODEL_HEALTH_INTERVAL_SECONDS = 15
+MODEL_IDLE_WARNING_SECONDS = 10 * 60
+MODEL_STALL_TIMEOUT_SECONDS = 30 * 60
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from tools.batch_pipeline import connect, prompt_hash, question_rows  # noqa: E402
+from tools.runtime_environment import docker_info, repair_docker_engine  # noqa: E402
 
 
 class PipelineInterrupted(RuntimeError):
@@ -66,9 +72,11 @@ def build_docker_claude_command(
     return [
         docker, "run", "--rm", "--name", container_name,
         "--label", f"ccusr.pipeline_job={pipeline_job_id}",
+        "--user", "1000:1000",
         "-v", f"{workspace}:/workspace",
-        "-v", f"{trajectory_root}:/root/.claude",
+        "-v", f"{trajectory_root}:/home/node/.claude",
         "-w", "/workspace",
+        "-e", "HOME=/home/node",
         "-e", "ANTHROPIC_BASE_URL", "-e", "ANTHROPIC_AUTH_TOKEN", "-e", "ANTHROPIC_MODEL",
         image, claude_command, "--dangerously-skip-permissions", prompt,
     ]
@@ -82,6 +90,7 @@ class Pipeline:
         self.emit = emit
         self.project_root = PROJECT_ROOT
         self.pipeline_root: Path | None = None
+        self.trajectory_search_root: Path | None = None
         self.redacted_values: set[str] = set()
 
     def db(self) -> sqlite3.Connection:
@@ -290,19 +299,53 @@ class Pipeline:
         )
         return config
 
+    def codex_preflight(self) -> str:
+        binary = shutil.which("codex")
+        if not binary:
+            raise RuntimeError("环境不可用：未找到 Codex CLI，请安装后加入 PATH")
+        result = subprocess.run(
+            [binary, "--version"], text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, check=False, timeout=30,
+        )
+        if result.returncode:
+            raise RuntimeError("环境不可用：Codex CLI 无法运行：" + result.stdout.strip()[-400:])
+        version = version_text(result.stdout)
+        if version == "0.0.0":
+            raise RuntimeError("环境不可用：Codex CLI 未返回有效版本")
+        self.log(f"环境检测通过：Codex CLI {version}")
+        return version
+
     def docker_preflight(self, image: str, command: str) -> str:
         docker = shutil.which("docker")
         if not docker:
             raise RuntimeError("未找到 Docker CLI")
-        result = subprocess.run([docker, "info"], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
+        result = docker_info(docker)
         if result.returncode:
-            raise RuntimeError("Docker 引擎未运行：" + result.stdout.strip()[-500:])
+            self.log("环境检测：Docker 引擎不可用，准备启动 Docker Desktop")
+            repaired, detail = repair_docker_engine(docker)
+            self.log("环境修复：" + detail)
+            if not repaired:
+                raise RuntimeError("Docker 引擎未运行：" + result.stdout.strip()[-500:])
         inspect = subprocess.run([docker, "image", "inspect", image], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
-        if inspect.returncode:
+        rebuild = inspect.returncode != 0
+        if inspect.returncode == 0:
+            try:
+                image_config = json.loads(inspect.stdout)[0].get("Config", {})
+                image_user = str(image_config.get("User") or "").strip().lower()
+                labels = image_config.get("Labels") or {}
+                rebuild = image == "claude-cli:latest" and (
+                    image_user in {"", "root", "0", "0:0"}
+                    or labels.get("ccusr.claude.nonroot") != "true"
+                )
+                if rebuild:
+                    self.log("环境检测：默认 Claude 镜像仍以 root 运行，准备重建非 root 镜像")
+            except (ValueError, TypeError, IndexError):
+                rebuild = image == "claude-cli:latest"
+        if rebuild:
             dockerfile = self.project_root / "docker" / "claude-cli" / "Dockerfile"
             if image != "claude-cli:latest" or not dockerfile.is_file():
                 raise RuntimeError(f"Docker 镜像不存在：{image}")
-            self.log("默认 Claude CLI 镜像不存在，开始自动构建")
+            self.log("环境修复：开始构建非 root Claude CLI 镜像")
             build = subprocess.run(
                 [docker, "build", "-t", image, str(dockerfile.parent)],
                 cwd=self.project_root, text=True, stdout=subprocess.PIPE,
@@ -310,9 +353,19 @@ class Pipeline:
             )
             if build.returncode:
                 raise RuntimeError("Claude CLI 镜像构建失败：" + build.stdout.strip()[-1000:])
-        result = subprocess.run([docker, "run", "--rm", image, command, "--version"], text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
+        user_probe = subprocess.run(
+            [docker, "run", "--rm", "--user", "1000:1000", image, "id", "-u"],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
+        )
+        if user_probe.returncode or user_probe.stdout.strip() == "0":
+            raise RuntimeError("Docker 中 Claude 环境仍以 root 运行：" + user_probe.stdout.strip()[-500:])
+        result = subprocess.run(
+            [docker, "run", "--rm", "--user", "1000:1000", "-e", "HOME=/home/node", image, command, "--version"],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
+        )
         if result.returncode:
             raise RuntimeError("Docker 中无法运行 claude-cli：" + result.stdout.strip()[-500:])
+        self.log("环境检测通过：Docker 引擎、非 root Claude 用户和 Claude CLI 均可用")
         return version_text(result.stdout)
 
     def run_model(
@@ -334,7 +387,11 @@ class Pipeline:
             )
             connection.execute("UPDATE questions SET status='running', updated_at=? WHERE id=?", (launch_time, question_id))
             connection.commit()
-        self.item(question_id, status="model_running", started_at=launch_time)
+        self.item(
+            question_id, status="model_running", started_at=launch_time,
+            heartbeat_at=launch_time, activity_at=launch_time,
+            health_status="starting", health_detail="正在启动 Claude 容器",
+        )
         docker = shutil.which("docker") or "docker"
         host_workspace = str(folder)
         host_home = str(trajectory_root)
@@ -349,22 +406,116 @@ class Pipeline:
         started = datetime.now().astimezone().isoformat(timespec="seconds")
         process = subprocess.Popen(command_line, cwd=self.project_root, env=env, text=True, encoding="utf-8", errors="replace", stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         assert process.stdout is not None
-        output: list[str] = []
-        for line in process.stdout:
-            line = line.rstrip()
+        lines: Queue[str | None] = Queue()
+
+        def read_output() -> None:
+            assert process.stdout is not None
+            for value in process.stdout:
+                lines.put(value.rstrip())
+            lines.put(None)
+
+        reader = threading.Thread(
+            target=read_output, name=f"claude-output-{question_id}", daemon=True,
+        )
+        reader.start()
+        output = ""
+        last_activity = launch_time
+        stalled = False
+        stalled_detail = ""
+        while True:
+            try:
+                line = lines.get(timeout=MODEL_HEALTH_INTERVAL_SECONDS)
+            except Empty:
+                health_status, health_detail, activity_at = self.docker_run_health(
+                    docker, container_name, trajectory_root, last_activity,
+                )
+                last_activity = activity_at
+                self.item(
+                    question_id, heartbeat_at=timestamp(), activity_at=activity_at,
+                    health_status=health_status, health_detail=health_detail,
+                )
+                if health_status == "stalled":
+                    stalled = True
+                    stalled_detail = health_detail
+                    self.log(f"[{row['task_id']}] {health_detail}，停止容器并保留现有轨迹")
+                    subprocess.run(
+                        [docker, "rm", "-f", container_name],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        check=False, timeout=30,
+                    )
+                continue
+            if line is None:
+                break
             if line:
-                output.append(line)
-                self.item(question_id, output="\n".join(output)[-OUTPUT_LIMIT:])
+                now = timestamp()
+                last_activity = now
+                output = (output + line + "\n")[-OUTPUT_LIMIT:]
+                self.item(
+                    question_id, output=output.rstrip(), heartbeat_at=now,
+                    activity_at=now, health_status="healthy",
+                    health_detail="Claude 容器运行正常，刚刚产生新输出",
+                )
                 self.log(f"[{row['task_id']}] {line}")
         returncode = process.wait(timeout=86400)
         finished = timestamp()
         if returncode:
-            self.item(question_id, status="failed", error=f"Docker Claude CLI 退出码：{returncode}", finished_at=finished)
-            raise RuntimeError(f"{row['task_id']} 模型运行失败，退出码 {returncode}")
+            error = stalled_detail or f"Docker Claude CLI 退出码：{returncode}"
+            self.item(
+                question_id, status="failed", error=error,
+                heartbeat_at=finished, health_status="stalled" if stalled else "failed",
+                health_detail=error if stalled else f"Claude 容器已异常退出，退出码 {returncode}",
+                finished_at=finished,
+            )
+            raise RuntimeError(f"{row['task_id']} 模型运行失败：{error}")
         with closing(self.db()) as connection:
             connection.execute("UPDATE questions SET status='completed', updated_at=? WHERE id=?", (finished, question_id))
             connection.commit()
-        self.item(question_id, status="model_completed", finished_at=finished)
+        self.item(
+            question_id, status="model_completed", heartbeat_at=finished,
+            activity_at=finished, health_status="completed",
+            health_detail="Claude 容器已正常完成", finished_at=finished,
+        )
+
+    @staticmethod
+    def docker_run_health(
+        docker: str, container_name: str, trajectory_root: Path, fallback_activity: str,
+    ) -> tuple[str, str, str]:
+        heartbeat = datetime.now().astimezone()
+        activity = fallback_activity
+        try:
+            latest_mtime = datetime.fromisoformat(fallback_activity).timestamp()
+        except ValueError:
+            latest_mtime = 0.0
+        try:
+            for path in trajectory_root.rglob("*.jsonl"):
+                latest_mtime = max(latest_mtime, path.stat().st_mtime)
+        except OSError:
+            pass
+        if latest_mtime:
+            activity = datetime.fromtimestamp(
+                latest_mtime, heartbeat.tzinfo,
+            ).isoformat(timespec="seconds")
+        try:
+            state = subprocess.run(
+                [docker, "inspect", "--format", "{{.State.Running}}|{{.State.Status}}", container_name],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                check=False, timeout=15,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return "unavailable", f"无法确认容器状态：{exc}", activity
+        if state.returncode or not state.stdout.strip().lower().startswith("true|running"):
+            detail = state.stdout.strip()[-300:] or "容器不存在或已经停止"
+            return "unavailable", detail, activity
+        try:
+            activity_time = datetime.fromisoformat(activity)
+            idle_seconds = max(0, int((heartbeat - activity_time).total_seconds()))
+        except ValueError:
+            idle_seconds = 0
+        if idle_seconds >= MODEL_STALL_TIMEOUT_SECONDS:
+            return "stalled", f"容器仍在运行，但轨迹已 {idle_seconds // 60} 分钟没有更新，判定为停滞", activity
+        if idle_seconds >= MODEL_IDLE_WARNING_SECONDS:
+            return "idle", f"容器仍在运行，但轨迹已 {idle_seconds // 60} 分钟没有更新", activity
+        return "healthy", f"容器运行正常，轨迹在 {idle_seconds // 60} 分钟内有更新", activity
 
     def model_stage(
         self, image: str, command: str, concurrency: int, model_version: str,
@@ -393,9 +544,9 @@ class Pipeline:
                 raise RuntimeError("模型跑题阶段失败：" + "; ".join(errors))
 
     def producer_stage(self, concurrency: int, rows: list[sqlite3.Row]) -> None:
-        assert self.pipeline_root is not None
+        assert self.trajectory_search_root is not None
         self.log(f"阶段 3/4：Codex CLI 并行执行交付生产，并发数 {concurrency}")
-        root = self.pipeline_root / "claude-home"
+        root = self.trajectory_search_root
         def produce(row: sqlite3.Row) -> int:
             question_id = int(row["id"])
             self.item(question_id, status="producing", error="")
@@ -463,7 +614,7 @@ class Pipeline:
             raise RuntimeError("交付生产未写入 SQLite 记录：" + ", ".join(missing))
 
     def qc_export_stage(self) -> None:
-        assert self.pipeline_root is not None
+        assert self.trajectory_search_root is not None
         self.log("阶段 4/4：Codex CLI 执行交付质检并导出 Excel")
         with closing(self.db()) as connection:
             question_ids = [
@@ -474,7 +625,7 @@ class Pipeline:
             ]
         for question_id in question_ids:
             self.item(question_id, status="finalizing")
-        root = self.pipeline_root / "claude-home"
+        root = self.trajectory_search_root
         with closing(self.db()) as connection:
             batch_folder = Path(connection.execute(
                 "SELECT folder_path FROM batches WHERE name=?", (self.batch,)
@@ -527,32 +678,132 @@ class Pipeline:
         for question_id in question_ids:
             self.item(question_id, status="completed", finished_at=finished)
 
+    @staticmethod
+    def question_qc_passed(row: sqlite3.Row) -> bool:
+        return bool(
+            row["mechanical_qc"] == "pass"
+            and row["qc_decision"] == "pass"
+            and row["qc_prompt_sha256"] == prompt_hash(row["prompt"])
+        )
+
+    def question_progress(self, rows: list[sqlite3.Row]) -> dict[int, dict[str, object]]:
+        question_ids = [int(row["id"]) for row in rows]
+        if not question_ids:
+            return {}
+        placeholders = ",".join("?" for _ in question_ids)
+        with closing(self.db()) as connection:
+            states = connection.execute(
+                "SELECT q.id, q.status, "
+                "(SELECT COUNT(*) FROM runs x WHERE x.question_id=q.id) AS run_count, "
+                "(SELECT COUNT(*) FROM records r WHERE r.question_id=q.id) AS record_count, "
+                "(SELECT COUNT(*) FROM records r WHERE r.question_id=q.id "
+                "AND r.delivery_qc_passed=1 AND r.delivery_qc_note='质检通过') AS passed_count "
+                f"FROM questions q WHERE q.id IN ({placeholders})",
+                question_ids,
+            ).fetchall()
+        return {
+            int(state["id"]): {
+                "model_done": bool(
+                    int(state["record_count"] or 0) > 0
+                    or (state["status"] == "completed" and int(state["run_count"] or 0) > 0)
+                ),
+                "record_count": int(state["record_count"] or 0),
+                "delivery_passed": bool(
+                    int(state["record_count"] or 0) > 0
+                    and int(state["record_count"] or 0) == int(state["passed_count"] or 0)
+                ),
+            }
+            for state in states
+        }
+
     def execute(self, image: str, command: str, qc_concurrency: int, model_concurrency: int, codex_concurrency: int) -> None:
         with closing(self.db()) as connection:
             batch = connection.execute("SELECT * FROM batches WHERE name=?", (self.batch,)).fetchone()
             rows = question_rows(connection, self.batch)
+            job = connection.execute(
+                "SELECT retry_of_job_id FROM pipeline_jobs WHERE id=?", (self.job_id,)
+            ).fetchone()
         if batch is None or not rows:
             raise ValueError(f"批次不存在或没有题目：{self.batch}")
+        if job is None:
+            raise ValueError(f"流水线任务不存在：{self.job_id}")
+        retry_of_job_id = job["retry_of_job_id"]
         with closing(self.db()) as connection:
             existing = connection.execute(
                 "SELECT COUNT(*) FROM runs r JOIN questions q ON q.id=r.question_id "
                 "JOIN batches b ON b.id=q.batch_id WHERE b.name=?", (self.batch,),
             ).fetchone()[0]
-        if existing:
+        if existing and retry_of_job_id is None:
             raise RuntimeError("批次已有目标模型运行记录；为保护原始工作区和轨迹，一键全流程只允许运行尚未跑题的新批次")
-        self.pipeline_root = Path(batch["folder_path"]) / ".runs" / f"auto-{self.job_id}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        runs_root = Path(batch["folder_path"]) / ".runs"
+        self.pipeline_root = runs_root / f"auto-{self.job_id}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
         self.pipeline_root.mkdir(parents=True, exist_ok=False)
-        self.question_qc(qc_concurrency, rows)
-        self.ensure_active()
+        self.trajectory_search_root = runs_root if retry_of_job_id is not None else self.pipeline_root / "claude-home"
         config = self.runtime_config()
+        self.log("阶段 0/4：检查并修复运行环境")
+        self.codex_preflight()
         model_version = self.docker_preflight(image, command)
+        self.ensure_active()
+        qc_pending = [row for row in rows if not self.question_qc_passed(row)]
+        qc_pending_ids = {int(row["id"]) for row in qc_pending}
+        if retry_of_job_id is not None:
+            progress = self.question_progress(rows)
+            if qc_pending:
+                resume_stage = "题目质检"
+            elif any(not progress[int(row["id"])]["model_done"] for row in rows):
+                resume_stage = "模型跑题"
+            elif any(progress[int(row["id"])]["record_count"] == 0 for row in rows):
+                resume_stage = "交付生产"
+            else:
+                resume_stage = "交付质检与导出"
+            self.log(f"重试任务：原任务 #{retry_of_job_id}，从{resume_stage}阶段继续")
+        for row in rows:
+            if int(row["id"]) not in qc_pending_ids:
+                self.item(int(row["id"]), status="qc_passed", error="")
+        if qc_pending:
+            self.question_qc(qc_concurrency, qc_pending)
+        else:
+            self.log("阶段 1/4：题目质检已有有效通过记录，跳过")
+        self.ensure_active()
         with closing(self.db()) as connection:
             rows = question_rows(connection, self.batch)
-        self.model_stage(image, command, model_concurrency, model_version, rows, config)
+        progress = self.question_progress(rows)
+        model_pending = [row for row in rows if not progress[int(row["id"])]["model_done"]]
+        model_pending_ids = {int(row["id"]) for row in model_pending}
+        for row in rows:
+            if int(row["id"]) not in model_pending_ids:
+                self.item(int(row["id"]), status="model_completed", error="")
+        if model_pending:
+            self.model_stage(image, command, model_concurrency, model_version, model_pending, config)
+        else:
+            self.log("阶段 2/4：模型跑题已有成功结果，跳过")
         self.ensure_active()
-        self.producer_stage(codex_concurrency, rows)
+        progress = self.question_progress(rows)
+        producer_pending = [row for row in rows if progress[int(row["id"])]["record_count"] == 0]
+        producer_pending_ids = {int(row["id"]) for row in producer_pending}
+        for row in rows:
+            if int(row["id"]) not in producer_pending_ids:
+                self.item(int(row["id"]), status="produced", error="")
+        if producer_pending:
+            self.producer_stage(codex_concurrency, producer_pending)
+        else:
+            self.log("阶段 3/4：交付记录已经生成，跳过")
         self.ensure_active()
-        self.qc_export_stage()
+        progress = self.question_progress(rows)
+        batch_folder = Path(batch["folder_path"])
+        delivery_complete = bool(rows) and all(
+            progress[int(row["id"])]["delivery_passed"] for row in rows
+        )
+        exported = bool(list(batch_folder.glob("CC_Codex*.xlsx"))) and bool(
+            list(batch_folder.glob("轨迹_*.jsonl"))
+        )
+        if retry_of_job_id is not None and delivery_complete and exported:
+            self.log("阶段 4/4：交付质检、Excel 和原始轨迹均已存在，跳过")
+            finished = timestamp()
+            for row in rows:
+                self.item(int(row["id"]), status="completed", error="", finished_at=finished)
+        else:
+            self.qc_export_stage()
 
 
 def main() -> int:

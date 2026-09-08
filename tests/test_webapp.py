@@ -239,9 +239,88 @@ class WebConsoleTests(unittest.TestCase):
                 self.assertEqual(jobs[0]["status"], "queued")
                 self.assertEqual(jobs[0]["model_concurrency"], 2)
                 self.assertEqual(len(jobs[0]["items"]), 1)
+                self.assertIn("heartbeat_at", jobs[0]["items"][0])
             finally:
                 data.author_executor.shutdown(wait=True)
                 data.pipeline_executor.shutdown(wait=True)
+
+    def test_failed_pipeline_retry_creates_linked_job_and_preserves_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = self.make_database(root)
+            (root / ".env").write_text(
+                "CC_SWITCH_BASE_URL=https://relay.example.com\n"
+                "CC_SWITCH_MODEL=claude-test\n"
+                "CC_SWITCH_API_KEY=test-secret\n"
+                "CC_USR_SUBMITTER=测试提交人\n",
+                encoding="utf-8",
+            )
+            data = ConsoleData(database, root)
+            try:
+                with mock.patch.object(data, "_run_pipeline_process"):
+                    first = data.create_pipeline_job({"batch": "0911"})
+                    data.pipeline_executor.shutdown(wait=True)
+                connection = sqlite3.connect(database)
+                connection.execute(
+                    "UPDATE pipeline_jobs SET status='failed', error='模型执行失败' WHERE id=?",
+                    (first["job_id"],),
+                )
+                connection.execute(
+                    "UPDATE pipeline_items SET status='failed', error='模型执行失败' WHERE pipeline_job_id=?",
+                    (first["job_id"],),
+                )
+                connection.commit()
+                connection.close()
+                data.pipeline_executor = mock.Mock()
+
+                retried = data.retry_pipeline_job({"job_id": first["job_id"]})
+                jobs = data.pipeline_jobs()
+
+                self.assertEqual(retried["retry_of_job_id"], first["job_id"])
+                self.assertEqual(jobs[0]["status"], "queued")
+                self.assertEqual(jobs[0]["retry_of_job_id"], first["job_id"])
+                self.assertEqual(len(jobs), 1)
+                connection = sqlite3.connect(database)
+                source = connection.execute(
+                    "SELECT status,error FROM pipeline_jobs WHERE id=?", (first["job_id"],)
+                ).fetchone()
+                connection.close()
+                self.assertEqual(source, ("failed", "模型执行失败"))
+                data.pipeline_executor.submit.assert_called_once()
+            finally:
+                data.author_executor.shutdown(wait=True)
+                shutdown = getattr(data.pipeline_executor, "shutdown", None)
+                if shutdown:
+                    shutdown(wait=True)
+
+    def test_pipeline_jobs_returns_only_latest_attempt_and_log_tail(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = self.make_database(root)
+            connection = sqlite3.connect(database)
+            created = "2026-09-08T10:00:00+08:00"
+            connection.execute(
+                "INSERT INTO pipeline_jobs(id,batch_name,question_count,docker_image,status,output,created_at) "
+                "VALUES(1,'0911',1,'claude-cli:latest','failed',?,?)",
+                ("a" * 40000, created),
+            )
+            connection.execute(
+                "INSERT INTO pipeline_jobs(id,batch_name,question_count,docker_image,status,output,created_at) "
+                "VALUES(2,'0911',1,'claude-cli:latest','running',?,?)",
+                ("b" * 40000, created),
+            )
+            connection.commit()
+            connection.close()
+            data = ConsoleData(database, root)
+            try:
+                jobs = data.pipeline_jobs()
+            finally:
+                data.author_executor.shutdown(wait=True)
+                data.pipeline_executor.shutdown(wait=True)
+
+        self.assertEqual([job["id"] for job in jobs], [2])
+        self.assertEqual(jobs[0]["output_length"], 40000)
+        self.assertEqual(len(jobs[0]["output"]), 30000)
 
     def test_windows_open_uses_startfile(self):
         with tempfile.TemporaryDirectory() as directory:
