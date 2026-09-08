@@ -148,7 +148,7 @@ def main() -> int:
     for row, folder in prepared:
         print(
             f"PREVIEW {row['question_no']}: cd {shlex.quote(str(folder))} && "
-            "claude <SQLite 原始 prompt>"
+            "claude --dangerously-skip-permissions <SQLite 原始 prompt>"
         )
 
     if not args.launch:

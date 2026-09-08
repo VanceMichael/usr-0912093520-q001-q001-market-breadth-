@@ -100,8 +100,8 @@ def load_claude_config(path: Path) -> ClaudeConfig:
 
 
 def build_claude_command(claude: str, prompt: str) -> list[str]:
-    """Keep the target-model invocation free of all launcher-added CLI options."""
-    return [claude, prompt]
+    """Run Claude Code non-interactively for permissions in the isolated task workspace."""
+    return [claude, "--dangerously-skip-permissions", prompt]
 
 
 def build_claude_environment(config: ClaudeConfig) -> dict[str, str]:

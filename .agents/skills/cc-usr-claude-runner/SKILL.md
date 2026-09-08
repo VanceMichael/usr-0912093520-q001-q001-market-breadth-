@@ -31,6 +31,6 @@ python3 .agents/skills/cc-usr-claude-runner/scripts/run_tasks.py \
   --db production.sqlite3 --batch 0911 --env-file .env --select 1,3-5 --launch
 ```
 
-Each selected question opens a new iTerm2 window and runs Claude Code with that question folder as its working directory. At launch time, the helper re-reads `.env` and loads the exact prompt from SQLite. The target command must be exactly `[claude_binary, stored_prompt]`: do not add `-p`, model, permission, output-format, system-prompt, agent, or any other Claude CLI option.
+Each selected question opens a new iTerm2 window and runs Claude Code with that question folder as its working directory. At launch time, the helper re-reads `.env` and loads the exact prompt from SQLite. The target command must be exactly `[claude_binary, "--dangerously-skip-permissions", stored_prompt]`; this deliberately grants the current user\'s full local tool permissions so iTerm2 launches do not pause for approval. Use it only in the isolated question workspace.
 
 Pass URL, model, and key only through Claude's process environment. Do not require the CC Switch app once `.env` is filled. Never print or persist the key or prompt in generated launchers, logs, run metadata, or previews. Preserve Claude Code's native interactive session and original trajectory; never read, copy, transform, summarize, or evaluate trajectory files.

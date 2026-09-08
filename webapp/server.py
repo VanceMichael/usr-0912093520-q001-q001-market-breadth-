@@ -7,10 +7,12 @@ import argparse
 import hashlib
 import json
 import mimetypes
+import os
 import re
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import webbrowser
 from datetime import datetime
 from http import HTTPStatus
@@ -24,6 +26,8 @@ STATIC_ROOT = Path(__file__).resolve().parent / "static"
 DEFAULT_DATABASE = PROJECT_ROOT / "production.sqlite3"
 QUESTION_ID_RE = re.compile(r"^\d+$")
 BATCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{1,31}$")
+ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+ENV_KEYS = ("CC_SWITCH_BASE_URL", "CC_SWITCH_MODEL", "CC_SWITCH_API_KEY", "CC_USR_SUBMITTER")
 
 
 def prompt_hash(prompt: str) -> str:
@@ -44,6 +48,109 @@ class ConsoleData:
     def __init__(self, database: Path, project_root: Path = PROJECT_ROOT) -> None:
         self.database = database.resolve()
         self.project_root = project_root.resolve()
+        self.env_file = self.project_root / ".env"
+
+    @staticmethod
+    def _env_value(raw: str) -> str:
+        value = raw.strip()
+        if len(value) >= 2 and value[0] == value[-1] == '"':
+            return value[1:-1].replace('\\"', '"').replace('\\\\', '\\')
+        if len(value) >= 2 and value[0] == value[-1] == "'":
+            return value[1:-1]
+        return value.split(" #", 1)[0].rstrip()
+
+    def read_env(self) -> dict[str, str]:
+        values = {key: "" for key in ENV_KEYS}
+        if not self.env_file.exists():
+            return values
+        for line in self.env_file.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            key, raw = stripped.split("=", 1)
+            key = key.removeprefix("export ").strip()
+            if key in values:
+                values[key] = self._env_value(raw)
+        return values
+
+    def env_config(self) -> dict[str, object]:
+        values = self.read_env()
+        key = values["CC_SWITCH_API_KEY"]
+        return {
+            "base_url": values["CC_SWITCH_BASE_URL"],
+            "model": values["CC_SWITCH_MODEL"],
+            "submitter": values["CC_USR_SUBMITTER"],
+            "api_key_configured": bool(key),
+            "api_key_hint": f"已配置（末尾 {key[-4:]}）" if len(key) >= 4 else ("已配置" if key else "未配置"),
+        }
+
+    @staticmethod
+    def _validate_env_input(values: dict[str, object]) -> dict[str, str]:
+        result = {}
+        for field in ("base_url", "model", "api_key", "submitter"):
+            value = values.get(field, "")
+            if not isinstance(value, str) or "\x00" in value or "\n" in value or "\r" in value:
+                raise ValueError(f"{field} 配置无效")
+            result[field] = value.strip()
+        if not result["base_url"] or not result["model"] or not result["submitter"]:
+            raise ValueError("中转 URL、模型名和提交人不能为空")
+        parsed = urlparse(result["base_url"])
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("中转 URL 必须是完整的 http(s) 地址")
+        if parsed.scheme != "https" and parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
+            raise ValueError("非本机中转地址必须使用 HTTPS")
+        if parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise ValueError("中转 URL 不能包含账号、密码、查询参数或片段")
+        if len(result["model"]) > 200 or len(result["submitter"]) > 200:
+            raise ValueError("模型名或提交人过长")
+        return result
+
+    def update_env(self, body: dict[str, object]) -> dict[str, object]:
+        current = self.read_env()
+        incoming = {
+            "base_url": body.get("base_url", current["CC_SWITCH_BASE_URL"]),
+            "model": body.get("model", current["CC_SWITCH_MODEL"]),
+            "api_key": body.get("api_key", ""),
+            "submitter": body.get("submitter", current["CC_USR_SUBMITTER"]),
+        }
+        values = self._validate_env_input(incoming)
+        if not values["api_key"]:
+            values["api_key"] = current["CC_SWITCH_API_KEY"]
+        if not values["api_key"]:
+            raise ValueError("API Key 尚未配置")
+        output_values = {
+            "CC_SWITCH_BASE_URL": values["base_url"],
+            "CC_SWITCH_MODEL": values["model"],
+            "CC_SWITCH_API_KEY": values["api_key"],
+            "CC_USR_SUBMITTER": values["submitter"],
+        }
+        lines = self.env_file.read_text(encoding="utf-8").splitlines() if self.env_file.exists() else []
+        replaced: set[str] = set()
+        output: list[str] = []
+        for line in lines:
+            stripped = line.strip()
+            key = stripped.split("=", 1)[0].removeprefix("export ").strip() if "=" in stripped else ""
+            if key in output_values and ENV_KEY_RE.fullmatch(key):
+                output.append(f'{key}={json.dumps(output_values[key], ensure_ascii=False)}')
+                replaced.add(key)
+            else:
+                output.append(line)
+        if output and output[-1].strip():
+            output.append("")
+        for key in ENV_KEYS:
+            if key not in replaced:
+                output.append(f'{key}={json.dumps(output_values[key], ensure_ascii=False)}')
+        self.env_file.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_name = tempfile.mkstemp(prefix=".env.", dir=self.env_file.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write("\n".join(output).rstrip() + "\n")
+            os.chmod(temp_name, 0o600)
+            os.replace(temp_name, self.env_file)
+        finally:
+            if os.path.exists(temp_name):
+                os.unlink(temp_name)
+        return {"ok": True, "message": "运行配置已保存", "config": self.env_config()}
 
     def connect(self) -> sqlite3.Connection:
         if not self.database.is_file():
@@ -219,6 +326,7 @@ class ConsoleData:
             {"id": 5, "label": "Excel 交付", "complete": sum(q["exported"] for q in questions)},
         ]
         for stage in stages:
+            stage["current"] = sum(q["stage_index"] == stage["id"] for q in questions)
             stage["pending"] = total - stage["complete"]
         return {
             "batches": batches,
@@ -450,6 +558,9 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 batch = parse_qs(parsed.query).get("batch", [None])[0]
                 self.send_json(self.data.dashboard(batch))
                 return
+            if parsed.path == "/api/config":
+                self.send_json(self.data.env_config())
+                return
             if parsed.path.startswith("/api/questions/"):
                 raw_id = parsed.path.rsplit("/", 1)[-1]
                 if not QUESTION_ID_RE.fullmatch(raw_id):
@@ -484,6 +595,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 result = self.data.qc_check(body.get("batch"))
             elif self.path == "/api/actions/export":
                 result = self.data.export(body.get("batch"), body.get("numbers"))
+            elif self.path == "/api/config":
+                result = self.data.update_env(body)
             else:
                 self.send_error_json("操作不存在", HTTPStatus.NOT_FOUND)
                 return

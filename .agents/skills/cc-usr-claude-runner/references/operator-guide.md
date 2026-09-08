@@ -8,7 +8,7 @@ Put the relay URL, model name, and key in root `.env`; `.env.example` is the fie
 
 Preview shows the exact working directory while hiding all three configuration values and the prompt. Launch creates `<批次>/.runs/<时间>/<任务ID>/launch.command`, opens one iTerm2 window per question, and registers the run in SQLite. The generated launcher contains only database/question references and paths, never the URL, model, key, or prompt.
 
-Each helper re-reads `.env`, maps the three values to Claude Code environment variables, changes into the question folder, and invokes exactly `claude <SQLite 原始 prompt>`. It does not use `-p` or add any CLI option. Claude Code therefore remains interactive and writes its native original trajectory. The runner never reads that trajectory.
+Each helper re-reads `.env`, maps the three values to Claude Code environment variables, changes into the question folder, and invokes `claude --dangerously-skip-permissions <SQLite 原始 prompt>`. The flag intentionally disables Claude Code's per-command approval prompts for this isolated local run. The runner never prints the key or reads the trajectory.
 
 One selected question starts one new session. Keep each conversation to at most ten counted turns. Network failures do not count; a human `继续` after thinking-limit exhaustion does count.
 

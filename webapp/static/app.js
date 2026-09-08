@@ -7,6 +7,7 @@ const state = {
   stage: null,
   view: "production",
   pendingAction: null,
+  config: null,
 };
 let drawerCloseTimer = null;
 
@@ -82,18 +83,18 @@ function renderBatchOptions() {
 function renderSummary() {
   const summary = state.data.summary;
   $("#summary-chips").innerHTML = `
-    <span class="summary-chip">全部题目<strong>${summary.total}</strong></span>
-    <span class="summary-chip">当前待处理<strong>${summary.waiting}</strong></span>
+    <span class="summary-chip">题目<strong>${summary.total}</strong></span>
+    <span class="summary-chip">待处理<strong>${summary.waiting}</strong></span>
     <span class="summary-chip success">质检通过<strong>${summary.qc_passed}</strong></span>
     <span class="summary-chip success">已经交付<strong>${summary.delivered}</strong></span>`;
 }
 
 function renderPipeline() {
   $("#pipeline-track").innerHTML = state.data.stages.map((stage) => `
-    <button class="stage-button ${state.stage === stage.id ? "active" : ""}" data-stage="${stage.id}">
+    <button class="stage-button ${state.stage === stage.id ? "active" : ""}" data-stage="${stage.id}" aria-label="${escapeHtml(stage.label)}，${stage.current} 道">
       <span class="stage-number">${stage.id}</span>
       <span>${escapeHtml(stage.label)}</span>
-      <span class="stage-count">${stage.complete}/${state.data.summary.total}</span>
+      ${stage.current ? `<span class="stage-count">${stage.current}</span>` : ""}
     </button>`).join("");
 }
 
@@ -120,8 +121,8 @@ function renderRows() {
       <td><div class="cell-stack"><span>${recordText}</span><small>${question.average_score === null ? "暂无评分" : `均分 ${question.average_score}`}</small></div></td>
       <td><span class="tag ${qcTone}">${qcLabel}</span></td>
       <td><div class="row-actions">
-        <button class="button ghost" data-action="detail"><i data-lucide="eye"></i>详情</button>
-        <button class="button ghost" data-action="copy"><i data-lucide="copy"></i>Prompt</button>
+        <button class="icon-button" data-action="detail" title="查看详情" aria-label="查看详情"><i data-lucide="eye"></i></button>
+        <button class="icon-button" data-action="copy" title="复制 Prompt" aria-label="复制 Prompt"><i data-lucide="copy"></i></button>
         <button class="icon-button" data-action="folder" title="打开题目目录" aria-label="打开题目目录"><i data-lucide="folder-open"></i></button>
       </div></td>
     </tr>`;
@@ -147,19 +148,38 @@ function renderFiles() {
 
 function renderView() {
   const exportsView = state.view === "exports";
-  $(".pipeline-band").hidden = exportsView;
-  $(".list-controls").hidden = exportsView;
-  $(".table-panel").hidden = exportsView;
+  const settingsView = state.view === "settings";
+  const authorView = state.view === "author";
+  const nonProductionView = exportsView || settingsView || authorView;
+  $(".batch-toolbar").hidden = settingsView || authorView;
+  $(".pipeline-band").hidden = nonProductionView;
+  $(".list-controls").hidden = nonProductionView;
+  $(".table-panel").hidden = nonProductionView;
   $("#export-view").hidden = !exportsView;
+  $("#settings-view").hidden = !settingsView;
+  $("#author-view").hidden = !authorView;
   const titles = {
+    author: ["生成题目", "填写批次信息和关键词，生成可复制的标准出题命令。"],
     production: ["生产批次", "从题目质检到 Excel 交付，状态直接来自本地生产库。"],
     records: ["交付记录", "查看已经生成评分记录的题目及交付质检状态。"],
     exports: ["导出中心", "集中查看当前批次的工作簿和原始 JSONL 轨迹。"],
+    settings: ["运行配置", "修改下一次 Claude Code 启动使用的中转地址、模型和提交人。"],
   };
   $("#page-title").textContent = titles[state.view][0];
   $("#page-subtitle").textContent = titles[state.view][1];
   $$(".nav-item").forEach((button) => button.classList.toggle("active", button.dataset.view === state.view));
-  if (exportsView) renderFiles(); else renderRows();
+  if (exportsView) renderFiles();
+  else if (settingsView) renderSettings();
+  else if (!authorView) renderRows();
+}
+
+function renderSettings() {
+  if (!state.config) return;
+  $("#config-base-url").value = state.config.base_url || "";
+  $("#config-model").value = state.config.model || "";
+  $("#config-submitter").value = state.config.submitter || "";
+  $("#config-api-key").value = "";
+  $("#config-key-hint").textContent = state.config.api_key_hint || "";
 }
 
 function render() {
@@ -186,7 +206,20 @@ async function loadDashboard(batch = state.batch) {
   }
 }
 
+async function loadConfig() {
+  try {
+    state.config = await api("/api/config");
+    if (state.view === "settings") renderSettings();
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
 function updateSelectionState() {
+  const selectionMode = state.stage === 2;
+  if (!selectionMode) state.selected.clear();
+  $("#selection-tools").hidden = !selectionMode;
+  $("#question-table").classList.toggle("selection-enabled", selectionMode);
   const visible = currentQuestions();
   const visibleIds = visible.map((question) => question.id);
   const checkedVisible = visibleIds.filter((id) => state.selected.has(id));
@@ -195,13 +228,15 @@ function updateSelectionState() {
   selectAll.indeterminate = checkedVisible.length > 0 && checkedVisible.length < visibleIds.length;
   $("#selected-count").textContent = `已选 ${state.selected.size} 道`;
   const selectedQuestions = state.data.questions.filter((question) => state.selected.has(question.id));
-  $("#launch-button").disabled = selectedQuestions.length === 0 || selectedQuestions.some((question) => !question.can_launch) || selectedQuestions.length > 4;
+  const launchButton = $("#launch-button");
+  launchButton.hidden = state.stage !== 2;
+  launchButton.disabled = selectedQuestions.length === 0 || selectedQuestions.some((question) => !question.can_launch) || selectedQuestions.length > 4;
 }
 
-async function copyText(value, successMessage = "已复制") {
+async function copyText(value, successMessage = "已复制", announce = true) {
   try {
     await navigator.clipboard.writeText(value);
-    toast(successMessage);
+    if (announce) toast(successMessage);
   } catch {
     const input = document.createElement("textarea");
     input.value = value;
@@ -211,7 +246,7 @@ async function copyText(value, successMessage = "已复制") {
     input.select();
     document.execCommand("copy");
     input.remove();
-    toast(successMessage);
+    if (announce) toast(successMessage);
   }
 }
 
@@ -240,6 +275,25 @@ function workflowPrompt() {
     return `使用 $cc-usr-delivery-qc 质检批次 ${batch} 的${scope}交付记录。逐项检查 27 个提交字段，发现不合规项必须根据 SQLite、对应会话和实际产物修正并重新质检。全部符合规范后将审核备注写为“质检通过”。不要导出 Excel。`;
   }
   return `使用 $cc-usr-excel-exporter 导出批次 ${batch} 的${scope}。只导出已经通过交付质检的记录，按照 A:AA 27 列生成全新 Excel，同时复制对应原始 JSONL 轨迹，Excel 的“轨迹文件”列保持空白。`;
+}
+
+function authorPrompt() {
+  const batch = $("#author-batch").value.trim() || "<填写批次名>";
+  const count = $("#author-count").value || "10";
+  const business = $("#author-business").value.trim().replace(/\s+/g, " ");
+  const technology = $("#author-technology").value.trim().replace(/\s+/g, " ");
+  const notes = $("#author-notes").value.trim().replace(/\s+/g, " ");
+  const requirements = [
+    business && `业务关键词：${business}`,
+    technology && `技术关键词：${technology}`,
+    notes && `补充要求：${notes}`,
+  ].filter(Boolean).join("；") || "<填写出题关键词>";
+  return `使用 $cc-usr-question-author 创建批次。\n批次名：${batch}\n题目数量：${count}\n出题要求：${requirements}\n严格遵守 项目规范.md。创建完成后运行出题机械质检，不要启动目标模型。`;
+}
+
+function renderAuthorCommand() {
+  $("#author-command").value = authorPrompt();
+  $("#author-status").hidden = true;
 }
 
 function openModal(title, description, confirmLabel, action) {
@@ -359,6 +413,7 @@ $("#pipeline-track").addEventListener("click", (event) => {
   if (!button) return;
   const selectedStage = Number(button.dataset.stage);
   state.stage = state.stage === selectedStage ? null : selectedStage;
+  if (state.stage !== 2) state.selected.clear();
   renderPipeline();
   renderRows();
 });
@@ -397,6 +452,15 @@ $("#launch-button").addEventListener("click", () => {
     await executeAction("/api/actions/launch", { batch: state.batch, numbers }, $("#launch-button"), "Claude Code 会话已启动");
   });
 });
+$("#author-form").addEventListener("input", renderAuthorCommand);
+$("#author-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  await copyText(authorPrompt(), "出题命令已复制", false);
+  const status = $("#author-status");
+  status.querySelector("span").textContent = "出题命令已复制";
+  status.hidden = false;
+  refreshIcons();
+});
 $("#export-button").addEventListener("click", () => {
   const numbers = state.selected.size ? selectedNumbers() : [];
   const scope = numbers.length ? `第 ${numbers.join("、")} 题` : "整个批次";
@@ -410,7 +474,44 @@ $(".nav-list").addEventListener("click", (event) => {
   if (!button) return;
   state.view = button.dataset.view;
   state.stage = null;
+  if (state.view === "settings" && !state.config) loadConfig();
   renderView();
+});
+$("#settings-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const button = $("#save-config");
+  const original = button.innerHTML;
+  button.disabled = true;
+  button.textContent = "保存中…";
+  try {
+    const result = await api("/api/config", {
+      method: "POST",
+      body: JSON.stringify({
+        base_url: $("#config-base-url").value,
+        model: $("#config-model").value,
+        api_key: $("#config-api-key").value,
+        submitter: $("#config-submitter").value,
+      }),
+    });
+    state.config = result.config;
+    renderSettings();
+    toast("运行配置已保存");
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    button.innerHTML = original;
+    button.disabled = false;
+    refreshIcons();
+  }
+});
+$("#toggle-api-key").addEventListener("click", () => {
+  const input = $("#config-api-key");
+  const showing = input.type === "text";
+  input.type = showing ? "password" : "text";
+  $("#toggle-api-key").title = showing ? "显示 API Key" : "隐藏 API Key";
+  $("#toggle-api-key").setAttribute("aria-label", showing ? "显示 API Key" : "隐藏 API Key");
+  $("#toggle-api-key").innerHTML = `<i data-lucide="${showing ? "eye" : "eye-off"}"></i>`;
+  refreshIcons();
 });
 $("#file-list").addEventListener("click", (event) => {
   const button = event.target.closest("[data-file-path]");
@@ -432,4 +533,6 @@ document.addEventListener("keydown", (event) => {
 });
 
 refreshIcons();
+renderAuthorCommand();
 loadDashboard();
+loadConfig();

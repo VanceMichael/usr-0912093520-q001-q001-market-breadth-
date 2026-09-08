@@ -63,6 +63,8 @@ class WebConsoleTests(unittest.TestCase):
             self.assertEqual(dashboard["questions"][0]["stage_label"], "待模型跑题")
             self.assertTrue(dashboard["questions"][0]["can_launch"])
             self.assertEqual(dashboard["stages"][0]["complete"], 1)
+            self.assertEqual(dashboard["stages"][0]["current"], 0)
+            self.assertEqual(dashboard["stages"][1]["current"], 1)
 
     def test_changed_prompt_returns_to_question_qc(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -93,6 +95,47 @@ class WebConsoleTests(unittest.TestCase):
             ConsoleData._exported_question_numbers("0911", workbooks),
             {1, 3, 4, 5},
         )
+
+    def test_env_config_masks_key_and_updates_dotenv(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            env_file = root / ".env"
+            env_file.write_text(
+                "# keep this comment\n"
+                "CC_SWITCH_BASE_URL=https://old.example.com/v1\n"
+                "CC_SWITCH_MODEL=old-model\n"
+                "CC_SWITCH_API_KEY=old-secret\n"
+                "CC_USR_SUBMITTER=旧提交人\n",
+                encoding="utf-8",
+            )
+            data = ConsoleData(self.make_database(root), root)
+            self.assertEqual(data.env_config()["api_key_hint"], "已配置（末尾 cret）")
+            result = data.update_env({
+                "base_url": "https://relay.example.com/v1",
+                "model": "claude-new",
+                "api_key": "new-secret",
+                "submitter": "新提交人",
+            })
+            self.assertEqual(result["config"]["model"], "claude-new")
+            content = env_file.read_text(encoding="utf-8")
+            self.assertIn('CC_SWITCH_BASE_URL="https://relay.example.com/v1"', content)
+            self.assertIn('CC_SWITCH_API_KEY="new-secret"', content)
+            self.assertNotIn("old-secret", content)
+            self.assertEqual(env_file.stat().st_mode & 0o777, 0o600)
+
+    def test_env_config_keeps_existing_key_when_blank(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / ".env").write_text(
+                "CC_SWITCH_BASE_URL=https://relay.example.com/v1\n"
+                "CC_SWITCH_MODEL=claude-test\n"
+                "CC_SWITCH_API_KEY=keep-secret\n"
+                "CC_USR_SUBMITTER=提交人\n",
+                encoding="utf-8",
+            )
+            data = ConsoleData(self.make_database(root), root)
+            data.update_env({"base_url": "https://relay.example.com/v2", "model": "claude-v2", "api_key": "", "submitter": "提交人"})
+            self.assertIn('CC_SWITCH_API_KEY="keep-secret"', (root / ".env").read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

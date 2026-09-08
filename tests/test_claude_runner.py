@@ -89,10 +89,13 @@ class RunnerTests(unittest.TestCase):
         )
         return path
 
-    def test_claude_command_has_only_binary_and_exact_prompt(self):
+    def test_claude_command_skips_permission_prompts_and_keeps_exact_prompt(self):
         prompt = "  原始 prompt，不能改写。\n第二行  "
         command = launch_task.build_claude_command("/usr/local/bin/claude", prompt)
-        self.assertEqual(command, ["/usr/local/bin/claude", prompt])
+        self.assertEqual(
+            command,
+            ["/usr/local/bin/claude", "--dangerously-skip-permissions", prompt],
+        )
 
     def test_claude_version_keeps_only_numeric_version(self):
         completed = subprocess.CompletedProcess(
@@ -135,7 +138,10 @@ class RunnerTests(unittest.TestCase):
             chdir_mock.assert_called_once_with(Path(row["folder_path"]).resolve())
             executable, command, environment = exec_mock.call_args.args
             self.assertEqual(executable, "/usr/local/bin/claude")
-            self.assertEqual(command, ["/usr/local/bin/claude", row["prompt"]])
+            self.assertEqual(
+                command,
+                ["/usr/local/bin/claude", "--dangerously-skip-permissions", row["prompt"]],
+            )
             self.assertEqual(environment["ANTHROPIC_AUTH_TOKEN"], "super-secret")
 
     def test_preview_redacts_prompt_and_all_env_values(self):
@@ -156,7 +162,7 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(run_tasks.main(), 0)
             output = stdout.getvalue()
             self.assertIn(f"cd {row['folder_path']}", output)
-            self.assertIn("claude <SQLite 原始 prompt>", output)
+            self.assertIn("claude --dangerously-skip-permissions <SQLite 原始 prompt>", output)
             for secret in ("preview-secret", "relay.example.com", "claude-test", row["prompt"]):
                 self.assertNotIn(secret, output)
 
