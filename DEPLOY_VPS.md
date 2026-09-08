@@ -19,3 +19,4 @@ docker compose run --rm scheduler python3 -m tools.orchestrator \
 不要把 `/var/run/docker.sock` 暴露给 Claude worker；它只应被调度器使用。生产环境应改为 rootless Docker 或独立 worker 主机，并通过 SSH/Tailscale 访问控制台。
 
 部署前需要把被 `.gitignore` 排除的 `production.sqlite3` 和批次目录一并同步到 VPS。`relocate` 只重写数据库绝对路径，不复制文件，也不修改题目仓库内容。
+仅同步部分批次时增加 `--batch <批次名>`，避免要求其他历史批次目录也存在。

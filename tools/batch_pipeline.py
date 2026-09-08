@@ -775,10 +775,19 @@ def list_questions(connection: sqlite3.Connection, batch: str) -> None:
         print(f"{row['question_no']:>3}  {mark:<7}  {row['task_id']:<14}  {row['title']}  [{row['folder_name']}]")
 
 
-def relocate_paths(connection: sqlite3.Connection, workspace: Path) -> int:
+def relocate_paths(
+    connection: sqlite3.Connection, workspace: Path, batch_name: str | None = None
+) -> int:
     """Rebind stored absolute paths after the project is copied to another host."""
     workspace = workspace.resolve(strict=True)
-    batches = connection.execute("SELECT id,name FROM batches ORDER BY id").fetchall()
+    if batch_name:
+        batches = connection.execute(
+            "SELECT id,name FROM batches WHERE name=? ORDER BY id", (batch_name,)
+        ).fetchall()
+        if not batches:
+            raise ValueError(f"batch does not exist: {batch_name}")
+    else:
+        batches = connection.execute("SELECT id,name FROM batches ORDER BY id").fetchall()
     updated = 0
     for batch in batches:
         folder = workspace / batch["name"]
@@ -840,6 +849,7 @@ def main() -> int:
     render_parser.add_argument("--batch", required=True)
     relocate_parser = subparsers.add_parser("relocate")
     relocate_parser.add_argument("--workspace", type=Path, required=True)
+    relocate_parser.add_argument("--batch")
 
     args = parser.parse_args()
     try:
@@ -866,7 +876,7 @@ def main() -> int:
         elif args.command == "render":
             print(render_batch(connection, args.batch))
         elif args.command == "relocate":
-            count = relocate_paths(connection, args.workspace)
+            count = relocate_paths(connection, args.workspace, args.batch)
             print(f"Relocated {count} question paths under {args.workspace.resolve()}")
         connection.close()
         return 0
