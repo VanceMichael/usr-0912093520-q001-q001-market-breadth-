@@ -27,6 +27,16 @@ class NewsTopicTest(unittest.TestCase):
             with connect(database) as connection:
                 self.assertEqual(connection.execute("SELECT COUNT(*) FROM news_topics").fetchone()[0], 1)
 
+    def test_parse_html_channel_page(self):
+        html = b'''<html><body><h1>News</h1>
+        <a href="/world/202609/08-article.shtml">A meaningful article title</a>
+        <a href="/world/202609/08-article.shtml">A meaningful article title</a>
+        <a href="https://other.example/x">External link should be ignored</a>
+        </body></html>'''
+        items = parse_feed("https://channel.example/news.shtml", html)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["article_url"], "https://channel.example/world/202609/08-article.shtml")
+
 
 if __name__ == "__main__":
     unittest.main()

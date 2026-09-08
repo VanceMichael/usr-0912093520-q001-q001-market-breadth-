@@ -11,6 +11,8 @@ import re
 import sqlite3
 import sys
 import urllib.request
+from html.parser import HTMLParser
+from urllib.parse import urljoin, urlparse
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
@@ -22,9 +24,9 @@ if str(PROJECT_ROOT) not in sys.path:
 from tools.batch_pipeline import connect  # noqa: E402
 
 DEFAULT_FEEDS = (
-    "https://feeds.bbci.co.uk/news/world/rss.xml",
-    "https://feeds.bbci.co.uk/news/technology/rss.xml",
-    "https://www.theguardian.com/world/rss",
+    "https://channel.chinanews.com.cn/cns/cl/gn-js.shtml",
+    "https://channel.chinanews.com.cn/cns/cl/gn-kjww.shtml",
+    "https://www.chinanews.com/finance/",
 )
 ATOM = "http://www.w3.org/2005/Atom"
 
@@ -47,10 +49,15 @@ def child_text(node: ET.Element, names: tuple[str, ...]) -> str:
 
 
 def parse_feed(source_url: str, payload: bytes) -> list[dict[str, str]]:
-    root = ET.fromstring(payload)
+    try:
+        root = ET.fromstring(payload)
+    except ET.ParseError:
+        return parse_html(source_url, payload)
     entries = list(root.findall(".//item"))
     if not entries:
         entries = list(root.findall(f".//{{{ATOM}}}entry"))
+    if not entries and root.tag.lower() in {"html", "body"}:
+        return parse_html(source_url, payload)
     parsed: list[dict[str, str]] = []
     for entry in entries:
         title = child_text(entry, ("title", f"{{{ATOM}}}title"))
@@ -63,6 +70,71 @@ def parse_feed(source_url: str, payload: bytes) -> list[dict[str, str]]:
         if title and link:
             parsed.append({"source_url": source_url, "article_url": link, "title": title, "summary": summary, "published_at": published})
     return parsed
+
+
+class _ChannelParser(HTMLParser):
+    """Extract likely article links from a news channel page without scraping body text."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.current_href = ""
+        self.current_text: list[str] = []
+        self.in_heading = False
+        self.items: list[tuple[str, str]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        attributes = dict(attrs)
+        if tag == "a" and attributes.get("href"):
+            self.current_href = str(attributes["href"])
+            self.current_text = []
+        if tag in {"h1", "h2", "h3", "h4"}:
+            self.in_heading = True
+
+    def handle_data(self, data: str) -> None:
+        if self.current_href or self.in_heading:
+            self.current_text.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "a" and self.current_href:
+            text = clean(" ".join(self.current_text))
+            if text:
+                self.items.append((self.current_href, text))
+            self.current_href = ""
+            self.current_text = []
+        if tag in {"h1", "h2", "h3", "h4"}:
+            self.in_heading = False
+
+
+def parse_html(source_url: str, payload: bytes) -> list[dict[str, str]]:
+    parser = _ChannelParser()
+    charset = "utf-8"
+    head = payload[:4096].decode("ascii", errors="ignore")
+    match = re.search(r"charset\s*=\s*[\"']?([\w-]+)", head, re.IGNORECASE)
+    if match:
+        charset = match.group(1)
+    text = payload.decode(charset, errors="replace")
+    parser.feed(text)
+    source_host = urlparse(source_url).netloc
+    seen: set[str] = set()
+    parsed: list[dict[str, str]] = []
+    for raw_link, title in parser.items:
+        article_url = urljoin(source_url, raw_link).split("#", 1)[0]
+        parsed_url = urlparse(article_url)
+        if parsed_url.scheme not in {"http", "https"} or parsed_url.netloc != source_host:
+            continue
+        if article_url == source_url or len(title) < 8 or len(title) > 180:
+            continue
+        if article_url in seen:
+            continue
+        seen.add(article_url)
+        parsed.append({
+            "source_url": source_url,
+            "article_url": article_url,
+            "title": title,
+            "summary": "",
+            "published_at": "",
+        })
+    return parsed[:100]
 
 
 def fetch(source_url: str, timeout: int = 20) -> list[dict[str, str]]:
