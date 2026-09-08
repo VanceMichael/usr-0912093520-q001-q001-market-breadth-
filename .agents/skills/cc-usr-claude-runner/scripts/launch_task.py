@@ -100,17 +100,35 @@ def load_claude_config(path: Path) -> ClaudeConfig:
     return ClaudeConfig(base_url.rstrip("/"), model, api_key, parsed_url.hostname)
 
 
-def build_claude_command(claude: str, prompt: str) -> list[str]:
-    """Run Claude Code non-interactively for permissions in the isolated task workspace."""
+def build_claude_command(claude: str, prompt: str, *, headless: bool = False) -> list[str]:
+    """Build the Claude Code command for an isolated task workspace.
+
+    Interactive launches keep the native session for local macOS runs.  Headless
+    launches use print mode, which skips the workspace-trust UI and never waits
+    for a permission answer on servers without a terminal.
+    """
+    if headless:
+        return [
+            claude,
+            "--print",
+            "--dangerously-skip-permissions",
+            "--permission-mode",
+            "bypassPermissions",
+            "--permission-prompts",
+            "none",
+            prompt,
+        ]
     return [claude, "--dangerously-skip-permissions", prompt]
 
 
-def build_claude_environment(config: ClaudeConfig) -> dict[str, str]:
+def build_claude_environment(config: ClaudeConfig, *, headless: bool = False) -> dict[str, str]:
     environment = os.environ.copy()
     environment.pop("ANTHROPIC_API_KEY", None)
     environment["ANTHROPIC_BASE_URL"] = config.base_url
     environment["ANTHROPIC_AUTH_TOKEN"] = config.api_key
     environment["ANTHROPIC_MODEL"] = config.model
+    if headless:
+        environment["CI"] = "1"
     return environment
 
 
@@ -126,6 +144,11 @@ def main() -> int:
     parser.add_argument("--db", type=Path, required=True)
     parser.add_argument("--question-id", type=int, required=True)
     parser.add_argument("--claude", required=True)
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="run one unattended print-mode turn (for Linux/servers without iTerm2)",
+    )
     args = parser.parse_args()
     try:
         config = load_claude_config(args.env_file.resolve(strict=True))
@@ -154,8 +177,8 @@ def main() -> int:
         return 1
 
     os.chdir(folder)
-    command = build_claude_command(args.claude, prompt)
-    environment = build_claude_environment(config)
+    command = build_claude_command(args.claude, prompt, headless=args.headless)
+    environment = build_claude_environment(config, headless=args.headless)
     if sys.platform == "win32" and Path(args.claude).suffix.lower() in {".cmd", ".bat"}:
         return run_claude_on_windows(command, environment)
     os.execvpe(args.claude, command, environment)

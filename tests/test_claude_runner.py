@@ -98,6 +98,19 @@ class RunnerTests(unittest.TestCase):
             ["/usr/local/bin/claude", "--dangerously-skip-permissions", prompt],
         )
 
+    def test_headless_command_cannot_wait_for_trust_or_permission_input(self):
+        prompt = "服务器原始 prompt"
+        command = launch_task.build_claude_command(
+            "/usr/local/bin/claude", prompt, headless=True
+        )
+        self.assertEqual(command[-1], prompt)
+        self.assertIn("--print", command)
+        self.assertIn("--dangerously-skip-permissions", command)
+        self.assertIn("--permission-mode", command)
+        self.assertIn("bypassPermissions", command)
+        self.assertIn("--permission-prompts", command)
+        self.assertIn("none", command)
+
     def test_claude_version_keeps_only_numeric_version(self):
         completed = subprocess.CompletedProcess(
             ["claude", "--version"], 0, "2.1.259 (Claude Code)\n", ""
@@ -120,6 +133,22 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(environment["ANTHROPIC_BASE_URL"], "https://relay.example.com/v1")
             self.assertEqual(environment["ANTHROPIC_MODEL"], "claude-test")
             self.assertEqual(environment["ANTHROPIC_AUTH_TOKEN"], "super-secret")
+
+    def test_headless_environment_marks_noninteractive_ci(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = launch_task.load_claude_config(self.write_env(Path(directory)))
+            environment = launch_task.build_claude_environment(config, headless=True)
+            self.assertEqual(environment["CI"], "1")
+
+    def test_auto_mode_uses_server_when_iterm_is_unavailable(self):
+        with mock.patch.object(run_tasks.platform, "system", return_value="Linux"):
+            self.assertEqual(run_tasks.select_launch_mode("auto"), "server")
+
+    def test_auto_mode_uses_iterm_when_available(self):
+        with mock.patch.object(
+            run_tasks.platform, "system", return_value="Darwin"
+        ), mock.patch.object(run_tasks, "iterm_available", return_value=True):
+            self.assertEqual(run_tasks.select_launch_mode("auto"), "iterm")
 
     def test_launch_helper_uses_question_directory_and_exact_command(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -153,7 +182,7 @@ class RunnerTests(unittest.TestCase):
             stdout = io.StringIO()
             argv = [
                 "run_tasks.py", "--db", str(database), "--batch", "0911",
-                "--env-file", str(env_file), "--select", "1",
+                "--env-file", str(env_file), "--select", "1", "--mode", "server",
             ]
             with mock.patch.object(sys, "argv", argv), mock.patch.object(
                 run_tasks, "find_claude", return_value="/usr/local/bin/claude"
@@ -163,7 +192,12 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(run_tasks.main(), 0)
             output = stdout.getvalue()
             self.assertIn(f"cd {shlex.quote(str(row['folder_path']))}", output)
-            self.assertIn("claude --dangerously-skip-permissions <SQLite 原始 prompt>", output)
+            self.assertIn(
+                "claude --print --dangerously-skip-permissions "
+                "--permission-mode bypassPermissions --permission-prompts none "
+                "<SQLite 原始 prompt>",
+                output,
+            )
             for secret in ("preview-secret", "relay.example.com", "claude-test", row["prompt"]):
                 self.assertNotIn(secret, output)
 
@@ -174,7 +208,7 @@ class RunnerTests(unittest.TestCase):
             env_file = self.write_env(root, "generated-file-secret")
             argv = [
                 "run_tasks.py", "--db", str(database), "--batch", "0911",
-                "--env-file", str(env_file), "--select", "1", "--launch",
+                "--env-file", str(env_file), "--select", "1", "--launch", "--mode", "iterm",
             ]
             completed = subprocess.CompletedProcess([], 0, "", "")
             with mock.patch.object(sys, "argv", argv), mock.patch.object(
@@ -264,6 +298,29 @@ class RunnerTests(unittest.TestCase):
                 launch_task.run_claude_on_windows(command, environment), 7
             )
         run_mock.assert_called_once_with(command, env=environment, check=False)
+    def test_mocked_server_launch_is_detached_and_records_pid(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database, row = self.make_batch(root)
+            env_file = self.write_env(root)
+            argv = [
+                "run_tasks.py", "--db", str(database), "--batch", "0911",
+                "--env-file", str(env_file), "--select", "1", "--launch",
+                "--mode", "server",
+            ]
+            process = mock.Mock(pid=43210)
+            with mock.patch.object(sys, "argv", argv), mock.patch.object(
+                run_tasks, "find_claude", return_value="/usr/local/bin/claude"
+            ), mock.patch.object(
+                run_tasks, "claude_version", return_value="2.1.259"
+            ), mock.patch.object(
+                run_tasks, "open_server", return_value=process
+            ) as server_mock:
+                self.assertEqual(run_tasks.main(), 0)
+            server_mock.assert_called_once()
+            run_root = next((root / "0911/.runs").iterdir()) / row["task_id"]
+            self.assertEqual((run_root / "process.pid").read_text(), "43210\n")
+            self.assertIn('"$@"', (run_root / "launch.command").read_text())
 
     def test_changed_prompt_is_blocked_after_qc(self):
         with tempfile.TemporaryDirectory() as directory:

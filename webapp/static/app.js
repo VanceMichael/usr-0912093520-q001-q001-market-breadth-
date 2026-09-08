@@ -94,10 +94,10 @@ function renderSummary() {
 
 function renderPipeline() {
   $("#pipeline-track").innerHTML = state.data.stages.map((stage) => `
-    <button class="stage-button ${state.stage === stage.id ? "active" : ""}" data-stage="${stage.id}" aria-label="${escapeHtml(stage.label)}，${stage.current} 道">
+    <button class="stage-button ${state.stage === stage.id ? "active" : ""}" data-stage="${stage.id}" aria-label="${escapeHtml(stage.label)}，待处理 ${stage.current} 道">
       <span class="stage-number">${stage.id}</span>
       <span>${escapeHtml(stage.label)}</span>
-      ${stage.current ? `<span class="stage-count">${stage.current}</span>` : ""}
+      <span class="stage-count ${stage.current ? "has-work" : ""}" title="待处理 ${stage.current} 道">${stage.current}</span>
     </button>`).join("");
 }
 

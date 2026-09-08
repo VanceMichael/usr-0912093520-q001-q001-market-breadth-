@@ -144,6 +144,25 @@ def open_windows(launcher: Path) -> subprocess.Popen[str]:
     )
 
 
+def select_launch_mode(requested: str) -> str:
+    """Resolve auto mode from the host environment, with explicit overrides."""
+    if requested in {"iterm", "server"}:
+        return requested
+    return "iterm" if platform.system() == "Darwin" and iterm_available() else "server"
+
+
+def open_server(launcher: Path, folder: Path) -> subprocess.Popen[bytes]:
+    """Start an unattended Claude process detached from the launching terminal."""
+    return subprocess.Popen(
+        [str(launcher), "--headless"],
+        cwd=folder,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--db", type=Path, default=PROJECT_ROOT / "production.sqlite3")
@@ -153,6 +172,12 @@ def main() -> int:
     parser.add_argument("--launch", action="store_true")
     parser.add_argument("--max-open", type=int, default=4)
     parser.add_argument("--env-file", type=Path, default=PROJECT_ROOT / ".env")
+    parser.add_argument(
+        "--mode",
+        choices=("auto", "iterm", "server"),
+        default="auto",
+        help="use unattended mode by default; choose iterm only for a local interactive window",
+    )
     args = parser.parse_args()
 
     try:
@@ -198,33 +223,33 @@ def main() -> int:
         connection.close()
         return 1
 
+    mode = select_launch_mode(args.mode)
     print(f"Claude Code: {version}")
     print("配置: 已读取根目录 .env（URL、模型和 Key 不显示）")
+    preview_command = (
+        "claude --print --dangerously-skip-permissions "
+        "--permission-mode bypassPermissions --permission-prompts none "
+        "<SQLite 原始 prompt>"
+        if mode == "server"
+        else "claude --dangerously-skip-permissions <SQLite 原始 prompt>"
+    )
     for row, folder in prepared:
         print(
             f"PREVIEW {row['question_no']}: cd {shlex.quote(str(folder))} && "
-            "claude --dangerously-skip-permissions <SQLite 原始 prompt>"
+            + preview_command
         )
 
     if not args.launch:
-        terminals = {"Darwin": "iTerm2", "Windows": "PowerShell"}
-        target_terminal = terminals.get(platform.system(), "a supported terminal")
-        print(f"Preview only. Add --launch to open {target_terminal} sessions.")
+        print("Preview only. Add --launch to start Claude Code sessions.")
         connection.close()
         return 0
+    if args.mode == "iterm" and (platform.system() != "Darwin" or not iterm_available()):
+        print("iTerm2 mode requires macOS with iTerm2 and osascript.", file=sys.stderr)
+        connection.close()
+        return 1
     system = platform.system()
-    if system == "Darwin":
-        if not iterm_available():
-            print("iTerm2 or osascript is not available.", file=sys.stderr)
-            connection.close()
-            return 1
-    elif system == "Windows":
-        if not powershell_executable():
-            print("PowerShell is not available.", file=sys.stderr)
-            connection.close()
-            return 1
-    else:
-        print("Automatic launch currently supports macOS and Windows.", file=sys.stderr)
+    if args.mode == "auto" and system == "Windows" and not powershell_executable():
+        print("PowerShell is not available.", file=sys.stderr)
         connection.close()
         return 1
 
@@ -236,22 +261,22 @@ def main() -> int:
     for row, _folder in prepared:
         run_dir = launch_root / row["task_id"]
         run_dir.mkdir()
-        if system == "Darwin":
-            launcher = run_dir / "launch.command"
-            command = [
-                sys.executable, str(launch_helper),
-                "--env-file", str(env_file),
-                "--db", str(args.db.resolve()),
-                "--question-id", str(row["id"]),
-                "--claude", claude,
-            ]
-            launcher.write_text(
-                "#!/bin/zsh\nset -eu\n"
-                f"echo {shlex.quote('Task: ' + row['task_id'])}\n"
-                f"exec {shlex.join(command)}\n",
-                encoding="utf-8",
-            )
-            launcher.chmod(0o700)
+        launcher = run_dir / "launch.command"
+        command = [
+            sys.executable, str(launch_helper),
+            "--env-file", str(env_file),
+            "--db", str(args.db.resolve()),
+            "--question-id", str(row["id"]),
+            "--claude", claude,
+        ]
+        launcher.write_text(
+            ("#!/bin/zsh\nset -eu\n" if mode == "iterm" else "#!/usr/bin/env sh\nset -eu\n")
+            + f"echo {shlex.quote('Task: ' + row['task_id'])}\n"
+            + f"exec {shlex.join(command)} \"$@\"\n",
+            encoding="utf-8",
+        )
+        launcher.chmod(0o700)
+        if mode == "iterm":
             result = open_iterm(launcher)
             if result.returncode:
                 print(
@@ -260,7 +285,7 @@ def main() -> int:
                 )
                 connection.close()
                 return 1
-        else:
+        elif system == "Windows" and args.mode == "auto":
             launcher = run_dir / "launch.ps1"
             write_windows_launcher(
                 launcher, launch_helper, env_file, args.db.resolve(),
@@ -273,6 +298,27 @@ def main() -> int:
                     f"Failed to open PowerShell for {row['task_id']}: {exc}",
                     file=sys.stderr,
                 )
+        else:
+            launcher = run_dir / "launch.command"
+            command = [
+                sys.executable, str(launch_helper),
+                "--env-file", str(env_file),
+                "--db", str(args.db.resolve()),
+                "--question-id", str(row["id"]),
+                "--claude", claude,
+            ]
+            launcher.write_text(
+                "#!/usr/bin/env sh\nset -eu\n"
+                f"echo {shlex.quote('Task: ' + row['task_id'])}\n"
+                f"exec {shlex.join(command)} \"$@\"\n",
+                encoding="utf-8",
+            )
+            launcher.chmod(0o700)
+            try:
+                process = open_server(launcher, Path(row["folder_path"]).resolve())
+                (run_dir / "process.pid").write_text(f"{process.pid}\n", encoding="ascii")
+            except OSError as exc:
+                print(f"Failed to start server process for {row['task_id']}: {exc}", file=sys.stderr)
                 connection.close()
                 return 1
         timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
@@ -287,7 +333,7 @@ def main() -> int:
             (timestamp, row["id"]),
         )
         connection.commit()
-        print(f"LAUNCHED {row['task_id']}: {row['folder_path']}")
+        print(f"LAUNCHED {row['task_id']} ({mode}): {row['folder_path']}")
     connection.close()
     return 0
 
