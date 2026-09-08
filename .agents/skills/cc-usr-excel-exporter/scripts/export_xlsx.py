@@ -171,7 +171,7 @@ def unique_path(path: Path) -> Path:
     raise ValueError(f"too many existing exports for {path.name}")
 
 
-def trajectory_sources(claude_root: Path, records: list[dict]) -> list[tuple[int, Path]]:
+def trajectory_sources(roots_by_question: dict[int, list[Path]], records: list[dict]) -> list[tuple[int, Path]]:
     requested: dict[tuple[int, str, str], None] = {}
     for record in records:
         requested[(
@@ -179,12 +179,20 @@ def trajectory_sources(claude_root: Path, records: list[dict]) -> list[tuple[int
             str(record["session_id"]),
             str(record["trajectory_file"]),
         )] = None
-    by_name: dict[str, list[Path]] = {}
-    for path in claude_root.rglob("*.jsonl"):
-        if path.is_file():
-            by_name.setdefault(path.name, []).append(path)
+    indexed_roots: dict[Path, dict[str, list[Path]]] = {}
     located: list[tuple[int, Path]] = []
     for question_no, session_id, filename in requested:
+        by_name: dict[str, list[Path]] = {}
+        for root in roots_by_question.get(question_no, []):
+            root = root.resolve()
+            if root not in indexed_roots:
+                index: dict[str, list[Path]] = {}
+                for path in root.rglob("*.jsonl"):
+                    if path.is_file():
+                        index.setdefault(path.name, []).append(path)
+                indexed_roots[root] = index
+            for name, paths in indexed_roots[root].items():
+                by_name.setdefault(name, []).extend(paths)
         candidates = sorted(by_name.get(filename, []))
         if not candidates:
             raise FileNotFoundError(
@@ -199,6 +207,28 @@ def trajectory_sources(claude_root: Path, records: list[dict]) -> list[tuple[int
             )
         located.append((question_no, candidates[0]))
     return located
+
+
+def registered_trajectory_roots(
+    connection: sqlite3.Connection, records: list[dict], override: Path | None
+) -> dict[int, list[Path]]:
+    if override:
+        root = override.resolve()
+        return {int(record["question_no"]): [root] for record in records}
+    roots: dict[int, list[Path]] = {}
+    for record in records:
+        question_no = int(record["question_no"])
+        row = connection.execute(
+            "SELECT trajectory_root FROM runs WHERE question_id=? AND status='succeeded' "
+            "AND (session_id=? OR session_id='') "
+            "ORDER BY CASE WHEN session_id=? THEN 0 ELSE 1 END,id DESC LIMIT 1",
+            (record["question_id"], record["session_id"], record["session_id"]),
+        ).fetchone()
+        if row is not None and row["trajectory_root"]:
+            roots.setdefault(question_no, []).append(Path(row["trajectory_root"]))
+        else:
+            roots.setdefault(question_no, []).append(Path.home() / ".claude/projects")
+    return roots
 
 
 def copy_trajectories(
@@ -220,7 +250,7 @@ def main() -> int:
     parser.add_argument("--batch", required=True)
     parser.add_argument("--select", help="question numbers, for example 1,3-5")
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--claude-root", type=Path, default=Path.home() / ".claude/projects")
+    parser.add_argument("--claude-root", type=Path)
     parser.add_argument(
         "--template", type=Path,
         default=Path(__file__).resolve().parent.parent / "assets" / "CC_Codex 用户满意度标注（试标）.xlsx",
@@ -250,6 +280,7 @@ def main() -> int:
             if missing:
                 missing_text = ", ".join(str(number) for number in sorted(missing))
                 raise ValueError(f"selected questions have no delivery records: {missing_text}")
+        roots_by_question = registered_trajectory_roots(connection, records, args.claude_root)
         connection.close()
         if not records:
             raise ValueError(f"batch has no delivery records: {args.batch}")
@@ -271,7 +302,7 @@ def main() -> int:
                 batch_directory
                 / f"CC_Codex 用户满意度标注（{args.batch}-{question_label(numbers)}）.xlsx"
             )
-        sources = trajectory_sources(args.claude_root.resolve(), records)
+        sources = trajectory_sources(roots_by_question, records)
         export(template, output, records)
         trajectories = copy_trajectories(sources, args.batch, batch_directory)
     except (OSError, ValueError, sqlite3.Error) as exc:
