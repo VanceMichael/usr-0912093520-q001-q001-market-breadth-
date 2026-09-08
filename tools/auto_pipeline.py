@@ -64,6 +64,13 @@ def version_text(value: str) -> str:
     return match.group(0) if match else "0.0.0"
 
 
+def python_subprocess_env() -> dict[str, str]:
+    """Keep Python child-process stdout UTF-8 on Windows code-page consoles."""
+    environment = os.environ.copy()
+    environment.update({"PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"})
+    return environment
+
+
 def build_docker_claude_command(
     docker: str, image: str, claude_command: str, workspace: Path,
     trajectory_root: Path, container_name: str, pipeline_job_id: int, prompt: str,
@@ -175,6 +182,7 @@ class Pipeline:
             command, cwd=cwd or self.project_root, text=True, encoding="utf-8", errors="replace",
             stdin=subprocess.PIPE if stdin_text is not None else None,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            env=python_subprocess_env(),
         )
         if stdin_text is not None:
             assert process.stdin is not None

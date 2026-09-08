@@ -7,7 +7,7 @@ from unittest import mock
 from pathlib import Path
 
 from tools.batch_pipeline import connect, create_batch, prompt_hash, set_repository
-from webapp.server import ConsoleData, open_local_path, runtime_info, secure_file
+from webapp.server import ConsoleData, open_local_path, runtime_info, safe_console_print, secure_file
 
 
 def question_spec(batch: str) -> dict:
@@ -35,6 +35,12 @@ def question_spec(batch: str) -> dict:
 class WebConsoleTests(unittest.TestCase):
     def test_event_message_accepts_scalar_json_output(self):
         self.assertEqual(ConsoleData._event_message('"plain output"'), '"plain output"')
+
+    def test_safe_console_print_does_not_raise_on_unencodable_output(self):
+        encoding_error = UnicodeEncodeError("gbk", "�", 0, 1, "illegal multibyte sequence")
+        with mock.patch("builtins.print", side_effect=[encoding_error, None]) as printer:
+            safe_console_print("�")
+        self.assertIn("\\ufffd", printer.call_args_list[1].args[0])
 
     def make_database(self, root: Path) -> Path:
         database = root / "production.sqlite3"

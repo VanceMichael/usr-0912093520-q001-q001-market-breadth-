@@ -133,6 +133,15 @@ def runtime_info() -> dict[str, str]:
     return {"platform": "Linux", "terminal": "system terminal"}
 
 
+def safe_console_print(message: object, *, file: object = sys.stdout) -> None:
+    """Print pipeline output without letting a Windows code page abort a job."""
+    text = str(message)
+    try:
+        print(text, file=file)
+    except UnicodeEncodeError:
+        print(text.encode("ascii", "backslashreplace").decode("ascii"), file=file)
+
+
 def open_local_path(target: Path, cwd: Path) -> None:
     if sys.platform == "darwin":
         subprocess.Popen(["open", str(target)], cwd=cwd)
@@ -620,6 +629,8 @@ class ConsoleData:
     def _run_pipeline_process(self, job_id: int, batch: str, image: str, command: str, qc_concurrency: int, model_concurrency: int, codex_concurrency: int, model_mode: str, script: Path) -> None:
         flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
         try:
+            pipeline_env = os.environ.copy()
+            pipeline_env.update({"PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"})
             process = subprocess.Popen(
                 [
                     sys.executable, str(script), "--db", str(self.database), "--batch", batch,
@@ -631,7 +642,7 @@ class ConsoleData:
                 ],
                 cwd=self.project_root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="replace", creationflags=flags,
-                start_new_session=os.name != "nt",
+                start_new_session=os.name != "nt", env=pipeline_env,
             )
             with self._pipeline_process_lock:
                 self._pipeline_processes[job_id] = process
@@ -646,7 +657,7 @@ class ConsoleData:
             for line in process.stdout:
                 message = line.rstrip()
                 if message:
-                    print(f"[pipeline {job_id}] {message}")
+                    safe_console_print(f"[pipeline {job_id}] {message}")
             process.wait()
         except Exception as exc:
             finished = datetime.now().astimezone().isoformat(timespec="seconds")

@@ -131,6 +131,7 @@ function renderRows() {
         <button class="icon-button" data-action="detail" title="查看详情" aria-label="查看详情"><i data-lucide="eye"></i></button>
         <button class="icon-button" data-action="copy" title="复制 Prompt" aria-label="复制 Prompt"><i data-lucide="copy"></i></button>
         <button class="icon-button" data-action="folder" title="打开题目目录" aria-label="打开题目目录"><i data-lucide="folder-open"></i></button>
+        ${question.run_count === 0 ? `<button class="icon-button" data-action="single-pipeline" title="单题跑全流程" aria-label="单题跑全流程"><i data-lucide="play-circle"></i></button>` : ""}
       </div></td>
     </tr>`;
   }).join("");
@@ -329,13 +330,17 @@ async function loadPipelineJobs() {
 async function startAutoPipeline() {
   const button = $("#auto-pipeline-button");
   if (!state.batch) return;
-  openModal("一键全流程", `将对批次 ${state.batch} 执行 Codex 题目质检、Docker Claude 并行跑题、Codex 交付生产、交付质检和 Excel 导出。`, "开始执行", async () => {
+  const numbers = state.selected.size ? selectedNumbers() : [];
+  const scope = numbers.length ? `第 ${numbers.join("、")} 题` : "全部题目";
+  openModal("一键全流程", `将对批次 ${state.batch} 的${scope}执行 Codex 题目质检、Claude 并行跑题、Codex 交付生产、交付质检和 Excel 导出。`, "开始执行", async () => {
     closeModal();
     const original = button.innerHTML;
     button.disabled = true;
     button.textContent = "启动中...";
     try {
-      const result = await api("/api/actions/auto-pipeline", { method: "POST", body: JSON.stringify({ batch: state.batch }) });
+      const payload = { batch: state.batch };
+      if (numbers.length) payload.numbers = numbers;
+      const result = await api("/api/actions/auto-pipeline", { method: "POST", body: JSON.stringify(payload) });
       toast(result.message || "自动流水线已启动");
       await loadPipelineJobs();
     } catch (error) { toast(error.message, true); }
@@ -771,6 +776,7 @@ $("#question-rows").addEventListener("click", async (event) => {
   if (button.dataset.action === "folder") {
     executeAction("/api/actions/open", { kind: "question", id }, button, `已打开 ${question.task_id} 目录`).catch(() => {});
   }
+  if (button.dataset.action === "single-pipeline") startSinglePipeline(question, button);
 });
 $("#open-batch").addEventListener("click", () => executeAction("/api/actions/open", { kind: "batch", id: state.batch }, $("#open-batch"), "批次目录已打开").catch(() => {}));
 $("#qc-check").addEventListener("click", async () => {

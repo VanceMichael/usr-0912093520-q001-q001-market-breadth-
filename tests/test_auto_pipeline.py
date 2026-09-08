@@ -34,6 +34,11 @@ class AutoPipelineTests(unittest.TestCase):
     def test_codex_event_accepts_scalar_json_output(self):
         self.assertEqual(auto_pipeline.Pipeline.codex_event('"plain output"'), '"plain output"')
 
+    def test_python_child_environment_forces_utf8_output(self):
+        environment = auto_pipeline.python_subprocess_env()
+        self.assertEqual(environment["PYTHONIOENCODING"], "utf-8")
+        self.assertEqual(environment["PYTHONUTF8"], "1")
+
     def test_codex_sends_complete_prompt_through_stdin(self):
         pipeline = auto_pipeline.Pipeline(
             Path("production.sqlite3"), "0911", 1, lambda _message: None
