@@ -108,7 +108,7 @@
       </section>
 
       <section class="author-view" id="author-view" hidden>
-        <div class="section-heading"><div><h2>出题指令</h2><p>组合批次信息与关键词，生成可直接使用的标准出题命令。</p></div></div>
+        <div class="section-heading"><div><h2>出题指令</h2><p>填写批次和数量；派生题会根据母项目与《项目规范.md》自动生成。</p></div></div>
         <form class="settings-card author-card" id="author-form" autocomplete="off">
           <div class="author-basics">
             <label class="settings-field"><span>批次名</span><input id="author-batch" name="batch" required minlength="2" maxlength="32" pattern="[A-Za-z0-9][A-Za-z0-9_-]{1,31}" placeholder="例如 0911"></label>
@@ -121,16 +121,13 @@
               <label class="settings-field"><span>自动选择的派生题型</span><select id="author-task-type" name="task_type" disabled><option>Bug 修复</option><option>Feature 迭代</option><option>代码理解</option><option>代码重构</option><option>工程化</option><option>代码测试</option></select></label>
             </div>
             <div class="mother-summary" id="mother-summary">选择母库项目后显示代码路径、Git 地址、初始快照和使用次数。</div>
-            <div class="author-keywords">
-              <label class="settings-field"><span>派生方向</span><input id="author-derived-notes" maxlength="2000" placeholder="例如围绕已有预约流程增加取消与补偿处理"></label>
-              <label class="settings-field"><span>可接受的小瑕疵</span><input id="author-defect-tolerance" maxlength="1000" placeholder="例如允许不影响构建的小问题，并记录为后续方向"></label>
-            </div>
+            <p class="author-auto-note">派生方向和小瑕疵边界由系统根据母项目与《项目规范.md》自动生成。</p>
           </div>
-          <div class="author-keywords">
+          <div class="author-keywords" id="author-common-fields">
             <label class="settings-field"><span>业务关键词</span><input id="author-business" name="business" required maxlength="500" placeholder="例如 本地新闻、城市服务、空间租赁"></label>
             <label class="settings-field"><span>技术关键词</span><input id="author-technology" name="technology" maxlength="500" placeholder="例如 Go、React、SQLite、Docker"></label>
           </div>
-          <label class="settings-field"><span>补充要求</span><textarea id="author-notes" name="notes" maxlength="3000" rows="4" placeholder="填写架构侧重、仓库来源或需要避开的方向"></textarea></label>
+          <label class="settings-field" id="author-notes-field"><span>补充要求</span><textarea id="author-notes" name="notes" maxlength="3000" rows="4" placeholder="填写架构侧重、仓库来源或需要避开的方向"></textarea></label>
           <label class="settings-field"><span>命令预览</span><textarea class="command-preview" id="author-command" rows="9" readonly></textarea></label>
           <div class="author-status" id="author-status" hidden><i data-lucide="circle-check"></i><span></span></div>
           <div class="settings-actions"><span class="settings-note">复制命令供手动使用，或直接启动本机 Codex CLI。</span><button class="button secondary" type="submit" id="author-button"><i data-lucide="copy"></i>复制出题命令</button><button class="button primary" type="button" id="codex-author-button"><i data-lucide="bot"></i>Codex CLI 出题</button></div>

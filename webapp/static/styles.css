@@ -168,6 +168,7 @@ th:nth-child(6) { width: 12%; }
 .author-mode label { display: inline-flex; align-items: center; gap: 7px; border: 1px solid #d8d4db; border-radius: 6px; padding: 10px 13px; color: var(--ink); background: #fff; cursor: pointer; }
 .author-mode label:has(input:checked) { border-color: var(--red); background: #fff6f6; }
 .mother-summary { white-space: pre-line; border: 1px solid #e5e1e6; border-radius: 6px; padding: 11px 12px; color: var(--muted); background: #faf9fa; font-size: 12px; line-height: 1.65; }
+.author-auto-note { margin: 0; color: var(--muted); font-size: 12px; }
 #author-notes { min-height: 96px; }
 .settings-field .command-preview { min-height: 188px; resize: none; background: #f7f6f8; color: #4e4850; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; font-size: 11px; }
 .author-status { min-height: 42px; display: flex; align-items: center; gap: 9px; padding: 9px 11px; border: 1px solid #bfe3cb; border-radius: 6px; background: var(--green-soft); color: var(--green); font-size: 12px; }

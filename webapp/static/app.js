@@ -422,12 +422,16 @@ function renderMotherLibrary() {
 function renderAuthorMode() {
   const derived = selectedAuthorMode() === "derived";
   $("#derived-author-fields").hidden = !derived;
+  $("#author-common-fields").hidden = derived;
+  $("#author-notes-field").hidden = derived;
+  $("#author-business").required = !derived;
   renderMotherLibrary();
   renderAuthorCommand();
 }
 
 function renderMotherModeAndCommand() {
   renderMotherLibrary();
+  renderAuthorMode();
   renderAuthorCommand();
 }
 
@@ -480,6 +484,7 @@ async function loadMothers() {
     const result = await api("/api/mother-library");
     state.mothers = result.mothers || [];
     renderMotherLibrary();
+    renderAuthorMode();
     renderAuthorCommand();
   } catch (error) { toast(error.message, true); }
 }
@@ -495,8 +500,8 @@ async function startCodexAuthorJob() {
     mode: selectedAuthorMode(),
     task_type: $("#author-task-type").value,
     mother_id: $("#author-mother").value ? Number($("#author-mother").value) : null,
-    derived_notes: $("#author-derived-notes").value.trim(),
-    defect_tolerance: $("#author-defect-tolerance").value.trim(),
+    derived_notes: $("#author-derived-notes")?.value.trim() || "",
+    defect_tolerance: $("#author-defect-tolerance")?.value.trim() || "",
   };
   button.disabled = true;
   const original = button.innerHTML;
@@ -619,9 +624,9 @@ function authorPrompt() {
   if (mode === "derived") {
     const mother = state.mothers.find((item) => String(item.id) === $("#author-mother").value);
     const taskType = $("#author-task-type").value;
-    const derivedNotes = $("#author-derived-notes").value.trim().replace(/\s+/g, " ");
-    const tolerance = $("#author-defect-tolerance").value.trim().replace(/\s+/g, " ");
-    return `使用 $cc-usr-question-author 基于母库生成派生题目。\n批次名：${batch}\n题目数量：${count}\n题型：${taskType}\n母库项目：${mother ? `${mother.title}（ID ${mother.id}，代码路径 ${mother.workspace_path}，Git ${mother.repo_url || "待登记"}，已用 ${mother.use_count} 次）` : "<请选择母库项目>"}\n派生方向：${derivedNotes || "围绕母项目已有业务设计真实的后续工作"}\n可接受的小瑕疵：${tolerance || "允许不影响构建和主要流程的小问题，并记录为可迭代方向"}\n出题要求：${[business && `业务关键词：${business}`, technology && `技术关键词：${technology}`, notes && `补充要求：${notes}`].filter(Boolean).join("；") || "<填写出题关键词>"}\n严格遵守项目规范和母库引用规则，保留母题关系并完成独立快照与质检，不要启动目标模型。`;
+    const derivedNotes = $("#author-derived-notes")?.value.trim().replace(/\s+/g, " ") || "";
+    const tolerance = $("#author-defect-tolerance")?.value.trim().replace(/\s+/g, " ") || "";
+    return `使用 $cc-usr-question-author 基于母库生成派生题目。\n批次名：${batch}\n题目数量：${count}\n题型：${taskType}\n母库项目：${mother ? `${mother.title}（ID ${mother.id}，代码路径 ${mother.workspace_path}，Git ${mother.repo_url || "待登记"}，已用 ${mother.use_count} 次）` : "系统自动选择符合规范的母库项目"}\n派生方向：${derivedNotes || "围绕母项目已有业务设计真实的后续工作"}\n可接受的小瑕疵：${tolerance || "允许不影响构建和主要流程的小问题，并记录为可迭代方向"}\n出题要求：根据母项目代码、已登记快照和《项目规范.md》自动生成，不需要额外填写关键词。\n严格遵守项目规范和母库引用规则，保留母题关系并完成独立快照与质检，不要启动目标模型。`;
   }
   const requirements = [
     business && `业务关键词：${business}`,

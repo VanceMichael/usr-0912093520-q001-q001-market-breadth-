@@ -297,7 +297,7 @@ class ConsoleData:
                 "在项目根目录执行派生出题任务。先读取项目规范和 cc-usr-question-author 的全部引用，"
                 "使用母库中的 0-1 母项目生成独立的非 0-1 题目批次。\n"
                 f"批次名：{batch}\n题目数量：{count}\n题型：{task_type}\n"
-                f"母库信息：{mother_text}\n出题要求：{requirements}\n"
+                f"母库信息：{mother_text}\n出题要求：{requirements or '根据母项目代码、已登记快照和《项目规范.md》自动生成，不需要额外填写关键词。'}\n"
                 f"派生方向：{derived_notes or '围绕母项目已有业务设计真实的后续工作'}\n"
                 f"可接受的小瑕疵：{defect_tolerance or '允许不影响构建和主要流程的小问题，并将其记录为可迭代方向'}\n"
                 "保留母项目路径、Git 地址、初始快照和派生使用关系；每道题使用独立工作区和独立 Prompt，"
@@ -335,11 +335,11 @@ class ConsoleData:
             if not isinstance(value, str) or "\x00" in value or len(value) > limit:
                 raise ValueError(f"{key} 内容无效")
             values.append(" ".join(value.split()))
-        if not values[0]:
-            raise ValueError("业务关键词不能为空")
         mode = str(body.get("mode", "0-1")).strip() or "0-1"
         if mode not in {"0-1", "derived"}:
             raise ValueError("出题模式无效")
+        if mode == "0-1" and not values[0]:
+            raise ValueError("业务关键词不能为空")
         task_type = str(body.get("task_type", "0-1 代码生成")).strip()
         if mode == "0-1" and task_type != "0-1 代码生成":
             raise ValueError("0-1 模式只能使用 0-1 代码生成")
