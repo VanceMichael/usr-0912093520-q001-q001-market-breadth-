@@ -459,6 +459,41 @@ class DeliveryPipelineTests(unittest.TestCase):
                 ["prompt-001", "prompt-002"],
             )
 
+    def test_locator_uses_registered_docker_trajectory_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = self.prepare(root)
+            connection = connect(database)
+            question = connection.execute("SELECT * FROM questions").fetchone()
+            trajectory_root = root / "worker-state" / "claude"
+            project_root = trajectory_root / "projects" / "-workspace"
+            project_root.mkdir(parents=True)
+            connection.execute(
+                "UPDATE runs SET batch_run_id='docker-test',trajectory_root=?",
+                (str(trajectory_root),),
+            )
+            connection.commit()
+            connection.close()
+            event = {
+                "type": "user",
+                "cwd": "/workspace",
+                "sessionId": "docker-session",
+                "uuid": "docker-prompt",
+                "timestamp": "2026-09-07T09:00:05+08:00",
+                "message": {"role": "user", "content": question["prompt"]},
+            }
+            (project_root / "docker-session.jsonl").write_text(
+                json.dumps(event, ensure_ascii=False) + "\n", encoding="utf-8",
+            )
+            result = self.run_command([
+                sys.executable, str(LOCATOR), "--db", str(database),
+                "--batch", "0911", "--question", "1",
+            ])
+            self.assertEqual(result.returncode, 0, result.stdout)
+            located = json.loads(result.stdout)
+            self.assertEqual(located["session_id"], "docker-session")
+            self.assertEqual(located["trajectory_file"], "docker-session.jsonl")
+
 
 if __name__ == "__main__":
     unittest.main()

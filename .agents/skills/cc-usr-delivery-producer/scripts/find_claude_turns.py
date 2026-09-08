@@ -59,11 +59,12 @@ def read_events(path: Path) -> list[dict]:
     return events
 
 
-def same_folder(raw: object, folder: Path) -> bool:
+def same_folder(raw: object, folder: Path, aliases: tuple[Path, ...] = ()) -> bool:
     if not isinstance(raw, str) or not raw:
         return False
     try:
-        return Path(raw).resolve() == folder.resolve()
+        resolved = Path(raw).resolve()
+        return resolved == folder.resolve() or any(resolved == alias.resolve() for alias in aliases)
     except OSError:
         return False
 
@@ -77,7 +78,8 @@ def prompt_id(event: dict) -> tuple[str, str]:
 
 
 def locate(
-    claude_root: Path, folder: Path, prompt: str, launched_at: datetime
+    claude_root: Path, folder: Path, prompt: str, launched_at: datetime,
+    folder_aliases: tuple[Path, ...] = (),
 ) -> dict:
     candidates: list[tuple[float, Path, list[dict], int]] = []
     earliest = launched_at - timedelta(minutes=5)
@@ -92,7 +94,7 @@ def locate(
             timestamp = parse_time(str(event.get("timestamp", "")))
             if (
                 user_text(event).strip() == prompt.strip()
-                and same_folder(event.get("cwd"), folder)
+                and same_folder(event.get("cwd"), folder, folder_aliases)
                 and timestamp is not None
                 and timestamp >= earliest
             ):
@@ -135,7 +137,7 @@ def main() -> int:
     parser.add_argument("--db", type=Path, default=Path("production.sqlite3"))
     parser.add_argument("--batch", required=True)
     parser.add_argument("--question", type=int, required=True)
-    parser.add_argument("--claude-root", type=Path, default=Path.home() / ".claude/projects")
+    parser.add_argument("--claude-root", type=Path)
     args = parser.parse_args()
     connection: sqlite3.Connection | None = None
     try:
@@ -156,9 +158,16 @@ def main() -> int:
         launched_at = parse_time(run["launched_at"])
         if launched_at is None or launched_at.tzinfo is None:
             raise ValueError("registered launch timestamp is invalid")
+        if args.claude_root:
+            claude_root = args.claude_root.resolve()
+        elif run["trajectory_root"]:
+            claude_root = Path(run["trajectory_root"]).resolve()
+        else:
+            claude_root = (Path.home() / ".claude/projects").resolve()
+        folder_aliases = (Path("/workspace"),) if str(run["batch_run_id"]).startswith("docker-") else ()
         result = locate(
-            args.claude_root.resolve(), Path(question["folder_path"]),
-            question["prompt"], launched_at,
+            claude_root, Path(question["folder_path"]), question["prompt"],
+            launched_at, folder_aliases,
         )
     except (OSError, ValueError, sqlite3.Error) as exc:
         print(f"Claude session lookup failed: {exc}", file=sys.stderr)
