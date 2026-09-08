@@ -53,6 +53,13 @@ class NewsTopicTest(unittest.TestCase):
             self.assertEqual(ingest(database, ["https://example.test/rss"]), (1, []))
             self.assertEqual(ingest(database, ["https://example.test/rss"]), (0, []))
 
+    def test_parse_china_news_embedded_docarr(self):
+        html = b'''<script>var docArr=[{"title":"Embedded article title","content":"Summary","pubtime":"2026-09-08 10:00:00","url":"http:\\/\\/www.chinanews.com.cn\\/gn\\/2026\\/09-08\\/123.shtml"}];</script>'''
+        items = parse_feed("https://channel.chinanews.com.cn/cns/cl/gn-js.shtml", html)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["title"], "Embedded article title")
+        self.assertEqual(items[0]["article_url"], "http://www.chinanews.com.cn/gn/2026/09-08/123.shtml")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import html
+import json
 import os
 import re
 import sqlite3
@@ -58,7 +59,7 @@ def parse_feed(source_url: str, payload: bytes) -> list[dict[str, str]]:
     entries = list(root.findall(".//item"))
     if not entries:
         entries = list(root.findall(f".//{{{ATOM}}}entry"))
-    if not entries and root.tag.lower() in {"html", "body"}:
+    if not entries:
         return parse_html(source_url, payload)
     parsed: list[dict[str, str]] = []
     for entry in entries:
@@ -108,6 +109,33 @@ class _ChannelParser(HTMLParser):
 
 
 def parse_html(source_url: str, payload: bytes) -> list[dict[str, str]]:
+    # China News channel pages embed their article list as a JSON ``docArr``
+    # JavaScript variable instead of ordinary anchor tags.
+    decoded = payload.decode("utf-8", errors="replace")
+    doc_match = re.search(r"\bdocArr\s*=\s*(\[.*?\])\s*;", decoded, re.DOTALL)
+    if doc_match:
+        try:
+            documents = json.loads(doc_match.group(1))
+        except json.JSONDecodeError:
+            documents = []
+        if isinstance(documents, list):
+            parsed: list[dict[str, str]] = []
+            for document in documents:
+                if not isinstance(document, dict):
+                    continue
+                title = clean(str(document.get("title", "")))
+                article_url = str(document.get("url", "")).replace("\\/", "/")
+                article_url = urljoin(source_url, article_url).split("#", 1)[0]
+                if title and article_url and len(title) >= 10:
+                    parsed.append({
+                        "source_url": source_url,
+                        "article_url": article_url,
+                        "title": title,
+                        "summary": clean(str(document.get("content", "")))[:500],
+                        "published_at": clean(str(document.get("pubtime", ""))),
+                    })
+            if parsed:
+                return parsed[:100]
     parser = _ChannelParser()
     charset = "utf-8"
     head = payload[:4096].decode("ascii", errors="ignore")
@@ -122,7 +150,10 @@ def parse_html(source_url: str, payload: bytes) -> list[dict[str, str]]:
     for raw_link, title in parser.items:
         article_url = urljoin(source_url, raw_link).split("#", 1)[0]
         parsed_url = urlparse(article_url)
-        if parsed_url.scheme not in {"http", "https"} or parsed_url.netloc != source_host:
+        same_news_network = parsed_url.netloc == source_host or (
+            parsed_url.netloc.endswith(".chinanews.com.cn") and source_host.endswith(".chinanews.com.cn")
+        )
+        if parsed_url.scheme not in {"http", "https"} or not same_news_network:
             continue
         path = parsed_url.path.lower()
         blocked_titles = {"about us", "home", "首页", "联系我们", "登录", "注册", "更多", "下一页", "上一页"}
