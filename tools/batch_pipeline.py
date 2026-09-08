@@ -54,6 +54,22 @@ CREATE TABLE IF NOT EXISTS schema_meta (
     value TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS news_topics (
+    id INTEGER PRIMARY KEY,
+    source_url TEXT NOT NULL,
+    article_url TEXT NOT NULL,
+    title TEXT NOT NULL,
+    summary TEXT NOT NULL DEFAULT '',
+    published_at TEXT NOT NULL DEFAULT '',
+    topic_hash TEXT NOT NULL UNIQUE,
+    status TEXT NOT NULL DEFAULT 'new',
+    used_batch TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_news_topics_status ON news_topics(status, created_at);
+
 CREATE TABLE IF NOT EXISTS batches (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,

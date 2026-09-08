@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""Run one serialized autonomous production cycle.
+
+The control agent authors and audits batches; Claude Code question runs remain
+isolated Docker workers managed by ``tools.orchestrator``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from tools.batch_pipeline import connect  # noqa: E402
+from tools.news_topics import DEFAULT_FEEDS, ingest  # noqa: E402
+
+
+def now() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def run_command(command: list[str], cwd: Path, log: Path, timeout: int) -> int:
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with log.open("a", encoding="utf-8") as handle:
+        handle.write(f"\n[{now()}] $ {' '.join(command)}\n")
+        result = subprocess.run(command, cwd=cwd, stdout=handle, stderr=subprocess.STDOUT, timeout=timeout, check=False)
+        handle.write(f"[{now()}] exit={result.returncode}\n")
+    return result.returncode
+
+
+def codex_command(codex: str, prompt: str) -> list[str]:
+    return [codex, "exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "-C", str(PROJECT_ROOT), prompt]
+
+
+def claim_topic(database: Path) -> dict | None:
+    with connect(database.resolve()) as connection:
+        row = connection.execute(
+            "SELECT * FROM news_topics WHERE status='new' ORDER BY created_at,id LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return None
+        connection.execute("UPDATE news_topics SET status='claimed',updated_at=? WHERE id=?", (now(), row["id"]))
+        connection.commit()
+        return dict(row)
+
+
+def release_topic(database: Path, topic_id: int, status: str, batch: str = "") -> None:
+    with connect(database.resolve()) as connection:
+        connection.execute("UPDATE news_topics SET status=?,used_batch=?,updated_at=? WHERE id=?", (status, batch, now(), topic_id))
+        connection.commit()
+
+
+def count_ready(database: Path) -> int:
+    with connect(database.resolve()) as connection:
+        return int(connection.execute("SELECT COUNT(*) FROM questions WHERE status='approved' AND mechanical_qc='pass' AND qc_decision='pass' AND qc_prompt_sha256=prompt_sha256").fetchone()[0])
+
+
+def create_batch(database: Path, codex: str, topic: dict, batch: str, log: Path, timeout: int) -> int:
+    context = json.dumps({key: topic.get(key, "") for key in ("title", "summary", "article_url", "source_url", "published_at")}, ensure_ascii=False)
+    prompt = f"""你是持续生产控制 agent。严格读取并遵守项目根目录的 项目规范.md，以及 .agents/skills/cc-usr-question-author/SKILL.md 和 cc-usr-question-qc/SKILL.md。现在创建一个名为 {batch} 的首轮 0-1 代码生成批次，生成 2 道彼此明显不同、业务导向、可执行验收的题目。新闻主题只作为业务背景种子，不要复制新闻标题，不要把新闻事实当成实现要求，也不要使用新闻网站代码或受版权保护的正文。先检查现有 production.sqlite3 的题目避免重复；完成真实初始工程、GitHub 可访问快照、机械质检和重复性质检后才算完成。主题种子如下：{context}。全过程只修改本项目和题目工作区，完成后输出批次名、每题状态和任何阻塞原因。"""
+    return run_command(codex_command(codex, prompt), PROJECT_ROOT, log, timeout)
+
+
+def process_ready(database: Path, codex: str, log: Path, timeout: int) -> int:
+    with connect(database.resolve()) as connection:
+        batches = [row["name"] for row in connection.execute("SELECT name FROM batches ORDER BY created_at")]
+    for batch in batches:
+        with connect(database.resolve()) as connection:
+            needs_producer = connection.execute("SELECT COUNT(*) FROM questions q JOIN batches b ON b.id=q.batch_id WHERE b.name=? AND EXISTS(SELECT 1 FROM runs r WHERE r.question_id=q.id AND r.status='succeeded') AND NOT EXISTS(SELECT 1 FROM records d WHERE d.question_id=q.id)", (batch,)).fetchone()[0]
+            needs_qc = connection.execute("SELECT COUNT(*) FROM records r JOIN questions q ON q.id=r.question_id JOIN batches b ON b.id=q.batch_id WHERE b.name=? AND r.delivery_qc_passed=0", (batch,)).fetchone()[0]
+        if needs_producer:
+            prompt = f"使用 $cc-usr-delivery-producer 处理批次 {batch} 的全部已完成题目，读取原始 Claude JSONL 轨迹和实际产物，按项目规范逐轮评分入库；不要修改目标模型代码。完成后停止。"
+            if run_command(codex_command(codex, prompt), PROJECT_ROOT, log, timeout) != 0:
+                return 1
+        if needs_qc:
+            prompt = f"使用 $cc-usr-delivery-qc 质检批次 {batch} 的全部交付记录；从可核验证据修正问题并最终写入质检通过，不要导出 Excel。完成后停止。"
+            if run_command(codex_command(codex, prompt), PROJECT_ROOT, log, timeout) != 0:
+                return 1
+        with connect(database.resolve()) as connection:
+            passed = connection.execute("SELECT COUNT(*) FROM records r JOIN questions q ON q.id=r.question_id JOIN batches b ON b.id=q.batch_id WHERE b.name=? AND r.delivery_qc_passed=1", (batch,)).fetchone()[0]
+        if passed:
+            prompt = f"使用 $cc-usr-excel-exporter 导出批次 {batch} 中已经通过交付质检的完整记录，复制原始 JSONL 轨迹并报告输出路径；不要修改评分或记录。完成后停止。"
+            if run_command(codex_command(codex, prompt), PROJECT_ROOT, log, timeout) != 0:
+                return 1
+    return 0
+
+
+def cycle(args: argparse.Namespace) -> int:
+    database = args.db.resolve()
+    added, errors = ingest(database, args.feeds, args.feed_timeout)
+    print(f"news: added={added} feed_errors={len(errors)}")
+    if errors and not added:
+        return 1
+    if count_ready(database) < args.ready_watermark:
+        topic = claim_topic(database)
+        if topic:
+            batch = f"news{datetime.now().strftime('%m%d%H%M%S')}"
+            log = args.log_dir.resolve() / f"author-{batch}.log"
+            code = create_batch(database, args.codex, topic, batch, log, args.agent_timeout)
+            release_topic(database, topic["id"], "used" if code == 0 else "new", batch if code == 0 else "")
+            if code:
+                return code
+            run_code = run_command(
+                [
+                    sys.executable,
+                    str(PROJECT_ROOT / "tools" / "orchestrator.py"),
+                    "--db", str(database), "--batch", batch,
+                    "--env-file", str(args.env_file.resolve()),
+                    "--data-root", str(args.data_root.resolve()),
+                    "--image", args.worker_image,
+                    "--concurrency", str(args.concurrency),
+                ],
+                PROJECT_ROOT,
+                args.log_dir.resolve() / f"workers-{batch}.log",
+                args.agent_timeout,
+            )
+            if run_code:
+                return run_code
+    return process_ready(database, args.codex, args.log_dir.resolve() / "delivery.log", args.agent_timeout)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--db", type=Path, default=PROJECT_ROOT / "production.sqlite3")
+    parser.add_argument("--codex", default=os.environ.get("CODEX_BIN", "codex"))
+    parser.add_argument("--feeds", default=os.environ.get("NEWS_FEEDS", ",".join(DEFAULT_FEEDS)));
+    parser.add_argument("--log-dir", type=Path, default=PROJECT_ROOT / "runs" / "daemon")
+    parser.add_argument("--env-file", type=Path, default=PROJECT_ROOT / ".env")
+    parser.add_argument("--data-root", type=Path, default=PROJECT_ROOT / "runs")
+    parser.add_argument("--worker-image", default="ccusr-claude-worker:local")
+    parser.add_argument("--concurrency", type=int, default=2)
+    parser.add_argument("--ready-watermark", type=int, default=4)
+    parser.add_argument("--feed-timeout", type=int, default=20)
+    parser.add_argument("--agent-timeout", type=int, default=3600)
+    parser.add_argument("--loop", action="store_true")
+    parser.add_argument("--poll-seconds", type=int, default=60)
+    args = parser.parse_args()
+    args.feeds = [value.strip() for value in args.feeds.split(",") if value.strip()]
+    lock_path = args.log_dir / "daemon.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open("w", encoding="ascii") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("another pipeline daemon is already running", file=sys.stderr)
+            return 2
+        while True:
+            code = cycle(args)
+            if not args.loop or code:
+                return code
+            time.sleep(args.poll_seconds)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
