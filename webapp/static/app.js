@@ -270,6 +270,7 @@ function renderPipelineJobs() {
       <div class="pipeline-job-head"><div><strong>#${job.id} · ${escapeHtml(job.batch_name)}</strong><span>${job.question_count} 题 · Docker ${escapeHtml(job.docker_image)}</span></div><div class="job-actions">${job.can_retry ? `<button class="button secondary compact" type="button" data-pipeline-retry="${job.id}"><i data-lucide="rotate-ccw"></i>从失败处重试</button>` : ""}<span class="job-status">${escapeHtml(pipelineStatus(job.status))}</span></div></div>
       <div class="pipeline-job-meta"><span>质检并发 ${job.qc_concurrency}</span><span>模型并发 ${job.model_concurrency}</span><span>交付并发 ${job.codex_concurrency}</span>${job.retry_of_job_id ? `<span>重试自 #${job.retry_of_job_id}</span>` : ""}<span>${escapeHtml(formatDate(job.created_at))}</span></div>
       <div class="pipeline-item-grid">${(job.items || []).map((item) => `<span class="pipeline-item status-${escapeHtml(item.status.replaceAll("_", "-"))} health-${escapeHtml(item.health_status || "unknown")}"${item.error ? ` title="${escapeHtml(item.error)}"` : ""}><span>第 ${item.question_no} 题：${escapeHtml(pipelineItemLabel(item))}</span>${item.status === "model_running" && item.health_detail ? `<small>${escapeHtml(item.health_detail)} · 最近活动 ${escapeHtml(formatDate(item.activity_at || item.heartbeat_at))}</small>` : ""}</span>`).join("")}</div>
+      ${job.can_retry ? `<div class="job-actions"><button class="button secondary compact" type="button" data-author-retry="${job.id}"><i data-lucide="rotate-ccw"></i>从失败处重试</button></div>` : ""}
       ${job.error ? `<div class="author-job-error">${escapeHtml(job.error)}</div>` : ""}
       <pre class="author-job-output">${escapeHtml(job.output || job.last_message || "等待流水线启动...")}</pre>
     </article>`).join("");
@@ -364,6 +365,24 @@ function renderAuthorJobs() {
   refreshIcons();
 }
 
+function retryAuthorJob(jobId) {
+  openModal("从失败处重试", `将继续执行出题任务 #${jobId}。若批次已部分创建，将在现有批次基础上补齐。`, "开始重试", async () => {
+    closeModal();
+    const button = document.querySelector(`[data-author-retry="${jobId}"]`);
+    if (button) button.disabled = true;
+    try {
+      const result = await api("/api/actions/codex-author-retry", {
+        method: "POST", body: JSON.stringify({ job_id: jobId }),
+      });
+      toast(result.message || "重试出题任务已启动");
+      await loadAuthorJobs();
+    } catch (error) {
+      toast(error.message, true);
+      if (button) button.disabled = false;
+    }
+  });
+}
+
 async function loadAuthorJobs() {
   if (document.hidden) return;
   try {
@@ -372,7 +391,7 @@ async function loadAuthorJobs() {
       ...job, output: (job.output || "").slice(-30000),
     }));
     const signature = JSON.stringify(state.authorJobs.map((job) => [
-      job.id, job.status, job.output_length, job.last_message, job.error,
+      job.id, job.status, job.output_length, job.last_message, job.error, job.can_retry,
     ]));
     if (signature !== authorJobsSignature) {
       authorJobsSignature = signature;
@@ -697,6 +716,10 @@ $("#author-form").addEventListener("submit", async (event) => {
 });
 $("#codex-author-button").addEventListener("click", startCodexAuthorJob);
 $("#author-jobs-refresh").addEventListener("click", loadAuthorJobs);
+$("#author-job-list").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-author-retry]");
+  if (button) retryAuthorJob(Number(button.dataset.authorRetry));
+});
 $("#export-button").addEventListener("click", () => {
   const numbers = state.selected.size ? selectedNumbers() : [];
   const scope = numbers.length ? `第 ${numbers.join("、")} 题` : "整个批次";

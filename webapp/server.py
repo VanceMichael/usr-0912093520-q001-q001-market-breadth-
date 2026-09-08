@@ -30,6 +30,8 @@ STATIC_ROOT = Path(__file__).resolve().parent / "static"
 DEFAULT_DATABASE = PROJECT_ROOT / "production.sqlite3"
 QUESTION_ID_RE = re.compile(r"^\d+$")
 BATCH_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{1,31}$")
+SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+SNAPSHOT_RE = re.compile(r"^https://github\.com/[^/]+/[^/]+/commit/[0-9a-fA-F]{40}$")
 ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 ENV_KEYS = ("CC_SWITCH_BASE_URL", "CC_SWITCH_MODEL", "CC_SWITCH_API_KEY", "CC_USR_SUBMITTER")
 PIPELINE_ENV_KEYS = (
@@ -296,7 +298,80 @@ class ConsoleData:
                 "ORDER BY created_at DESC,id DESC LIMIT ?",
                 (max(1, min(limit, 50)),),
             ).fetchall()
-        return [dict(row) for row in rows]
+        jobs = [dict(row) for row in rows]
+        latest_by_batch: dict[str, int] = {}
+        for job in jobs:
+            latest_by_batch[job["batch_name"]] = max(
+                latest_by_batch.get(job["batch_name"], 0), int(job["id"])
+            )
+        for job in jobs:
+            job["can_retry"] = bool(
+                job["status"] in {"failed", "interrupted"}
+                and latest_by_batch.get(job["batch_name"]) == int(job["id"])
+            )
+        return jobs
+
+    def retry_author_job(self, body: dict[str, object]) -> dict[str, object]:
+        try:
+            source_job_id = int(body.get("job_id", 0))
+        except (TypeError, ValueError):
+            raise ValueError("出题任务编号无效") from None
+        if source_job_id <= 0:
+            raise ValueError("出题任务编号无效")
+        with closing(self._write_connection()) as connection:
+            source = connection.execute(
+                "SELECT * FROM author_jobs WHERE id=?", (source_job_id,)
+            ).fetchone()
+            if source is None:
+                raise ValueError("原出题任务不存在")
+            if source["status"] not in {"failed", "interrupted"}:
+                raise ValueError("只有失败或中断的出题任务可以重试")
+            latest = connection.execute(
+                "SELECT id FROM author_jobs WHERE batch_name=? ORDER BY id DESC LIMIT 1",
+                (source["batch_name"],),
+            ).fetchone()
+            if latest is None or int(latest["id"]) != source_job_id:
+                raise ValueError("该批次已有更新的出题任务，请从最新任务重试")
+            active = connection.execute(
+                "SELECT 1 FROM author_jobs WHERE batch_name=? AND status IN ('queued','running')",
+                (source["batch_name"],),
+            ).fetchone()
+            if active:
+                raise ValueError(f"批次 {source['batch_name']} 已有正在执行的出题任务")
+            created = datetime.now().astimezone().isoformat(timespec="seconds")
+            prompt = (
+                str(source["prompt"])
+                + "\n这是上一次失败出题任务的重试。请先检查该批次是否已经部分创建；"
+                "若已存在，请在现有批次基础上补齐缺失内容并重新执行需要的质检，"
+                "不要删除已有可用产物，也不要重复创建同名批次。"
+            )
+            cursor = connection.execute(
+                "INSERT INTO author_jobs(batch_name,question_count,business,technology,notes,"
+                "prompt,status,created_at,last_message) VALUES(?,?,?,?,?,?,'queued',?,?)",
+                (
+                    source["batch_name"], source["question_count"], source["business"],
+                    source["technology"], source["notes"], prompt, created,
+                    f"等待重试出题任务 #{source_job_id}",
+                ),
+            )
+            job_id = int(cursor.lastrowid)
+            connection.commit()
+        codex = shutil.which("codex")
+        if not codex:
+            with closing(self._write_connection()) as connection:
+                connection.execute(
+                    "UPDATE author_jobs SET status='failed',error=?,last_message=?,finished_at=? WHERE id=?",
+                    ("未找到 Codex CLI", "未找到 Codex CLI", datetime.now().astimezone().isoformat(timespec="seconds"), job_id),
+                )
+                connection.commit()
+            raise RuntimeError("未找到 Codex CLI，请先安装并确保 codex 在 PATH 中")
+        self.author_executor.submit(self._run_author_job, job_id, codex)
+        return {
+            "ok": True,
+            "job_id": job_id,
+            "retry_of_job_id": source_job_id,
+            "message": f"重试出题任务 #{job_id} 已启动",
+        }
 
     def pipeline_jobs(self, limit: int = 20) -> list[dict]:
         with closing(self.connect()) as connection:
@@ -614,6 +689,8 @@ class ConsoleData:
             event = json.loads(line)
         except json.JSONDecodeError:
             return line
+        if not isinstance(event, dict):
+            return json.dumps(event, ensure_ascii=False)
         event_type = str(event.get("type", "event"))
         item = event.get("item") if isinstance(event.get("item"), dict) else {}
         item_type = str(item.get("type", ""))
@@ -661,26 +738,79 @@ class ConsoleData:
             )
             connection.commit()
 
+    def _author_result_error(self, batch: str, expected_count: int) -> str:
+        with closing(self._write_connection()) as connection:
+            batch_row = connection.execute(
+                "SELECT id,folder_path,markdown_path,question_count FROM batches WHERE name=?",
+                (batch,),
+            ).fetchone()
+            if batch_row is None:
+                return f"Codex CLI 已结束，但未创建批次 {batch}"
+            questions = connection.execute(
+                "SELECT question_no,folder_path,repo_url,initial_snapshot,local_initial_sha,mechanical_qc "
+                "FROM questions WHERE batch_id=? ORDER BY question_no",
+                (batch_row["id"],),
+            ).fetchall()
+
+        issues: list[str] = []
+        if int(batch_row["question_count"]) != expected_count or len(questions) != expected_count:
+            issues.append(f"题目数量应为 {expected_count}，实际为 {len(questions)}")
+        if [int(row["question_no"]) for row in questions] != list(range(1, len(questions) + 1)):
+            issues.append("题号不连续")
+        if not Path(batch_row["folder_path"]).is_dir():
+            issues.append("批次目录不存在")
+        if not Path(batch_row["markdown_path"]).is_file():
+            issues.append("批次 Markdown 不存在")
+        for row in questions:
+            number = int(row["question_no"])
+            repo_url = str(row["repo_url"]).rstrip("/")
+            snapshot = str(row["initial_snapshot"])
+            sha = str(row["local_initial_sha"])
+            if not Path(row["folder_path"]).is_dir():
+                issues.append(f"第 {number} 题目录不存在")
+            if not repo_url.startswith("https://github.com/"):
+                issues.append(f"第 {number} 题仓库地址无效")
+            if not SNAPSHOT_RE.fullmatch(snapshot):
+                issues.append(f"第 {number} 题快照地址无效")
+            elif not repo_url or not snapshot.startswith(repo_url + "/commit/"):
+                issues.append(f"第 {number} 题仓库与快照不一致")
+            if not SHA_RE.fullmatch(sha) or snapshot.rsplit("/", 1)[-1].lower() != sha.lower():
+                issues.append(f"第 {number} 题快照 SHA 不一致")
+            if row["mechanical_qc"] != "pass":
+                issues.append(f"第 {number} 题机械质检未通过")
+        if not issues:
+            return ""
+        detail = "；".join(issues[:8])
+        if len(issues) > 8:
+            detail += f"；另有 {len(issues) - 8} 项问题"
+        return f"Codex CLI 已结束，但出题产物不完整：{detail}"
+
     def _run_author_job(self, job_id: int, codex: str) -> None:
         with closing(self._write_connection()) as connection:
-            row = connection.execute("SELECT prompt FROM author_jobs WHERE id=?", (job_id,)).fetchone()
+            row = connection.execute(
+                "SELECT batch_name,question_count,prompt FROM author_jobs WHERE id=?", (job_id,)
+            ).fetchone()
         if row is None:
             return
         timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
         command = [
             codex, "exec", "--json", "--cd", str(self.project_root),
-            "--sandbox", "danger-full-access", "--skip-git-repo-check", row["prompt"],
+            "--sandbox", "danger-full-access", "--skip-git-repo-check", "-",
         ]
         try:
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
             process = subprocess.Popen(
                 command, cwd=self.project_root, text=True, encoding="utf-8", errors="replace",
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1, creationflags=flags,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                bufsize=1, creationflags=flags,
             )
             self._update_author_job(
                 job_id, status="running", pid=process.pid, started_at=timestamp,
                 last_message="Codex CLI 已启动",
             )
+            assert process.stdin is not None
+            process.stdin.write(row["prompt"])
+            process.stdin.close()
             assert process.stdout is not None
             for line in process.stdout:
                 message = self._event_message(line.strip())
@@ -689,10 +819,18 @@ class ConsoleData:
             returncode = process.wait()
             finished = datetime.now().astimezone().isoformat(timespec="seconds")
             if returncode == 0:
-                self._update_author_job(
-                    job_id, status="completed", pid=None, finished_at=finished,
-                    last_message="Codex CLI 执行完成",
-                )
+                error = self._author_result_error(row["batch_name"], int(row["question_count"]))
+                if error:
+                    self._append_author_output(job_id, error)
+                    self._update_author_job(
+                        job_id, status="failed", pid=None, finished_at=finished, error=error,
+                        last_message=error,
+                    )
+                else:
+                    self._update_author_job(
+                        job_id, status="completed", pid=None, finished_at=finished,
+                        last_message="Codex CLI 执行完成，出题产物校验通过",
+                    )
             else:
                 error = f"Codex CLI 退出码：{returncode}"
                 self._append_author_output(job_id, error)
@@ -1291,9 +1429,17 @@ class ConsoleData:
             if not BATCH_RE.fullmatch(batch_name):
                 raise ValueError("批次名无效")
             selected = []
+        with closing(self.connect()) as connection:
+            batch_row = connection.execute(
+                "SELECT folder_path FROM batches WHERE name=?", (batch_name,)
+            ).fetchone()
+        if batch_row is None:
+            raise ValueError("batch does not exist")
+        trajectory_root = Path(batch_row["folder_path"]).resolve() / ".runs"
         script = self.project_root / ".agents/skills/cc-usr-excel-exporter/scripts/export_xlsx.py"
         command = [
-            sys.executable, str(script), "--db", str(self.database), "--batch", batch_name
+            sys.executable, str(script), "--db", str(self.database), "--batch", batch_name,
+            "--claude-root", str(trajectory_root),
         ]
         if selected:
             command.extend(["--select", ",".join(map(str, selected))])
@@ -1411,6 +1557,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 result["message"] = "环境检测与修复已完成" if result["ok"] else "环境仍不可用，请查看检测结果"
             elif self.path == "/api/actions/codex-author":
                 result = self.data.create_author_job(body)
+            elif self.path == "/api/actions/codex-author-retry":
+                result = self.data.retry_author_job(body)
             elif self.path == "/api/actions/auto-pipeline":
                 result = self.data.create_pipeline_job(body)
             elif self.path == "/api/actions/auto-pipeline-retry":

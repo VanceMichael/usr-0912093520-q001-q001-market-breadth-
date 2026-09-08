@@ -33,6 +33,9 @@ def question_spec(batch: str) -> dict:
 
 
 class WebConsoleTests(unittest.TestCase):
+    def test_event_message_accepts_scalar_json_output(self):
+        self.assertEqual(ConsoleData._event_message('"plain output"'), '"plain output"')
+
     def make_database(self, root: Path) -> Path:
         database = root / "production.sqlite3"
         spec = root / "spec.json"
@@ -98,6 +101,24 @@ class WebConsoleTests(unittest.TestCase):
             {1, 3, 4, 5},
         )
 
+    def test_export_passes_batch_runs_as_trajectory_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = self.make_database(root)
+            data = ConsoleData(database, root)
+            try:
+                with mock.patch.object(
+                    data, "run_tool", return_value={"ok": True, "output": ""}
+                ) as run_tool:
+                    data.export("0911", None)
+                command = run_tool.call_args.args[0]
+                self.assertIn("--claude-root", command)
+                root_index = command.index("--claude-root") + 1
+                self.assertEqual(Path(command[root_index]), root / "0911" / ".runs")
+            finally:
+                data.author_executor.shutdown(wait=True)
+                data.pipeline_executor.shutdown(wait=True)
+
     def test_env_config_masks_key_and_updates_dotenv(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -160,6 +181,7 @@ class WebConsoleTests(unittest.TestCase):
     def test_codex_author_job_persists_output_and_command(self):
         class Process:
             pid = 4321
+            stdin = mock.Mock()
             stdout = iter([
                 '{"type":"thread.started"}\n',
                 '{"type":"item.completed","item":{"type":"agent_message","text":"finished"}}\n',
@@ -175,7 +197,9 @@ class WebConsoleTests(unittest.TestCase):
             connection.close()
             data = ConsoleData(database, root)
             try:
-                with mock.patch("webapp.server.shutil.which", return_value="codex"), mock.patch(
+                with mock.patch.object(data, "_author_result_error", return_value=""), mock.patch(
+                    "webapp.server.shutil.which", return_value="codex"
+                ), mock.patch(
                     "webapp.server.subprocess.Popen", return_value=Process()
                 ) as popen:
                     result = data.create_author_job({
@@ -187,6 +211,12 @@ class WebConsoleTests(unittest.TestCase):
                     job = data.author_jobs()[0]
                 command = popen.call_args.args[0]
                 self.assertEqual(command[1:3], ["exec", "--json"])
+                self.assertEqual(command[-1], "-")
+                prompt = job["prompt"]
+                Process.stdin.write.assert_called_once_with(prompt)
+                Process.stdin.close.assert_called_once_with()
+                self.assertIn("批次名：codex1", prompt)
+                self.assertIn("题目数量：2", prompt)
                 self.assertEqual(job["status"], "completed")
                 self.assertIn("finished", job["output"])
             finally:
@@ -195,6 +225,7 @@ class WebConsoleTests(unittest.TestCase):
     def test_codex_author_job_records_failure(self):
         class Process:
             pid = 4322
+            stdin = mock.Mock()
             stdout = iter(["plain output\n"])
 
             def wait(self):
@@ -215,6 +246,74 @@ class WebConsoleTests(unittest.TestCase):
                 job = data.author_jobs()[0]
                 self.assertEqual(job["status"], "failed")
                 self.assertIn("退出码：7", job["error"])
+            finally:
+                data.author_executor.shutdown(wait=True)
+
+    def test_codex_author_job_rejects_zero_exit_without_batch(self):
+        class Process:
+            pid = 4323
+            stdin = mock.Mock()
+            stdout = iter([])
+
+            def wait(self):
+                return 0
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "production.sqlite3"
+            connect(database).close()
+            data = ConsoleData(database, root)
+            try:
+                with mock.patch("webapp.server.shutil.which", return_value="codex"), mock.patch(
+                    "webapp.server.subprocess.Popen", return_value=Process()
+                ):
+                    data.create_author_job({"batch": "codex3", "count": 1, "business": "本地服务"})
+                    data.author_executor.shutdown(wait=True)
+                job = data.author_jobs()[0]
+                self.assertEqual(job["status"], "failed")
+                self.assertIn("未创建批次 codex3", job["error"])
+            finally:
+                data.author_executor.shutdown(wait=True)
+
+    def test_codex_author_result_accepts_complete_batch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = ConsoleData(self.make_database(root), root)
+            try:
+                self.assertEqual(data._author_result_error("0911", 1), "")
+            finally:
+                data.author_executor.shutdown(wait=True)
+
+    def test_failed_author_retry_creates_linked_attempt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "production.sqlite3"
+            connect(database).close()
+            data = ConsoleData(database, root)
+            try:
+                with mock.patch("webapp.server.shutil.which", return_value="codex"), mock.patch.object(
+                    data, "_run_author_job"
+                ):
+                    first = data.create_author_job({
+                        "batch": "retry-author", "count": 1, "business": "本地服务",
+                    })
+                    data.author_executor.shutdown(wait=True)
+                connection = sqlite3.connect(database)
+                connection.execute(
+                    "UPDATE author_jobs SET status='failed', error='失败' WHERE id=?",
+                    (first["job_id"],),
+                )
+                connection.commit()
+                connection.close()
+                data.author_executor = mock.Mock()
+
+                with mock.patch("webapp.server.shutil.which", return_value="codex"):
+                    retried = data.retry_author_job({"job_id": first["job_id"]})
+                jobs = data.author_jobs()
+                self.assertEqual(retried["retry_of_job_id"], first["job_id"])
+                self.assertEqual(jobs[0]["status"], "queued")
+                self.assertFalse(jobs[0]["can_retry"])
+                data.author_executor.submit.assert_called_once()
             finally:
                 data.author_executor.shutdown(wait=True)
 

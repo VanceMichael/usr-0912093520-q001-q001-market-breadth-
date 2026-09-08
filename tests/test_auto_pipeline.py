@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -30,6 +31,23 @@ LOCATOR_SPEC.loader.exec_module(find_claude_turns)
 
 
 class AutoPipelineTests(unittest.TestCase):
+    def test_codex_event_accepts_scalar_json_output(self):
+        self.assertEqual(auto_pipeline.Pipeline.codex_event('"plain output"'), '"plain output"')
+
+    def test_codex_sends_complete_prompt_through_stdin(self):
+        pipeline = auto_pipeline.Pipeline(
+            Path("production.sqlite3"), "0911", 1, lambda _message: None
+        )
+        prompt = "批次名：0911\n题目数量：5\n出题要求：城市服务"
+        with mock.patch.object(auto_pipeline.shutil, "which", return_value="codex.CMD"), mock.patch.object(
+            pipeline, "run_command", return_value=(0, "")
+        ) as run_command:
+            self.assertEqual(pipeline.codex(prompt), 0)
+
+        command = run_command.call_args.args[0]
+        self.assertEqual(command[-1], "-")
+        self.assertEqual(run_command.call_args.kwargs["stdin_text"], prompt)
+
     def test_docker_command_contains_only_exact_prompt_as_user_content(self):
         prompt = "实现一个唯一的跨模块状态恢复流程。"
         command = auto_pipeline.build_docker_claude_command(
@@ -156,6 +174,44 @@ class AutoPipelineTests(unittest.TestCase):
 
         self.assertTrue(progress[question_id]["model_done"])
         self.assertEqual(progress[question_id]["record_count"], 0)
+
+    def test_restore_question_workspace_removes_failed_attempt_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "question"
+            repo.mkdir()
+            subprocess.run(["git", "-C", str(repo), "init", "-q", "-b", "main"], check=True)
+            (repo / "app.txt").write_text("baseline\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(repo), "add", "app.txt"], check=True)
+            subprocess.run(
+                ["git", "-C", str(repo), "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-q", "-m", "baseline"],
+                check=True,
+            )
+            baseline = subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "HEAD"],
+                text=True, stdout=subprocess.PIPE, check=True,
+            ).stdout.strip()
+            (repo / "app.txt").write_text("failed attempt\n", encoding="utf-8")
+            (repo / "new.txt").write_text("generated\n", encoding="utf-8")
+            (repo / ".secret").write_text("credential\n", encoding="utf-8")
+            (repo / ".gitignore").write_text(".secret\n", encoding="utf-8")
+
+            pipeline = auto_pipeline.Pipeline(Path(directory) / "db.sqlite3", "0911", 1, lambda _message: None)
+            with mock.patch.object(pipeline, "log"):
+                pipeline.restore_question_workspace({
+                    "task_id": "0911-001",
+                    "folder_path": str(repo),
+                    "local_initial_sha": baseline,
+                    "initial_snapshot": f"https://github.com/example/repo/commit/{baseline}",
+                })
+
+            self.assertEqual((repo / "app.txt").read_text(encoding="utf-8"), "baseline\n")
+            self.assertFalse((repo / "new.txt").exists())
+            self.assertFalse((repo / ".secret").exists())
+            status = subprocess.run(
+                ["git", "-C", str(repo), "status", "--porcelain", "--untracked-files=all"],
+                text=True, stdout=subprocess.PIPE, check=True,
+            )
+            self.assertEqual(status.stdout, "")
 
     def test_docker_run_health_uses_recent_trajectory_activity(self):
         with tempfile.TemporaryDirectory() as directory:

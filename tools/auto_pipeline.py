@@ -29,7 +29,7 @@ MODEL_STALL_TIMEOUT_SECONDS = 30 * 60
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from tools.batch_pipeline import connect, prompt_hash, question_rows  # noqa: E402
+from tools.batch_pipeline import SNAPSHOT_RE, connect, prompt_hash, question_rows  # noqa: E402
 from tools.runtime_environment import docker_info, repair_docker_engine  # noqa: E402
 
 
@@ -153,12 +153,20 @@ class Pipeline:
             )
             connection.commit()
 
-    def run_command(self, command: list[str], *, cwd: Path | None = None, timeout: int = 7200) -> tuple[int, str]:
+    def run_command(
+        self, command: list[str], *, cwd: Path | None = None,
+        timeout: int = 7200, stdin_text: str | None = None,
+    ) -> tuple[int, str]:
         self.log("$ " + " ".join(self._safe_arg(value) for value in command[:5]) + (" ..." if len(command) > 5 else ""))
         process = subprocess.Popen(
             command, cwd=cwd or self.project_root, text=True, encoding="utf-8", errors="replace",
+            stdin=subprocess.PIPE if stdin_text is not None else None,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         )
+        if stdin_text is not None:
+            assert process.stdin is not None
+            process.stdin.write(stdin_text)
+            process.stdin.close()
         assert process.stdout is not None
         chunks: list[str] = []
         for line in process.stdout:
@@ -179,6 +187,8 @@ class Pipeline:
             event = json.loads(line)
         except json.JSONDecodeError:
             return line
+        if not isinstance(event, dict):
+            return json.dumps(event, ensure_ascii=False)
         item = event.get("item") if isinstance(event.get("item"), dict) else {}
         text = item.get("text") or item.get("command") or event.get("message") or event.get("error")
         if isinstance(text, (dict, list)):
@@ -191,9 +201,9 @@ class Pipeline:
             raise RuntimeError("未找到 Codex CLI")
         command = [
             binary, "exec", "--json", "--cd", str(self.project_root),
-            "--sandbox", "danger-full-access", "--skip-git-repo-check", prompt,
+            "--sandbox", "danger-full-access", "--skip-git-repo-check", "-",
         ]
-        return self.run_command(command, timeout=timeout)[0]
+        return self.run_command(command, timeout=timeout, stdin_text=prompt)[0]
 
     def question_qc(self, concurrency: int, rows: list[sqlite3.Row]) -> None:
         self.log("阶段 1/4：先执行快照与 Prompt 机械门禁")
@@ -716,6 +726,64 @@ class Pipeline:
             for state in states
         }
 
+    def restore_question_workspace(self, row: sqlite3.Row | dict[str, object]) -> None:
+        """Restore a retried question to its registered Git snapshot.
+
+        A retry gets a fresh Claude session, so its workspace must also start
+        from the same clean baseline.  ``git clean -ffdx`` intentionally drops
+        untracked and ignored files produced by the failed model attempt.
+        """
+        folder = Path(str(row["folder_path"])).resolve(strict=True)
+        baseline = str(row["local_initial_sha"] or "").strip()
+        snapshot = str(row["initial_snapshot"] or "").strip()
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", baseline):
+            raise RuntimeError(
+                f"{row['task_id']} 缺少有效的 local_initial_sha，无法安全恢复工作区"
+            )
+        if (
+            not SNAPSHOT_RE.fullmatch(snapshot)
+            or snapshot.rsplit("/", 1)[-1].lower() != baseline.lower()
+        ):
+            raise RuntimeError(
+                f"{row['task_id']} 的初始快照 SHA 与 local_initial_sha 不一致，拒绝恢复"
+            )
+
+        def git(*args: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                ["git", "-C", str(folder), *args],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                check=False,
+            )
+
+        root = git("rev-parse", "--show-toplevel")
+        if root.returncode or Path(root.stdout.strip()).resolve() != folder:
+            raise RuntimeError(f"{row['task_id']} 工作区不是独立 Git 仓库，拒绝恢复")
+        exists = git("cat-file", "-e", f"{baseline}^{{commit}}")
+        if exists.returncode:
+            raise RuntimeError(f"{row['task_id']} 找不到初始快照提交 {baseline}")
+
+        reset = git("reset", "--hard", baseline)
+        if reset.returncode:
+            raise RuntimeError(
+                f"{row['task_id']} 恢复 Git 跟踪文件失败：{reset.stdout.strip()[-500:]}"
+            )
+        clean = git("clean", "-ffdx")
+        if clean.returncode:
+            raise RuntimeError(
+                f"{row['task_id']} 清理工作区文件失败：{clean.stdout.strip()[-500:]}"
+            )
+
+        head = git("rev-parse", "HEAD")
+        status = git("status", "--porcelain", "--untracked-files=all")
+        if (
+            head.returncode
+            or head.stdout.strip().lower() != baseline.lower()
+            or status.returncode
+            or status.stdout.strip()
+        ):
+            raise RuntimeError(f"{row['task_id']} 恢复后工作区仍不是干净初始快照")
+        self.log(f"题目 {row['task_id']}：重试前已恢复到初始快照 {baseline}")
+
     def execute(self, image: str, command: str, qc_concurrency: int, model_concurrency: int, codex_concurrency: int) -> None:
         with closing(self.db()) as connection:
             batch = connection.execute("SELECT * FROM batches WHERE name=?", (self.batch,)).fetchone()
@@ -774,6 +842,9 @@ class Pipeline:
             if int(row["id"]) not in model_pending_ids:
                 self.item(int(row["id"]), status="model_completed", error="")
         if model_pending:
+            if retry_of_job_id is not None:
+                for row in model_pending:
+                    self.restore_question_workspace(row)
             self.model_stage(image, command, model_concurrency, model_version, model_pending, config)
         else:
             self.log("阶段 2/4：模型跑题已有成功结果，跳过")
