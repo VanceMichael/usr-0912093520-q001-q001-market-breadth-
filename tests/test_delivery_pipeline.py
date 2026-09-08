@@ -121,6 +121,27 @@ class DeliveryPipelineTests(unittest.TestCase):
             command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False
         )
 
+    def test_delivery_descriptions_reject_stock_and_model_wording(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = self.prepare(root)
+            record = automated_record()
+            record["human_authored"] = True
+            record["planning_description"] = "本次任务中，总体而言，模型的表现符合预期，规划过程比较完整。"
+            input_path = root / "score.json"
+            input_path.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+
+            result = self.run_command([
+                sys.executable, str(COLLECTOR), "--db", str(database), "--batch", "0911",
+                "--question", "1", "--turn", "1", "--from-json", str(input_path),
+            ])
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("套话开头", result.stdout)
+            connection = connect(database)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM records").fetchone()[0], 0)
+            connection.close()
+
     def test_delivery_qc_finalize_and_excel_export(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -137,6 +158,8 @@ class DeliveryPipelineTests(unittest.TestCase):
             run = connection.execute("SELECT * FROM runs").fetchone()
             connection.close()
             self.assertEqual(stored["human_authored"], 0)
+            expected_os = "Windows" if sys.platform == "win32" else "MacOS/Linux"
+            self.assertEqual(stored["operating_system"], expected_os)
             self.assertEqual(run["session_id"], "session-001")
 
             result = self.run_command([
@@ -370,8 +393,8 @@ class DeliveryPipelineTests(unittest.TestCase):
                 "--question", "1", "--turn", "1", "--from-json", str(input_path),
             ])
             self.assertNotEqual(result.returncode, 0, result.stdout)
-            self.assertIn("evaluator self-reference", result.stdout)
-            self.assertIn("prohibited fixed label", result.stdout)
+            self.assertIn("评价者自述", result.stdout)
+            self.assertIn("固定标签", result.stdout)
 
     def test_automated_record_rejects_repeated_descriptions(self):
         with tempfile.TemporaryDirectory() as directory:

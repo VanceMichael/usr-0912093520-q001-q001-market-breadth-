@@ -56,6 +56,7 @@
       <section class="pipeline-band" aria-label="生产阶段">
         <div class="pipeline-track" id="pipeline-track"></div>
         <div class="selection-bar">
+          <button class="button danger" id="auto-pipeline-button"><i data-lucide="play-circle"></i>一键全流程</button>
           <div class="selection-tools" id="selection-tools" hidden>
             <label class="check-label"><input type="checkbox" id="select-all"><span>全选</span></label>
             <span class="selected-count" id="selected-count">已选 0 道</span>
@@ -101,6 +102,11 @@
         </div>
       </section>
 
+      <section class="pipeline-jobs-panel" id="pipeline-jobs-panel" aria-labelledby="pipeline-jobs-title">
+        <div class="section-heading"><div><h2 id="pipeline-jobs-title">自动流水线</h2><p>按配置并行执行 Codex 质检、Docker Claude 跑题、交付生产、交付质检和 Excel 导出。</p></div><button class="button secondary" type="button" id="pipeline-jobs-refresh"><i data-lucide="refresh-cw"></i>刷新任务</button></div>
+        <div id="pipeline-job-list" class="pipeline-job-list"><div class="empty-state"><strong>暂无自动流水线任务</strong></div></div>
+      </section>
+
       <section class="author-view" id="author-view" hidden>
         <div class="section-heading"><div><h2>出题指令</h2><p>组合批次信息与关键词，生成可直接使用的标准出题命令。</p></div></div>
         <form class="settings-card author-card" id="author-form" autocomplete="off">
@@ -115,8 +121,12 @@
           <label class="settings-field"><span>补充要求</span><textarea id="author-notes" name="notes" maxlength="3000" rows="4" placeholder="填写架构侧重、仓库来源或需要避开的方向"></textarea></label>
           <label class="settings-field"><span>命令预览</span><textarea class="command-preview" id="author-command" rows="9" readonly></textarea></label>
           <div class="author-status" id="author-status" hidden><i data-lucide="circle-check"></i><span></span></div>
-          <div class="settings-actions"><span class="settings-note">只复制命令，不会创建批次、打开终端或启动目标模型。</span><button class="button primary" type="submit" id="author-button"><i data-lucide="copy"></i>复制出题命令</button></div>
+          <div class="settings-actions"><span class="settings-note">复制命令供手动使用，或直接启动本机 Codex CLI。</span><button class="button secondary" type="submit" id="author-button"><i data-lucide="copy"></i>复制出题命令</button><button class="button primary" type="button" id="codex-author-button"><i data-lucide="bot"></i>Codex CLI 出题</button></div>
         </form>
+        <section class="author-jobs" aria-labelledby="author-jobs-title">
+          <div class="section-heading"><div><h3 id="author-jobs-title">Codex 出题任务</h3><p>任务状态和实时过程保存在本地生产库，刷新页面后仍可查看。</p></div><button class="button secondary" type="button" id="author-jobs-refresh"><i data-lucide="refresh-cw"></i>刷新任务</button></div>
+          <div id="author-job-list" class="author-job-list"><div class="empty-state"><strong>暂无 Codex 出题任务</strong></div></div>
+        </section>
       </section>
 
       <section class="export-view" id="export-view" hidden>
@@ -131,6 +141,16 @@
           <label class="settings-field"><span>模型名称</span><input id="config-model" name="model" required placeholder="claude-sonnet"></label>
           <label class="settings-field"><span>API Key <small id="config-key-hint"></small></span><span class="password-field"><input id="config-api-key" name="api_key" type="password" placeholder="留空表示保留现有 Key"><button class="field-icon" id="toggle-api-key" type="button" title="显示 API Key" aria-label="显示 API Key"><i data-lucide="eye"></i></button></span></label>
           <label class="settings-field"><span>提交人</span><input id="config-submitter" name="submitter" required placeholder="真实姓名"></label>
+          <div class="pipeline-config-fields" aria-label="Docker 流水线配置">
+            <label class="settings-field"><span>Claude Docker 镜像</span><input id="config-docker-image" placeholder="claude-cli:latest"></label>
+            <label class="settings-field"><span>容器内命令</span><input id="config-docker-command" placeholder="claude"></label>
+            <div class="pipeline-concurrency-fields">
+              <label class="settings-field"><span>题目质检并发</span><input id="config-qc-concurrency" type="number" min="1" max="8" value="2"></label>
+              <label class="settings-field"><span>模型跑题并发</span><input id="config-model-concurrency" type="number" min="1" max="8" value="2"></label>
+              <label class="settings-field"><span>Codex 交付并发</span><input id="config-codex-concurrency" type="number" min="1" max="8" value="2"></label>
+            </div>
+            <p class="settings-note">模型只接收 SQLite 中该题的原始 User Prompt；中转配置通过容器环境变量传递，不拼入 Prompt。默认镜像不存在时会自动构建。</p>
+          </div>
           <div class="settings-actions"><span class="settings-note">配置文件权限会自动设置为仅当前用户可读写。</span><button class="button primary" type="submit" id="save-config"><i data-lucide="save"></i>保存配置</button></div>
         </form>
       </section>

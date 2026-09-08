@@ -35,7 +35,7 @@ Before insertion, compare each score with its own description and then read all 
 
 ## Description requirements
 
-Every description is required, including scores of 5. Write as a programmer reporting a concrete review finding to another programmer. A reader should be able to tell, without labels or a prescribed format, where the issue surfaced, what actually happened, and what it changed or prevented. Add the likely cause and the better engineering approach when the available evidence supports both.
+Every description is required, including scores of 5. Write it in natural Chinese as a programmer reporting a concrete engineering finding to another programmer. A reader should be able to tell, without labels or a prescribed format, where the issue surfaced, what actually happened, and what it changed or prevented. Every conclusion must be anchored by a named file, function, command, error, test result, explicit requirement, or exact observable action; remove any conclusion that cannot be traced to one of those sources. Add the likely cause and the better engineering approach only when the available evidence supports both.
 
 Do not turn those ingredients into visible headings, a checklist, or a repeated sentence frame. Vary the opening, rhythm, and level of detail according to the evidence. Some findings read most naturally from the failed requirement to the code evidence; others should start with a command failure, a mistaken decision, or a specific file. Use “根因是” or “正确做法是” only when it genuinely improves clarity, not as a mandatory tail.
 
@@ -43,7 +43,7 @@ When process and product problems are causally related, explain that connection 
 
 The descriptions are production feedback, not an audit note. They must not identify or discuss the evaluator, the writing process, automation, internal provenance, or how the text was generated. Do not use self-referential wording such as `AI 分析认为`, `Codex 认为`, “自动生成” or “基于轨迹生成”. An exact product, API, or business-domain term may be retained only when it is necessary to describe the task evidence.
 
-Before storing a turn, read the five descriptions as a set. They must not be identical paraphrases with only the dimension name changed, and they must not start with fixed labels such as `When:`、`What:`、`Impact:`、“过程：”或“产物：”. Openers such as “经检查”“根据轨迹”“综合来看” also expose a writing formula instead of getting to the engineering fact. Do not use arrows or bracketed placeholders.
+Before storing a turn, read the five descriptions as a set. They must not be identical paraphrases with only the dimension name changed, and they must not start with fixed labels such as `When:`、`What:`、`Impact:`、“过程：”或“产物：”. Openers such as “经检查”“根据轨迹”“综合来看”“本次任务中”“总体而言”“综上所述” expose a writing formula instead of getting to the engineering fact. Do not use arrows or bracketed placeholders. Except for necessary file names, commands, identifiers and exact technical terms, the prose must be Chinese rather than translated English or mixed-language boilerplate.
 
 ## Calibration examples
 

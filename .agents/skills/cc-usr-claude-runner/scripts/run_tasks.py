@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""List and launch QC-passed SQLite-backed questions in Claude Code through iTerm2."""
+"""List and launch QC-passed SQLite-backed questions in Claude Code cross-platform."""
 
 from __future__ import annotations
 
@@ -26,8 +26,13 @@ def find_claude() -> str | None:
     discovered = shutil.which("claude")
     if discovered:
         return discovered
-    local_install = Path.home() / ".local/bin/claude"
-    return str(local_install) if local_install.is_file() else None
+    candidates = [
+        Path.home() / ".local/bin/claude",
+        Path.home() / ".local/bin/claude.exe",
+        Path.home() / ".local/bin/claude.cmd",
+        Path.home() / "AppData/Roaming/npm/claude.cmd",
+    ]
+    return next((str(path) for path in candidates if path.is_file()), None)
 
 
 def claude_version(claude: str) -> str:
@@ -87,6 +92,56 @@ end run
 
 def iterm_available() -> bool:
     return Path("/Applications/iTerm.app").is_dir() and bool(shutil.which("osascript"))
+
+
+def powershell_executable() -> str | None:
+    return shutil.which("pwsh") or shutil.which("powershell")
+
+
+def powershell_quote(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def write_windows_launcher(
+    launcher: Path,
+    launch_helper: Path,
+    env_file: Path,
+    database: Path,
+    question_id: int,
+    claude: str,
+) -> None:
+    lines = [
+        "$ErrorActionPreference = 'Stop'",
+        (
+            f"& {powershell_quote(sys.executable)} {powershell_quote(str(launch_helper))} "
+            f"--env-file {powershell_quote(str(env_file))} "
+            f"--db {powershell_quote(str(database))} "
+            f"--question-id {question_id} --claude {powershell_quote(claude)}"
+        ),
+        "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+    ]
+    # Windows PowerShell 5.1 needs a BOM to decode non-ASCII paths as UTF-8.
+    launcher.write_text("\n".join(lines) + "\n", encoding="utf-8-sig")
+
+
+def open_windows(launcher: Path) -> subprocess.Popen[str]:
+    shell = powershell_executable()
+    if not shell:
+        raise RuntimeError("PowerShell is not available")
+    creation_flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+    return subprocess.Popen(
+        [
+            shell,
+            "-NoLogo",
+            "-NoExit",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(launcher),
+        ],
+        creationflags=creation_flags,
+        cwd=str(launcher.parent),
+    )
 
 
 def main() -> int:
@@ -152,15 +207,24 @@ def main() -> int:
         )
 
     if not args.launch:
-        print("Preview only. Add --launch to open iTerm2 sessions.")
+        terminals = {"Darwin": "iTerm2", "Windows": "PowerShell"}
+        target_terminal = terminals.get(platform.system(), "a supported terminal")
+        print(f"Preview only. Add --launch to open {target_terminal} sessions.")
         connection.close()
         return 0
-    if platform.system() != "Darwin":
-        print("Automatic launch currently supports macOS only.", file=sys.stderr)
-        connection.close()
-        return 1
-    if not iterm_available():
-        print("iTerm2 or osascript is not available.", file=sys.stderr)
+    system = platform.system()
+    if system == "Darwin":
+        if not iterm_available():
+            print("iTerm2 or osascript is not available.", file=sys.stderr)
+            connection.close()
+            return 1
+    elif system == "Windows":
+        if not powershell_executable():
+            print("PowerShell is not available.", file=sys.stderr)
+            connection.close()
+            return 1
+    else:
+        print("Automatic launch currently supports macOS and Windows.", file=sys.stderr)
         connection.close()
         return 1
 
@@ -172,29 +236,45 @@ def main() -> int:
     for row, _folder in prepared:
         run_dir = launch_root / row["task_id"]
         run_dir.mkdir()
-        launcher = run_dir / "launch.command"
-        command = [
-            sys.executable, str(launch_helper),
-            "--env-file", str(env_file),
-            "--db", str(args.db.resolve()),
-            "--question-id", str(row["id"]),
-            "--claude", claude,
-        ]
-        launcher.write_text(
-            "#!/bin/zsh\nset -eu\n"
-            f"echo {shlex.quote('Task: ' + row['task_id'])}\n"
-            f"exec {shlex.join(command)}\n",
-            encoding="utf-8",
-        )
-        launcher.chmod(0o700)
-        result = open_iterm(launcher)
-        if result.returncode:
-            print(
-                f"Failed to open iTerm2 for {row['task_id']}: {result.stdout.strip()}",
-                file=sys.stderr,
+        if system == "Darwin":
+            launcher = run_dir / "launch.command"
+            command = [
+                sys.executable, str(launch_helper),
+                "--env-file", str(env_file),
+                "--db", str(args.db.resolve()),
+                "--question-id", str(row["id"]),
+                "--claude", claude,
+            ]
+            launcher.write_text(
+                "#!/bin/zsh\nset -eu\n"
+                f"echo {shlex.quote('Task: ' + row['task_id'])}\n"
+                f"exec {shlex.join(command)}\n",
+                encoding="utf-8",
             )
-            connection.close()
-            return 1
+            launcher.chmod(0o700)
+            result = open_iterm(launcher)
+            if result.returncode:
+                print(
+                    f"Failed to open iTerm2 for {row['task_id']}: {result.stdout.strip()}",
+                    file=sys.stderr,
+                )
+                connection.close()
+                return 1
+        else:
+            launcher = run_dir / "launch.ps1"
+            write_windows_launcher(
+                launcher, launch_helper, env_file, args.db.resolve(),
+                int(row["id"]), claude,
+            )
+            try:
+                open_windows(launcher)
+            except (OSError, RuntimeError) as exc:
+                print(
+                    f"Failed to open PowerShell for {row['task_id']}: {exc}",
+                    file=sys.stderr,
+                )
+                connection.close()
+                return 1
         timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
         connection.execute(
             "INSERT INTO runs(question_id, batch_run_id, launched_at, codex_version, "

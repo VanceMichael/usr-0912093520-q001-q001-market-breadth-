@@ -7,6 +7,8 @@ A question passes this skill when all of these duplicate checks pass:
 - For questions using the same repository, similarity-tag Jaccard overlap is below 75%.
 - After business nouns are mentally removed, the prompt does not reuse another question's sentence skeleton or request sequence.
 - The state transitions, entities, constraints, and acceptance evidence do not describe substantially the same task in different words.
+- The prompt is one natural Chinese paragraph with a concrete professional context and observable business result; it does not use a canned opening, headings, checklist labels, a reusable requirement tail, or internal evaluation language.
+- Its sentence order and cadence are materially different from other prompts in the batch, rather than merely replacing nouns, technologies, and state names.
 
 Task type, 0-1 intent, difficulty, banned topics, repository validity, snapshots, acceptance coverage, and reproducibility are intentionally outside this skill. Authoring and mechanical checks remain separate gates. Passing duplicate QC makes the question ready to launch when mechanical QC and the stored prompt fingerprint are current.
 

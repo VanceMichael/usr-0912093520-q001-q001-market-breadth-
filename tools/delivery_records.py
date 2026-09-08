@@ -7,8 +7,15 @@ import json
 import re
 import sqlite3
 from collections import Counter, defaultdict
-from datetime import datetime, time, timedelta
-from zoneinfo import ZoneInfo
+from datetime import datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+
+try:
+    PROJECT_TIMEZONE = ZoneInfo("Asia/Shanghai")
+except ZoneInfoNotFoundError:
+    # Windows Python installations may not ship the IANA timezone database.
+    PROJECT_TIMEZONE = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
 
 TASK_TYPES = {
@@ -50,12 +57,15 @@ DESCRIPTION_META_PATTERNS = (
     re.compile(r"(?:由|作为|本)\s*(?:AI|Codex)\b", re.IGNORECASE),
     re.compile(r"Codex\s*(?:分析|生成|评分|撰写|认为)", re.IGNORECASE),
     re.compile(r"(?:自动生成|基于轨迹生成|根据轨迹生成|本评分由)"),
+    re.compile(r"(?:评分|打分|评测|质检|评价者|审核人员|生成过程)"),
+    re.compile(r"(?:轨迹|日志)(?:显示|表明|可见)"),
+    re.compile(r"(?:模型|智能体|助手)(?:的)?(?:表现|回答|输出|生成过程)"),
 )
 DESCRIPTION_TEMPLATE_PATTERNS = (
     re.compile(r"(?:^|[\s；;。])(?:When|What|Impact)\s*[:：]", re.IGNORECASE),
     re.compile(r"^\s*(?:过程|产物)\s*[:：]"),
     re.compile(r"^\s*对(?:过程|产物)不满意的原因\s*[:：]"),
-    re.compile(r"^\s*(?:经检查|通过检查|根据轨迹|从轨迹看|结合轨迹|综合来看|总体来看)[，,:：]?"),
+    re.compile(r"^\s*(?:经检查|通过检查|根据轨迹|从轨迹看|结合轨迹|综合来看|总体来看|本次任务中|本轮任务中|总体而言|综上所述|值得注意的是|需要指出的是)[，,:：]?"),
     re.compile(r"[→➡]"),
     re.compile(r"【(?:第几步|哪个环节|具体行为|什么后果|根因|正确做法|哪个文件|哪个功能)】"),
 )
@@ -112,10 +122,12 @@ def _parse_timestamp(
 
 def _description_style_errors(description: str) -> list[str]:
     errors: list[str] = []
+    if len(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]", description)) < 12:
+        errors.append("必须使用自然、完整的中文书面语")
     if any(pattern.search(description) for pattern in DESCRIPTION_META_PATTERNS):
-        errors.append("contains evaluator self-reference or generation-process wording")
+        errors.append("不得包含评价者自述、评分质检、模型表现或生成过程措辞")
     if any(pattern.search(description) for pattern in DESCRIPTION_TEMPLATE_PATTERNS):
-        errors.append("uses a prohibited fixed label, arrow, or placeholder template")
+        errors.append("不得使用固定标签、套话开头、箭头或占位模板")
     return errors
 
 
@@ -174,17 +186,20 @@ def validate_one(
         description = record.get(f"{prefix}_description")
         if not isinstance(description, str) or not description.strip():
             errors.append(f"{record_id}: {prefix}_description is required")
-        elif record.get("human_authored") is False:
+        else:
             for style_error in _description_style_errors(description):
                 errors.append(f"{record_id}: {prefix}_description {style_error}")
-    if record.get("human_authored") is False:
-        descriptions = [
-            re.sub(r"\s+", "", str(record.get(f"{prefix}_description", "")))
-            for prefix in SCORE_PREFIXES
-        ]
-        repeated = [text for text, count in Counter(descriptions).items() if text and count > 1]
-        if repeated:
-            errors.append(f"{record_id}: score descriptions must not repeat verbatim")
+    descriptions = [
+        re.sub(r"\s+", "", str(record.get(f"{prefix}_description", "")))
+        for prefix in SCORE_PREFIXES
+    ]
+    repeated = [text for text, count in Counter(descriptions).items() if text and count > 1]
+    if repeated:
+        errors.append(f"{record_id}: score descriptions must not repeat verbatim")
+    other_issues = record.get("other_issues")
+    if isinstance(other_issues, str) and other_issues.strip():
+        for style_error in _description_style_errors(other_issues):
+            errors.append(f"{record_id}: other_issues {style_error}")
     if not isinstance(record.get("human_authored"), bool):
         errors.append(f"{record_id}: human_authored must be boolean")
     if not isinstance(record.get("human_qc_approved"), bool):
@@ -223,14 +238,17 @@ def validate_one(
         record.get("submitted_at"), "submitted_at", record_id, errors
     )
     if completed and submitted:
-        local = ZoneInfo("Asia/Shanghai")
-        completed_local = completed.astimezone(local)
-        submitted_local = submitted.astimezone(local)
+        completed_local = completed.astimezone(PROJECT_TIMEZONE)
+        submitted_local = submitted.astimezone(PROJECT_TIMEZONE)
         if completed_local.time() < time(20, 0):
-            deadline = datetime.combine(completed_local.date(), time.max, local)
+            deadline = datetime.combine(
+                completed_local.date(), time.max, PROJECT_TIMEZONE
+            )
         else:
             deadline = datetime.combine(
-                completed_local.date() + timedelta(days=1), time(14, 0), local
+                completed_local.date() + timedelta(days=1),
+                time(14, 0),
+                PROJECT_TIMEZONE,
             )
         if submitted_local > deadline:
             errors.append(

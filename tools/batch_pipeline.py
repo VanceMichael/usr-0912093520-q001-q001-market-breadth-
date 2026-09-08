@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import difflib
 import hashlib
 import json
@@ -16,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 8
 TASK_TYPES = {
     "0-1 代码生成", "Feature 迭代", "Bug 修复", "代码理解",
     "代码重构", "工程化", "代码测试",
@@ -44,6 +45,29 @@ BANNED_TERMS = {
     "记账", "健康健身", "菜谱", "天气", "番茄钟", "习惯打卡", "音乐播放器",
     "旅行日记", "观影记录",
 }
+DOCUMENT_SUFFIXES = {".md", ".rst"}
+DOCUMENT_TEXT_NAMES = {"readme", "readme.txt"}
+SNAPSHOT_META_PATTERNS = (
+    ("评测或标注语境", re.compile(r"评测|测评|标注任务|满意度数据|目标模型|答题模型|出题|质检")),
+    ("工具或模型名称", re.compile(r"\b(?:coding agent|claude|codex|user prompt)\b", re.IGNORECASE)),
+    ("英文评测术语", re.compile(r"\b(?:benchmark|evaluation)\b", re.IGNORECASE)),
+    ("脚手架或答题说明", re.compile(
+        r"起始工作区|初始脚手架|任务执行者|本题|题目要求|"
+        r"starting workspace|starter (?:workspace|repository)|task owner|"
+        r"implementation is intentionally left",
+        re.IGNORECASE,
+    )),
+)
+SNAPSHOT_META_FILENAME_RE = re.compile(
+    r"(?:^|[/\\])(?:prompt|evaluation|benchmark|rubric|题目说明|评测说明|质检报告)(?:[._-]|$)",
+    re.IGNORECASE,
+)
+PROMPT_LABEL_RE = re.compile(
+    r"(?:^|[；;。])\s*(?:背景|目标|功能|技术|要求|验收|注意事项)\s*[:：]"
+)
+PROMPT_CANNED_OPENING_RE = re.compile(
+    r"^\s*(?:请(?:你)?\s*)?从零(?:开始)?(?:构建|实现|开发|搭建|创建)一套"
+)
 
 
 SCHEMA = """
@@ -113,6 +137,9 @@ CREATE TABLE IF NOT EXISTS runs (
     harness TEXT NOT NULL DEFAULT 'Claude Code',
     harness_version TEXT NOT NULL DEFAULT '',
     session_id TEXT NOT NULL DEFAULT '',
+    container_cwd TEXT NOT NULL DEFAULT '',
+    trajectory_root TEXT NOT NULL DEFAULT '',
+    operating_system TEXT NOT NULL DEFAULT '',
     UNIQUE (question_id, batch_run_id)
 );
 
@@ -163,6 +190,61 @@ CREATE TABLE IF NOT EXISTS records (
 
 CREATE INDEX IF NOT EXISTS idx_questions_batch ON questions(batch_id, question_no);
 CREATE INDEX IF NOT EXISTS idx_records_question ON records(question_id, turn_no);
+
+CREATE TABLE IF NOT EXISTS author_jobs (
+    id INTEGER PRIMARY KEY,
+    batch_name TEXT NOT NULL,
+    question_count INTEGER NOT NULL CHECK (question_count > 0),
+    business TEXT NOT NULL DEFAULT '',
+    technology TEXT NOT NULL DEFAULT '',
+    notes TEXT NOT NULL DEFAULT '',
+    prompt TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued',
+    output TEXT NOT NULL DEFAULT '',
+    last_message TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT '',
+    pid INTEGER,
+    created_at TEXT NOT NULL,
+    started_at TEXT NOT NULL DEFAULT '',
+    finished_at TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_author_jobs_created ON author_jobs(created_at DESC, id DESC);
+
+CREATE TABLE IF NOT EXISTS pipeline_jobs (
+    id INTEGER PRIMARY KEY,
+    batch_name TEXT NOT NULL,
+    question_count INTEGER NOT NULL CHECK (question_count > 0),
+    qc_concurrency INTEGER NOT NULL DEFAULT 2,
+    model_concurrency INTEGER NOT NULL DEFAULT 2,
+    codex_concurrency INTEGER NOT NULL DEFAULT 2,
+    docker_image TEXT NOT NULL,
+    docker_command TEXT NOT NULL DEFAULT 'claude',
+    status TEXT NOT NULL DEFAULT 'queued',
+    output TEXT NOT NULL DEFAULT '',
+    last_message TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT '',
+    pid INTEGER,
+    created_at TEXT NOT NULL,
+    started_at TEXT NOT NULL DEFAULT '',
+    finished_at TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS pipeline_items (
+    id INTEGER PRIMARY KEY,
+    pipeline_job_id INTEGER NOT NULL REFERENCES pipeline_jobs(id) ON DELETE CASCADE,
+    question_id INTEGER NOT NULL REFERENCES questions(id) ON DELETE RESTRICT,
+    question_no INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued',
+    output TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT '',
+    started_at TEXT NOT NULL DEFAULT '',
+    finished_at TEXT NOT NULL DEFAULT '',
+    UNIQUE (pipeline_job_id, question_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pipeline_jobs_created ON pipeline_jobs(created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_pipeline_items_job ON pipeline_items(pipeline_job_id, question_no);
 """
 
 
@@ -221,6 +303,23 @@ def connect(database: Path) -> sqlite3.Connection:
         connection.execute(
             "UPDATE runs SET harness_version=codex_version WHERE harness_version=''"
         )
+    if "container_cwd" not in run_columns:
+        connection.execute(
+            "ALTER TABLE runs ADD COLUMN container_cwd TEXT NOT NULL DEFAULT ''"
+        )
+    if "trajectory_root" not in run_columns:
+        connection.execute(
+            "ALTER TABLE runs ADD COLUMN trajectory_root TEXT NOT NULL DEFAULT ''"
+        )
+    if "operating_system" not in run_columns:
+        connection.execute(
+            "ALTER TABLE runs ADD COLUMN operating_system TEXT NOT NULL DEFAULT ''"
+        )
+    pipeline_job_columns = {
+        row["name"] for row in connection.execute("PRAGMA table_info(pipeline_jobs)")
+    }
+    if "pid" not in pipeline_job_columns:
+        connection.execute("ALTER TABLE pipeline_jobs ADD COLUMN pid INTEGER")
     connection.execute(
         "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -236,6 +335,97 @@ def prompt_hash(prompt: str) -> str:
 
 def normalize(text: str) -> str:
     return " ".join(text.lower().split())
+
+
+def chinese_character_count(text: str) -> int:
+    return len(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]", text))
+
+
+def prompt_style_issues(prompt: str) -> list[str]:
+    """Return objective style failures; semantic naturalness remains a QC judgment."""
+    issues: list[str] = []
+    stripped = prompt.strip()
+    if chinese_character_count(stripped) < 20:
+        issues.append("User Prompt 必须以中文书面语为主")
+    if PROMPT_CANNED_OPENING_RE.search(stripped):
+        issues.append("User Prompt 使用了“从零构建一套”式固定开头")
+    if re.match(r"^(?:#{1,6}\s|[-*+]\s|\d+[.、)]\s*)", stripped):
+        issues.append("User Prompt 不能使用标题或清单格式")
+    if len(PROMPT_LABEL_RE.findall(stripped)) >= 2:
+        issues.append("User Prompt 不能把背景、功能、技术、验收等标签串成模板")
+    if re.search(r"评测模型|测试模型能力|用于评测|用于测评|标注数据", stripped):
+        issues.append("User Prompt 不能暴露评测或标注用途")
+    return issues
+
+
+def tracked_workspace_files(folder: Path) -> list[Path]:
+    result = subprocess.run(
+        ["git", "-C", str(folder), "ls-files", "-z"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+    )
+    if result.returncode:
+        return []
+    return [folder / raw.decode("utf-8", errors="surrogateescape") for raw in result.stdout.split(b"\0") if raw]
+
+
+def snapshot_content_issues(folder: Path) -> list[str]:
+    """Check tracked project documents for language and evaluation leakage."""
+    issues: list[str] = []
+    for path in tracked_workspace_files(folder):
+        relative = path.relative_to(folder).as_posix()
+        if SNAPSHOT_META_FILENAME_RE.search(relative):
+            issues.append(f"快照包含与项目无关的内部文件：{relative}")
+        is_document = (
+            path.suffix.lower() in DOCUMENT_SUFFIXES
+            or path.name.casefold() in DOCUMENT_TEXT_NAMES
+            or (path.suffix.lower() == ".txt" and "docs" in {part.casefold() for part in path.parts})
+        )
+        if not path.is_file():
+            continue
+        try:
+            content = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            issues.append(f"项目文档不是有效的 UTF-8 文本：{relative}")
+            continue
+        if path.suffix.lower() == ".py":
+            try:
+                tree = ast.parse(content, filename=str(path))
+            except SyntaxError:
+                tree = None
+            if tree is not None:
+                docstrings: list[str] = []
+                module_doc = ast.get_docstring(tree, clean=False)
+                if module_doc:
+                    docstrings.append(module_doc)
+                for node in ast.walk(tree):
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                        doc = ast.get_docstring(node, clean=False)
+                        if doc:
+                            docstrings.append(doc)
+                for docstring in docstrings:
+                    if chinese_character_count(docstring) < 4 and len(re.findall(r"\b[A-Za-z]{2,}\b", docstring)) >= 3:
+                        issues.append(f"Python 文档字符串应使用中文书面语：{relative}")
+                    for label, pattern in SNAPSHOT_META_PATTERNS:
+                        match = pattern.search(docstring)
+                        if match:
+                            issues.append(f"Python 文档字符串包含{label}：{relative}（{match.group(0)}）")
+        if not is_document:
+            for label, pattern in SNAPSHOT_META_PATTERNS:
+                match = pattern.search(content)
+                if match:
+                    issues.append(f"项目源码包含{label}：{relative}（{match.group(0)}）")
+            continue
+        prose = re.sub(r"```.*?```", "", content, flags=re.DOTALL)
+        prose = re.sub(r"`[^`]+`|https?://\S+", "", prose)
+        chinese_count = chinese_character_count(prose)
+        latin_words = len(re.findall(r"\b[A-Za-z]{2,}\b", prose))
+        if chinese_count < 8 or chinese_count < latin_words // 2:
+            issues.append(f"项目文档应以中文书面语为主：{relative}")
+        for label, pattern in SNAPSHOT_META_PATTERNS:
+            match = pattern.search(content)
+            if match:
+                issues.append(f"项目文档包含{label}：{relative}（{match.group(0)}）")
+    return list(dict.fromkeys(issues))
 
 
 def trigrams(text: str) -> set[str]:
@@ -326,9 +516,9 @@ __pycache__/
     subprocess.run(["git", "-C", str(folder), "add", ".gitignore"], check=True)
     result = subprocess.run(
         [
-            "git", "-C", str(folder), "-c", "user.name=CC Dataset",
-            "-c", "user.email=cc-dataset@local.invalid", "commit", "-q",
-            "-m", "Initial workspace snapshot",
+            "git", "-C", str(folder), "-c", "user.name=项目维护者",
+            "-c", "user.email=project-maintainer@local.invalid", "commit", "-q",
+            "-m", "初始化项目",
         ],
         text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
     )
@@ -386,7 +576,7 @@ def render_batch(connection: sqlite3.Connection, batch: str) -> Path:
             f"- 语言/框架：{row['languages']}",
             f"- 机械质检：{row['mechanical_qc']}",
             f"- 出题质检：{row['qc_decision']}",
-            f"- 启动状态：{'READY' if ready else 'BLOCKED'}", "", "### User Prompt", "", row["prompt"], "", "---", "",
+            f"- 启动状态：{'可运行' if ready else '已阻塞'}", "", "### 用户需求", "", row["prompt"], "", "---", "",
         ])
     path = Path(batch_data["markdown_path"])
     path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
@@ -498,6 +688,7 @@ def check_question(connection: sqlite3.Connection, row: sqlite3.Row) -> dict:
     combined = normalize(row["title"] + "\n" + prompt)
     if "\n" in prompt or "\r" in prompt:
         errors.append("首轮 User Prompt 必须是一个自然语言段落")
+    errors.extend(prompt_style_issues(prompt))
     if row["difficulty"] == "简单":
         errors.append("首轮题目不能是简单")
     banned = sorted(term for term in BANNED_TERMS if term in combined)
@@ -513,6 +704,8 @@ def check_question(connection: sqlite3.Connection, row: sqlite3.Row) -> dict:
         text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
     ).stdout.strip():
         errors.append("题目工作目录不是干净快照")
+    elif folder.is_dir() and (folder / ".git").is_dir():
+        errors.extend(snapshot_content_issues(folder))
     if not SNAPSHOT_RE.fullmatch(row["initial_snapshot"]):
         errors.append("缺少可访问的 GitHub 40 位初始快照链接")
     elif folder.is_dir() and (folder / ".git").is_dir():

@@ -1,11 +1,13 @@
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from tools.batch_pipeline import connect, create_batch, prompt_hash, set_repository
-from webapp.server import ConsoleData
+from webapp.server import ConsoleData, open_local_path, runtime_info, secure_file
 
 
 def question_spec(batch: str) -> dict:
@@ -121,7 +123,8 @@ class WebConsoleTests(unittest.TestCase):
             self.assertIn('CC_SWITCH_BASE_URL="https://relay.example.com/v1"', content)
             self.assertIn('CC_SWITCH_API_KEY="new-secret"', content)
             self.assertNotIn("old-secret", content)
-            self.assertEqual(env_file.stat().st_mode & 0o777, 0o600)
+            if os.name != "nt":
+                self.assertEqual(env_file.stat().st_mode & 0o777, 0o600)
 
     def test_env_config_keeps_existing_key_when_blank(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -136,6 +139,143 @@ class WebConsoleTests(unittest.TestCase):
             data = ConsoleData(self.make_database(root), root)
             data.update_env({"base_url": "https://relay.example.com/v2", "model": "claude-v2", "api_key": "", "submitter": "提交人"})
             self.assertIn('CC_SWITCH_API_KEY="keep-secret"', (root / ".env").read_text(encoding="utf-8"))
+
+    def test_empty_dashboard_includes_zero_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "production.sqlite3"
+            connection = connect(database)
+            connection.close()
+            dashboard = ConsoleData(database, root).dashboard()
+            self.assertEqual(
+                dashboard["summary"],
+                {"total": 0, "delivered": 0, "qc_passed": 0, "waiting": 0},
+            )
+
+    def test_runtime_info_reports_supported_terminal(self):
+        info = runtime_info()
+        self.assertIn(info["platform"], {"macOS", "Windows", "Linux"})
+        self.assertTrue(info["terminal"])
+
+    def test_codex_author_job_persists_output_and_command(self):
+        class Process:
+            pid = 4321
+            stdout = iter([
+                '{"type":"thread.started"}\n',
+                '{"type":"item.completed","item":{"type":"agent_message","text":"finished"}}\n',
+            ])
+
+            def wait(self):
+                return 0
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "production.sqlite3"
+            connection = connect(database)
+            connection.close()
+            data = ConsoleData(database, root)
+            try:
+                with mock.patch("webapp.server.shutil.which", return_value="codex"), mock.patch(
+                    "webapp.server.subprocess.Popen", return_value=Process()
+                ) as popen:
+                    result = data.create_author_job({
+                        "batch": "codex1", "count": 2, "business": "城市服务",
+                        "technology": "Python", "notes": "持久化",
+                    })
+                    self.assertEqual(result["job_id"], 1)
+                    data.author_executor.shutdown(wait=True)
+                    job = data.author_jobs()[0]
+                command = popen.call_args.args[0]
+                self.assertEqual(command[1:3], ["exec", "--json"])
+                self.assertEqual(job["status"], "completed")
+                self.assertIn("finished", job["output"])
+            finally:
+                data.author_executor.shutdown(wait=True)
+
+    def test_codex_author_job_records_failure(self):
+        class Process:
+            pid = 4322
+            stdout = iter(["plain output\n"])
+
+            def wait(self):
+                return 7
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "production.sqlite3"
+            connection = connect(database)
+            connection.close()
+            data = ConsoleData(database, root)
+            try:
+                with mock.patch("webapp.server.shutil.which", return_value="codex"), mock.patch(
+                    "webapp.server.subprocess.Popen", return_value=Process()
+                ):
+                    data.create_author_job({"batch": "codex2", "count": 1, "business": "本地服务"})
+                    data.author_executor.shutdown(wait=True)
+                job = data.author_jobs()[0]
+                self.assertEqual(job["status"], "failed")
+                self.assertIn("退出码：7", job["error"])
+            finally:
+                data.author_executor.shutdown(wait=True)
+
+    def test_auto_pipeline_job_persists_items_and_defaults(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = self.make_database(root)
+            (root / ".env").write_text(
+                "CC_SWITCH_BASE_URL=https://relay.example.com\n"
+                "CC_SWITCH_MODEL=claude-test\n"
+                "CC_SWITCH_API_KEY=test-secret\n"
+                "CC_USR_SUBMITTER=测试提交人\n",
+                encoding="utf-8",
+            )
+            data = ConsoleData(database, root)
+            try:
+                with mock.patch.object(data, "_run_pipeline_process") as runner:
+                    result = data.create_pipeline_job({"batch": "0911"})
+                    self.assertEqual(result["job_id"], 1)
+                    runner.assert_called_once()
+                jobs = data.pipeline_jobs()
+                self.assertEqual(jobs[0]["status"], "queued")
+                self.assertEqual(jobs[0]["model_concurrency"], 2)
+                self.assertEqual(len(jobs[0]["items"]), 1)
+            finally:
+                data.author_executor.shutdown(wait=True)
+                data.pipeline_executor.shutdown(wait=True)
+
+    def test_windows_open_uses_startfile(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory)
+            with mock.patch("webapp.server.sys.platform", "win32"), mock.patch(
+                "webapp.server.os.startfile", create=True
+            ) as startfile:
+                open_local_path(target, target)
+            startfile.assert_called_once_with(str(target))
+
+    def test_macos_open_still_uses_open_command(self):
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory)
+            with mock.patch("webapp.server.sys.platform", "darwin"), mock.patch(
+                "webapp.server.subprocess.Popen"
+            ) as popen:
+                open_local_path(target, target)
+            popen.assert_called_once_with(["open", str(target)], cwd=target)
+
+    def test_windows_secure_file_restricts_acl_to_current_user(self):
+        identity = mock.Mock(returncode=0, stdout="machine\\operator\n")
+        acl = mock.Mock(returncode=0, stdout="processed")
+        with mock.patch("webapp.server.os.name", "nt"), mock.patch(
+            "webapp.server.subprocess.run", side_effect=[identity, acl]
+        ) as run_mock:
+            secure_file(Path("C:/workspace/.env.tmp"))
+        self.assertEqual(run_mock.call_count, 2)
+        self.assertEqual(
+            run_mock.call_args_list[1].args[0],
+            [
+                "icacls", "C:\\workspace\\.env.tmp", "/inheritance:r",
+                "/grant:r", "machine\\operator:F",
+            ],
+        )
 
 
 if __name__ == "__main__":

@@ -6,7 +6,7 @@ A question becomes `READY` as soon as mechanical QC and duplicate QC pass with a
 
 Put the relay URL, model name, and key in root `.env`; `.env.example` is the field reference. The CC Switch app is not required. HTTPS is required except for localhost. URLs containing credentials, query strings, or fragments are rejected.
 
-Preview shows the exact working directory while hiding all three configuration values and the prompt. Launch creates `<批次>/.runs/<时间>/<任务ID>/launch.command`, opens one iTerm2 window per question, and registers the run in SQLite. The generated launcher contains only database/question references and paths, never the URL, model, key, or prompt.
+Preview shows the exact working directory while hiding all three configuration values and the prompt. On macOS, launch creates `<批次>/.runs/<时间>/<任务ID>/launch.command` and opens one iTerm2 window per question. On Windows, it creates `launch.ps1` and opens one PowerShell console per question. Both paths register the run in SQLite. Generated launchers contain only database/question references and paths, never the URL, model, key, or prompt.
 
 Each helper re-reads `.env`, maps the three values to Claude Code environment variables, changes into the question folder, and invokes `claude --dangerously-skip-permissions <SQLite 原始 prompt>`. The flag intentionally disables Claude Code's per-command approval prompts for this isolated local run. The runner never prints the key or reads the trajectory.
 

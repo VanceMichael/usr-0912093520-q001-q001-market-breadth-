@@ -59,9 +59,11 @@ def read_events(path: Path) -> list[dict]:
     return events
 
 
-def same_folder(raw: object, folder: Path) -> bool:
+def same_folder(raw: object, folder: Path, alternate: str = "") -> bool:
     if not isinstance(raw, str) or not raw:
         return False
+    if alternate and raw.rstrip("/") == alternate.rstrip("/"):
+        return True
     try:
         return Path(raw).resolve() == folder.resolve()
     except OSError:
@@ -77,7 +79,8 @@ def prompt_id(event: dict) -> tuple[str, str]:
 
 
 def locate(
-    claude_root: Path, folder: Path, prompt: str, launched_at: datetime
+    claude_root: Path, folder: Path, prompt: str, launched_at: datetime,
+    alternate_folder: str = "",
 ) -> dict:
     candidates: list[tuple[float, Path, list[dict], int]] = []
     earliest = launched_at - timedelta(minutes=5)
@@ -92,7 +95,7 @@ def locate(
             timestamp = parse_time(str(event.get("timestamp", "")))
             if (
                 user_text(event).strip() == prompt.strip()
-                and same_folder(event.get("cwd"), folder)
+                and same_folder(event.get("cwd"), folder, alternate_folder)
                 and timestamp is not None
                 and timestamp >= earliest
             ):
@@ -158,7 +161,7 @@ def main() -> int:
             raise ValueError("registered launch timestamp is invalid")
         result = locate(
             args.claude_root.resolve(), Path(question["folder_path"]),
-            question["prompt"], launched_at,
+            question["prompt"], launched_at, str(run["container_cwd"] or ""),
         )
     except (OSError, ValueError, sqlite3.Error) as exc:
         print(f"Claude session lookup failed: {exc}", file=sys.stderr)

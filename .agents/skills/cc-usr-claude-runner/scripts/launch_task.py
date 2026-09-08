@@ -8,6 +8,7 @@ import os
 import re
 import shlex
 import sqlite3
+import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -113,6 +114,12 @@ def build_claude_environment(config: ClaudeConfig) -> dict[str, str]:
     return environment
 
 
+def run_claude_on_windows(command: list[str], environment: dict[str, str]) -> int:
+    """Run Windows command shims while preserving the exact Claude argv."""
+    completed = subprocess.run(command, env=environment, check=False)
+    return completed.returncode
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--env-file", type=Path, required=True)
@@ -148,7 +155,10 @@ def main() -> int:
 
     os.chdir(folder)
     command = build_claude_command(args.claude, prompt)
-    os.execvpe(args.claude, command, build_claude_environment(config))
+    environment = build_claude_environment(config)
+    if sys.platform == "win32" and Path(args.claude).suffix.lower() in {".cmd", ".bat"}:
+        return run_claude_on_windows(command, environment)
+    os.execvpe(args.claude, command, environment)
     return 1
 
 
