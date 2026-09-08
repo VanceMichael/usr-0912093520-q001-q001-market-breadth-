@@ -1,0 +1,23 @@
+[Unit]
+Description=CC USR autonomous news production pipeline
+Wants=network-online.target
+After=network-online.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/UserSatisfactionRating-codex
+Environment=HOME=/home/ubuntu
+Environment=PATH=/home/ubuntu/.local/bin:/home/ubuntu/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /home/ubuntu/UserSatisfactionRating-codex/tools/pipeline_daemon.py --loop --concurrency 2 --worker-image ccusr-claude-worker:local --worker-timeout 3600 --agent-timeout 3600 --poll-seconds 60
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=45
+KillMode=control-group
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
