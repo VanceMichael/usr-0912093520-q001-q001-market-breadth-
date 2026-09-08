@@ -11,6 +11,7 @@ import argparse
 import fcntl
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -42,6 +43,13 @@ def codex_command(codex: str, prompt: str) -> list[str]:
     return [codex, "exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check", "-C", str(PROJECT_ROOT), prompt]
 
 
+def resolve_codex(codex: str) -> str:
+    """Resolve Codex in both interactive and systemd/non-login environments."""
+    if os.path.isabs(codex):
+        return codex
+    return shutil.which(codex) or str(Path.home() / ".local" / "bin" / codex)
+
+
 def claim_topic(database: Path) -> dict | None:
     with connect(database.resolve()) as connection:
         row = connection.execute(
@@ -63,6 +71,11 @@ def release_topic(database: Path, topic_id: int, status: str, batch: str = "") -
 def count_ready(database: Path) -> int:
     with connect(database.resolve()) as connection:
         return int(connection.execute("SELECT COUNT(*) FROM questions WHERE status='approved' AND mechanical_qc='pass' AND qc_decision='pass' AND qc_prompt_sha256=prompt_sha256").fetchone()[0])
+
+
+def has_new_topics(database: Path) -> bool:
+    with connect(database.resolve()) as connection:
+        return connection.execute("SELECT 1 FROM news_topics WHERE status='new' LIMIT 1").fetchone() is not None
 
 
 def create_batch(database: Path, codex: str, topic: dict, batch: str, log: Path, timeout: int) -> int:
@@ -99,7 +112,7 @@ def cycle(args: argparse.Namespace) -> int:
     database = args.db.resolve()
     added, errors = ingest(database, args.feeds, args.feed_timeout)
     print(f"news: added={added} feed_errors={len(errors)}")
-    if errors and not added:
+    if errors and not added and not has_new_topics(database):
         return 1
     if count_ready(database) < args.ready_watermark:
         topic = claim_topic(database)
@@ -145,6 +158,7 @@ def main() -> int:
     parser.add_argument("--loop", action="store_true")
     parser.add_argument("--poll-seconds", type=int, default=60)
     args = parser.parse_args()
+    args.codex = resolve_codex(args.codex)
     args.feeds = [value.strip() for value in args.feeds.split(",") if value.strip()]
     lock_path = args.log_dir / "daemon.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)

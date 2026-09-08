@@ -37,7 +37,9 @@ def now() -> str:
 
 def clean(value: str) -> str:
     text = html.unescape(re.sub(r"<[^>]+>", " ", value or ""))
-    return re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\s+", " ", text).strip()
+    # Some China News list pages prefix headlines with a navigation marker.
+    return re.sub(r"^(?:[-\u2013\u2014]\s*)+", "", text).strip()
 
 
 def child_text(node: ET.Element, names: tuple[str, ...]) -> str:
@@ -156,7 +158,6 @@ def ingest(database: Path, feeds: list[str], timeout: int = 20) -> tuple[int, li
     errors: list[str] = []
     with connect(database.resolve()) as connection:
         for source_url in feeds:
-            before_count = added
             try:
                 items = fetch(source_url, timeout)
             except Exception as exc:  # noqa: BLE001 - one bad feed must not stop the cycle
@@ -169,7 +170,11 @@ def ingest(database: Path, feeds: list[str], timeout: int = 20) -> tuple[int, li
                     (item["source_url"], item["article_url"], item["title"], item["summary"], item["published_at"], topic_hash(item), timestamp, timestamp),
                 )
                 added += int(result.rowcount == 1)
-            if added == before_count:
+            # A feed that was successfully parsed but only contained topics
+            # already present in SQLite is healthy; do not report it as an
+            # outage on subsequent daemon cycles.  Warn only when parsing
+            # yielded no article-like entries at all.
+            if not items:
                 errors.append(f"{source_url}: no article-like topics found")
         connection.commit()
     return added, errors

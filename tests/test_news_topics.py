@@ -38,6 +38,21 @@ class NewsTopicTest(unittest.TestCase):
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["article_url"], "https://channel.example/world/202609/08-article.shtml")
 
+    def test_existing_topics_do_not_turn_a_healthy_feed_into_an_error(self):
+        items = [{
+            "source_url": "https://example.test/rss",
+            "article_url": "https://example.test/a",
+            "title": "A meaningful article title",
+            "summary": "",
+            "published_at": "",
+        }]
+        with tempfile.TemporaryDirectory() as raw:
+            database = Path(raw) / "production.sqlite3"
+            import tools.news_topics as news_topics
+            news_topics.fetch = lambda *_args, **_kwargs: items
+            self.assertEqual(ingest(database, ["https://example.test/rss"]), (1, []))
+            self.assertEqual(ingest(database, ["https://example.test/rss"]), (0, []))
+
 
 if __name__ == "__main__":
     unittest.main()
