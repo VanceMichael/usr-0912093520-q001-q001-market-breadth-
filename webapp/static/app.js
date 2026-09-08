@@ -402,8 +402,13 @@ function renderMotherLibrary() {
   select.innerHTML = '<option value="">请选择已通过基础检查的母项目</option>' + state.mothers.map((mother) =>
     `<option value="${mother.id}">${escapeHtml(mother.title)} · ${escapeHtml(mother.source_task_id)} · 已用 ${mother.use_count} 次</option>`
   ).join("");
-  if (state.mothers.some((mother) => String(mother.id) === selected)) select.value = selected;
+  select.value = state.mothers.some((mother) => String(mother.id) === selected)
+    ? selected
+    : (state.mothers[0] ? String(state.mothers[0].id) : "");
   const mother = state.mothers.find((item) => String(item.id) === select.value);
+  const taskType = $("#author-task-type");
+  if (mother && !mother.bugfix_ready && mother.iteration_ready) taskType.value = "Feature 迭代";
+  else if (mother && mother.bugfix_ready) taskType.value = "Bug 修复";
   $("#mother-summary").textContent = mother
     ? `代码路径：${mother.workspace_path}\nGit 地址：${mother.repo_url || "尚未登记"}\n初始快照：${mother.initial_snapshot || "尚未登记"}\n已派生使用：${mother.use_count} 次 · Bug 修复${mother.bugfix_ready ? "可用" : "不可用"} · Feature 迭代${mother.iteration_ready ? "可用" : "不可用"}`
     : "选择母库项目后显示代码路径、Git 地址、初始快照和使用次数。";
@@ -470,6 +475,7 @@ async function loadMothers() {
     const result = await api("/api/mother-library");
     state.mothers = result.mothers || [];
     renderMotherLibrary();
+    renderAuthorCommand();
   } catch (error) { toast(error.message, true); }
 }
 

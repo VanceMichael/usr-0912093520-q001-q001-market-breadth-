@@ -741,7 +741,19 @@ class ConsoleData:
         self.pipeline_executor.shutdown(wait=False, cancel_futures=True)
 
     def create_author_job(self, body: dict[str, object]) -> dict[str, object]:
-        batch, count, business, technology, notes, mode, task_type, mother_id, derived_notes, defect_tolerance = self._validate_author_fields(body)
+        normalized_body = dict(body)
+        if str(normalized_body.get("mode", "0-1")).strip() == "derived":
+            mothers = self.mother_library()
+            if not mothers:
+                raise ValueError("母库中没有符合项目规范的可用项目")
+            requested_mother = normalized_body.get("mother_id")
+            mother = next((item for item in mothers if str(item["id"]) == str(requested_mother)), mothers[0])
+            normalized_body["mother_id"] = int(mother["id"])
+            requested_type = str(normalized_body.get("task_type", "")).strip()
+            allowed_types = {"Bug 修复", "Feature 迭代", "代码理解", "代码重构", "工程化", "代码测试"}
+            if requested_type not in allowed_types:
+                normalized_body["task_type"] = "Bug 修复" if mother["bugfix_ready"] else "Feature 迭代"
+        batch, count, business, technology, notes, mode, task_type, mother_id, derived_notes, defect_tolerance = self._validate_author_fields(normalized_body)
         codex = shutil.which("codex")
         if not codex:
             raise RuntimeError("未找到 Codex CLI，请先安装并确保 codex 在 PATH 中")
@@ -1251,7 +1263,7 @@ class ConsoleData:
                 "SELECT m.*, COUNT(u.id) AS derived_count "
                 "FROM mother_library m LEFT JOIN mother_usages u ON u.mother_id=m.id "
                 "WHERE m.repo_url <> '' AND m.initial_snapshot <> '' AND m.local_initial_sha <> '' "
-                "GROUP BY m.id ORDER BY m.updated_at DESC, m.id DESC LIMIT ?",
+                "GROUP BY m.id ORDER BY CASE WHEN m.bugfix_ready=1 THEN 0 ELSE 1 END, m.use_count ASC, m.updated_at DESC, m.id DESC LIMIT ?",
                 (max(1, min(limit, 500)),),
             ).fetchall()
         return [dict(row) for row in rows]

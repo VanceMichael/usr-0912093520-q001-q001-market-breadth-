@@ -114,11 +114,11 @@
             <label class="settings-field"><span>批次名</span><input id="author-batch" name="batch" required minlength="2" maxlength="32" pattern="[A-Za-z0-9][A-Za-z0-9_-]{1,31}" placeholder="例如 0911"></label>
             <label class="settings-field"><span>题目数量</span><input id="author-count" name="count" type="number" required min="1" max="20" value="10"></label>
           </div>
-          <fieldset class="author-mode"><legend>出题模式</legend><label><input type="radio" name="author-mode" value="0-1" checked><span>0-1 新建母题</span></label><label><input type="radio" name="author-mode" value="derived"><span>基于母库生成其他题型</span></label></fieldset>
+          <fieldset class="author-mode"><legend>出题模式（系统按项目规范自动判断）</legend><label><input type="radio" name="author-mode" value="0-1" checked><span>0-1 新建母题</span></label><label><input type="radio" name="author-mode" value="derived"><span>基于母库生成其他题型</span></label></fieldset>
           <div id="derived-author-fields" hidden>
             <div class="author-keywords">
-              <label class="settings-field"><span>母库项目</span><select id="author-mother" name="mother_id"><option value="">请选择已通过基础检查的母项目</option></select></label>
-              <label class="settings-field"><span>派生题型</span><select id="author-task-type" name="task_type"><option>Bug 修复</option><option>Feature 迭代</option><option>代码理解</option><option>代码重构</option><option>工程化</option><option>代码测试</option></select></label>
+              <label class="settings-field"><span>自动选择的母库项目</span><select id="author-mother" name="mother_id" disabled><option value="">正在按规范选择母项目…</option></select></label>
+              <label class="settings-field"><span>自动选择的派生题型</span><select id="author-task-type" name="task_type" disabled><option>Bug 修复</option><option>Feature 迭代</option><option>代码理解</option><option>代码重构</option><option>工程化</option><option>代码测试</option></select></label>
             </div>
             <div class="mother-summary" id="mother-summary">选择母库项目后显示代码路径、Git 地址、初始快照和使用次数。</div>
             <div class="author-keywords">
