@@ -447,7 +447,7 @@ $("#qc-check").addEventListener("click", async () => {
 $("#workflow-button").addEventListener("click", () => copyText(workflowPrompt(), "当前阶段指令已复制"));
 $("#launch-button").addEventListener("click", () => {
   const numbers = selectedNumbers();
-  openModal("启动 Claude Code", `将为第 ${numbers.join("、")} 题分别打开新的 iTerm2 会话，最多同时启动 4 道题。`, "确认启动", async () => {
+  openModal("启动 Claude Code", `将为第 ${numbers.join("、")} 题启动模型；Mac 自动使用 iTerm2，服务器自动使用无终端后台模式，最多同时启动 4 道题。`, "确认启动", async () => {
     closeModal();
     await executeAction("/api/actions/launch", { batch: state.batch, numbers }, $("#launch-button"), "Claude Code 会话已启动");
   });

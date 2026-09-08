@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""List and launch QC-passed SQLite-backed questions in Claude Code through iTerm2."""
+"""List and launch QC-passed SQLite-backed questions in Claude Code."""
 
 from __future__ import annotations
 
@@ -89,6 +89,25 @@ def iterm_available() -> bool:
     return Path("/Applications/iTerm.app").is_dir() and bool(shutil.which("osascript"))
 
 
+def select_launch_mode(requested: str) -> str:
+    """Resolve auto mode from the host environment, with explicit overrides."""
+    if requested in {"iterm", "server"}:
+        return requested
+    return "iterm" if platform.system() == "Darwin" and iterm_available() else "server"
+
+
+def open_server(launcher: Path, folder: Path) -> subprocess.Popen[bytes]:
+    """Start an unattended Claude process detached from the launching terminal."""
+    return subprocess.Popen(
+        [str(launcher), "--headless"],
+        cwd=folder,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--db", type=Path, default=PROJECT_ROOT / "production.sqlite3")
@@ -98,6 +117,12 @@ def main() -> int:
     parser.add_argument("--launch", action="store_true")
     parser.add_argument("--max-open", type=int, default=4)
     parser.add_argument("--env-file", type=Path, default=PROJECT_ROOT / ".env")
+    parser.add_argument(
+        "--mode",
+        choices=("auto", "iterm", "server"),
+        default="auto",
+        help="use unattended mode by default; choose iterm only for a local interactive window",
+    )
     args = parser.parse_args()
 
     try:
@@ -143,24 +168,28 @@ def main() -> int:
         connection.close()
         return 1
 
+    mode = select_launch_mode(args.mode)
     print(f"Claude Code: {version}")
     print("配置: 已读取根目录 .env（URL、模型和 Key 不显示）")
+    preview_command = (
+        "claude --print --dangerously-skip-permissions "
+        "--permission-mode bypassPermissions --permission-prompts none "
+        "<SQLite 原始 prompt>"
+        if mode == "server"
+        else "claude --dangerously-skip-permissions <SQLite 原始 prompt>"
+    )
     for row, folder in prepared:
         print(
             f"PREVIEW {row['question_no']}: cd {shlex.quote(str(folder))} && "
-            "claude --dangerously-skip-permissions <SQLite 原始 prompt>"
+            + preview_command
         )
 
     if not args.launch:
-        print("Preview only. Add --launch to open iTerm2 sessions.")
+        print("Preview only. Add --launch to start Claude Code sessions.")
         connection.close()
         return 0
-    if platform.system() != "Darwin":
-        print("Automatic launch currently supports macOS only.", file=sys.stderr)
-        connection.close()
-        return 1
-    if not iterm_available():
-        print("iTerm2 or osascript is not available.", file=sys.stderr)
+    if args.mode == "iterm" and (platform.system() != "Darwin" or not iterm_available()):
+        print("iTerm2 mode requires macOS with iTerm2 and osascript.", file=sys.stderr)
         connection.close()
         return 1
 
@@ -181,20 +210,29 @@ def main() -> int:
             "--claude", claude,
         ]
         launcher.write_text(
-            "#!/bin/zsh\nset -eu\n"
+            "#!/usr/bin/env sh\nset -eu\n"
             f"echo {shlex.quote('Task: ' + row['task_id'])}\n"
-            f"exec {shlex.join(command)}\n",
+            f"exec {shlex.join(command)} \"$@\"\n",
             encoding="utf-8",
         )
         launcher.chmod(0o700)
-        result = open_iterm(launcher)
-        if result.returncode:
-            print(
-                f"Failed to open iTerm2 for {row['task_id']}: {result.stdout.strip()}",
-                file=sys.stderr,
-            )
-            connection.close()
-            return 1
+        if mode == "iterm":
+            result = open_iterm(launcher)
+            if result.returncode:
+                print(
+                    f"Failed to open iTerm2 for {row['task_id']}: {result.stdout.strip()}",
+                    file=sys.stderr,
+                )
+                connection.close()
+                return 1
+        else:
+            try:
+                process = open_server(launcher, Path(row["folder_path"]).resolve())
+                (run_dir / "process.pid").write_text(f"{process.pid}\n", encoding="ascii")
+            except OSError as exc:
+                print(f"Failed to start server process for {row['task_id']}: {exc}", file=sys.stderr)
+                connection.close()
+                return 1
         timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
         connection.execute(
             "INSERT INTO runs(question_id, batch_run_id, launched_at, codex_version, "
@@ -207,7 +245,7 @@ def main() -> int:
             (timestamp, row["id"]),
         )
         connection.commit()
-        print(f"LAUNCHED {row['task_id']}: {row['folder_path']}")
+        print(f"LAUNCHED {row['task_id']} ({mode}): {row['folder_path']}")
     connection.close()
     return 0
 

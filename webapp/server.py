@@ -470,6 +470,8 @@ class ConsoleData:
             "--select",
             ",".join(map(str, selected)),
             "--launch",
+            "--mode",
+            "auto",
         ])
 
     def qc_check(self, batch: object) -> dict:

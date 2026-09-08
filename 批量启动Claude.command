@@ -55,7 +55,8 @@ python3 "$RUNNER" \
   --batch "$BATCH" \
   --env-file "$ENV_FILE" \
   --select "$SELECTION" \
-  --launch
+  --launch \
+  --mode auto
 
 echo ""
 read "_?批次启动完成，按回车关闭本窗口。"
