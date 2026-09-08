@@ -347,6 +347,30 @@ class WebConsoleTests(unittest.TestCase):
                 data.author_executor.shutdown(wait=True)
                 data.pipeline_executor.shutdown(wait=True)
 
+    def test_single_question_pipeline_job_contains_only_requested_question(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = self.make_database(root)
+            (root / ".env").write_text(
+                "CC_SWITCH_BASE_URL=https://relay.example.com\n"
+                "CC_SWITCH_MODEL=claude-test\n"
+                "CC_SWITCH_API_KEY=test-secret\n"
+                "CC_USR_SUBMITTER=测试提交人\n",
+                encoding="utf-8",
+            )
+            data = ConsoleData(database, root)
+            try:
+                with mock.patch.object(data, "_run_pipeline_process") as runner:
+                    result = data.create_pipeline_job({"batch": "0911", "numbers": [1]})
+                    self.assertEqual(result["job_id"], 1)
+                    runner.assert_called_once()
+                jobs = data.pipeline_jobs()
+                self.assertEqual(jobs[0]["question_count"], 1)
+                self.assertEqual([item["question_no"] for item in jobs[0]["items"]], [1])
+            finally:
+                data.author_executor.shutdown(wait=True)
+                data.pipeline_executor.shutdown(wait=True)
+
     def test_failed_pipeline_retry_creates_linked_job_and_preserves_source(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -219,10 +219,14 @@ class Pipeline:
         mechanical_command = [
             sys.executable, str(self.project_root / "tools" / "batch_pipeline.py"),
             "--db", str(self.database), "qc-check", "--batch", self.batch,
+            "--select", ",".join(str(row["question_no"]) for row in rows),
         ]
         returncode, _output = self.run_command(mechanical_command)
         with closing(self.db()) as connection:
-            checked_rows = question_rows(connection, self.batch)
+            checked_rows = [
+                row for row in question_rows(connection, self.batch)
+                if int(row["id"]) in {int(selected["id"]) for selected in rows}
+            ]
         rejected = [row for row in checked_rows if row["mechanical_qc"] != "pass"]
         if rejected or returncode:
             for row in checked_rows:
@@ -278,7 +282,11 @@ class Pipeline:
         if errors:
             raise RuntimeError("Codex 题目质检失败：" + "; ".join(errors))
         with closing(self.db()) as connection:
-            rows = question_rows(connection, self.batch)
+            selected_ids = {int(selected["id"]) for selected in rows}
+            rows = [
+                row for row in question_rows(connection, self.batch)
+                if int(row["id"]) in selected_ids
+            ]
         blocked = [row["task_id"] for row in rows if not (
             row["mechanical_qc"] == "pass" and row["qc_decision"] == "pass"
             and row["qc_prompt_sha256"] == prompt_hash(row["prompt"])
@@ -705,6 +713,13 @@ class Pipeline:
                     (self.job_id,),
                 )
             ]
+            question_numbers = [
+                int(row["question_no"]) for row in connection.execute(
+                    "SELECT question_no FROM pipeline_items WHERE pipeline_job_id=? ORDER BY question_no",
+                    (self.job_id,),
+                )
+            ]
+        selection = ",".join(str(number) for number in question_numbers)
         for question_id in question_ids:
             self.item(question_id, status="finalizing")
         root = self.trajectory_search_root
@@ -715,16 +730,17 @@ class Pipeline:
         existing_workbooks = {path.resolve() for path in batch_folder.glob("CC_Codex*.xlsx")}
         existing_trajectories = {path.resolve() for path in batch_folder.glob("轨迹_*.jsonl")}
         prompt = (
-            f"使用 cc-usr-delivery-qc 处理批次 {self.batch} 的全部交付记录。读取项目规范.md、"
+            f"使用 cc-usr-delivery-qc 处理批次 {self.batch} 中第 {selection} 题的交付记录。读取项目规范.md、"
             ".agents/skills/cc-usr-delivery-qc/SKILL.md、references/delivery-qc-checklist.md 以及 producer 的记录合同和评分规则，执行 validate_records.py，依据原始 JSONL、SQLite、"
             f"初始快照和实际产物修正所有有证据支持的不合规字段；本批次原始 JSONL 根目录是 {root}。"
             "重新验证无错误后执行 --finalize。"
             "逐项复核五项评分描述和非空的其他问题是否为自然中文书面语、是否各自引用可核验证据，"
             "并拒绝评价者自述、评分质检、模型表现、生成过程、固定标签、套话开头和机械重复句式。"
             "无法从证据恢复的字段必须保持未通过，不得猜测或修改目标模型产物。"
-            f"全部通过后再使用 cc-usr-excel-exporter 导出批次 {self.batch}，"
-            ".agents/skills/cc-usr-excel-exporter/scripts/export_xlsx.py 必须显式使用 "
-            f"--claude-root {root}，原始 JSONL 必须逐字节复制。"
+            f"全部通过后再使用 cc-usr-excel-exporter 导出批次 {self.batch} 的第 {selection} 题，"
+            ".agents/skills/cc-usr-delivery-qc/scripts/validate_records.py 和 "
+            ".agents/skills/cc-usr-excel-exporter/scripts/export_xlsx.py 都必须显式使用 "
+            f"--select {selection}；export_xlsx.py 还必须使用 --claude-root {root}，原始 JSONL 必须逐字节复制。"
         )
         if self.codex(prompt) != 0:
             for question_id in question_ids:
@@ -859,7 +875,15 @@ class Pipeline:
     def execute(self, image: str, command: str, qc_concurrency: int, model_concurrency: int, codex_concurrency: int, model_mode: str = "local") -> None:
         with closing(self.db()) as connection:
             batch = connection.execute("SELECT * FROM batches WHERE name=?", (self.batch,)).fetchone()
-            rows = question_rows(connection, self.batch)
+            all_rows = question_rows(connection, self.batch)
+            selected_ids = {
+                int(item["question_id"])
+                for item in connection.execute(
+                    "SELECT question_id FROM pipeline_items WHERE pipeline_job_id=?",
+                    (self.job_id,),
+                )
+            }
+            rows = [row for row in all_rows if int(row["id"]) in selected_ids]
             job = connection.execute(
                 "SELECT retry_of_job_id FROM pipeline_jobs WHERE id=?", (self.job_id,)
             ).fetchone()
@@ -869,9 +893,10 @@ class Pipeline:
             raise ValueError(f"流水线任务不存在：{self.job_id}")
         retry_of_job_id = job["retry_of_job_id"]
         with closing(self.db()) as connection:
+            placeholders = ",".join("?" for _ in rows)
             existing = connection.execute(
-                "SELECT COUNT(*) FROM runs r JOIN questions q ON q.id=r.question_id "
-                "JOIN batches b ON b.id=q.batch_id WHERE b.name=?", (self.batch,),
+                "SELECT COUNT(*) FROM runs WHERE question_id IN (" + placeholders + ")",
+                [int(row["id"]) for row in rows],
             ).fetchone()[0]
         if existing and retry_of_job_id is None:
             raise RuntimeError("批次已有目标模型运行记录；为保护原始工作区和轨迹，一键全流程只允许运行尚未跑题的新批次")

@@ -130,6 +130,7 @@ function renderRows() {
         <button class="icon-button" data-action="detail" title="查看详情" aria-label="查看详情"><i data-lucide="eye"></i></button>
         <button class="icon-button" data-action="copy" title="复制 Prompt" aria-label="复制 Prompt"><i data-lucide="copy"></i></button>
         <button class="icon-button" data-action="folder" title="打开题目目录" aria-label="打开题目目录"><i data-lucide="folder-open"></i></button>
+        ${question.run_count === 0 ? `<button class="icon-button" data-action="single-pipeline" title="单题跑全流程" aria-label="单题跑全流程"><i data-lucide="play-circle"></i></button>` : ""}
       </div></td>
     </tr>`;
   }).join("");
@@ -242,13 +243,13 @@ function pipelineStatus(status) {
   })[status] || status;
 }
 
-function pipelineItemLabel(item) {
+function pipelineItemLabel(item, modelMode = "local") {
   if (item.status !== "model_running") return pipelineStatus(item.status);
   return ({
-    starting: "模型容器启动中",
+    starting: modelMode === "docker" ? "模型容器启动中" : "本地 Claude CLI 启动中",
     healthy: "模型运行正常",
     idle: "模型运行中，暂时无新轨迹",
-    unavailable: "模型容器状态异常",
+    unavailable: modelMode === "docker" ? "模型容器状态异常" : "本地 Claude CLI 状态异常",
     stalled: "模型运行已停滞",
   })[item.health_status] || "模型运行中，等待健康确认";
 }
@@ -270,7 +271,7 @@ function renderPipelineJobs() {
     <article class="pipeline-job status-${escapeHtml(job.status)}">
       <div class="pipeline-job-head"><div><strong>#${job.id} · ${escapeHtml(job.batch_name)}</strong><span>${job.question_count} 题 · ${job.model_mode === "docker" ? `Docker ${escapeHtml(job.docker_image)}` : "本地 Claude CLI"}</span></div><div class="job-actions">${job.can_retry ? `<button class="button secondary compact" type="button" data-pipeline-retry="${job.id}"><i data-lucide="rotate-ccw"></i>从失败处重试</button>` : ""}<span class="job-status">${escapeHtml(pipelineStatus(job.status))}</span></div></div>
       <div class="pipeline-job-meta"><span>质检并发 ${job.qc_concurrency}</span><span>模型并发 ${job.model_concurrency}</span><span>交付并发 ${job.codex_concurrency}</span>${job.retry_of_job_id ? `<span>重试自 #${job.retry_of_job_id}</span>` : ""}<span>${escapeHtml(formatDate(job.created_at))}</span></div>
-      <div class="pipeline-item-grid">${(job.items || []).map((item) => `<span class="pipeline-item status-${escapeHtml(item.status.replaceAll("_", "-"))} health-${escapeHtml(item.health_status || "unknown")}"${item.error ? ` title="${escapeHtml(item.error)}"` : ""}><span>第 ${item.question_no} 题：${escapeHtml(pipelineItemLabel(item))}</span>${item.status === "model_running" && item.health_detail ? `<small>${escapeHtml(item.health_detail)} · 最近活动 ${escapeHtml(formatDate(item.activity_at || item.heartbeat_at))}</small>` : ""}</span>`).join("")}</div>
+      <div class="pipeline-item-grid">${(job.items || []).map((item) => `<span class="pipeline-item status-${escapeHtml(item.status.replaceAll("_", "-"))} health-${escapeHtml(item.health_status || "unknown")}"${item.error ? ` title="${escapeHtml(item.error)}"` : ""}><span>第 ${item.question_no} 题：${escapeHtml(pipelineItemLabel(item, job.model_mode))}</span>${item.status === "model_running" && item.health_detail ? `<small>${escapeHtml(item.health_detail)} · 最近活动 ${escapeHtml(formatDate(item.activity_at || item.heartbeat_at))}</small>` : ""}</span>`).join("")}</div>
       ${job.can_retry ? `<div class="job-actions"><button class="button secondary compact" type="button" data-author-retry="${job.id}"><i data-lucide="rotate-ccw"></i>从失败处重试</button></div>` : ""}
       ${job.error ? `<div class="author-job-error">${escapeHtml(job.error)}</div>` : ""}
       <pre class="author-job-output">${escapeHtml(job.output || job.last_message || "等待流水线启动...")}</pre>
@@ -329,7 +330,7 @@ async function loadPipelineJobs() {
 async function startAutoPipeline() {
   const button = $("#auto-pipeline-button");
   if (!state.batch) return;
-  openModal("一键全流程", `将对批次 ${state.batch} 执行 Codex 题目质检、Docker Claude 并行跑题、Codex 交付生产、交付质检和 Excel 导出。`, "开始执行", async () => {
+  openModal("一键全流程", `将对批次 ${state.batch} 执行 Codex 题目质检、Claude 并行跑题、Codex 交付生产、交付质检和 Excel 导出。`, "开始执行", async () => {
     closeModal();
     const original = button.innerHTML;
     button.disabled = true;
@@ -364,6 +365,31 @@ function renderAuthorJobs() {
     </article>`).join("");
   scrollJobLogsToLatest();
   refreshIcons();
+}
+
+function startSinglePipeline(question, button) {
+  openModal("单题跑全流程", `将只对 ${question.task_id} 执行题目质检、Claude 跑题、交付生产、交付质检和 Excel 导出。`, "开始执行", async () => {
+    closeModal();
+    const original = button.innerHTML;
+    button.disabled = true;
+    button.innerHTML = '<i data-lucide="loader-circle"></i>';
+    refreshIcons();
+    try {
+      const result = await api("/api/actions/auto-pipeline", {
+        method: "POST",
+        body: JSON.stringify({ batch: state.batch, numbers: [question.question_no] }),
+      });
+      toast(result.message || "单题流水线已启动");
+      await loadPipelineJobs();
+      await loadDashboard();
+    } catch (error) {
+      toast(error.message, true);
+    } finally {
+      button.innerHTML = original;
+      button.disabled = false;
+      refreshIcons();
+    }
+  });
 }
 
 function retryAuthorJob(jobId) {
@@ -689,6 +715,7 @@ $("#question-rows").addEventListener("click", async (event) => {
   if (button.dataset.action === "folder") {
     executeAction("/api/actions/open", { kind: "question", id }, button, `已打开 ${question.task_id} 目录`).catch(() => {});
   }
+  if (button.dataset.action === "single-pipeline") startSinglePipeline(question, button);
 });
 $("#open-batch").addEventListener("click", () => executeAction("/api/actions/open", { kind: "batch", id: state.batch }, $("#open-batch"), "批次目录已打开").catch(() => {}));
 $("#qc-check").addEventListener("click", async () => {

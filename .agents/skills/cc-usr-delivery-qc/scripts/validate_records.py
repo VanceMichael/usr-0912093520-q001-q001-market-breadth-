@@ -14,7 +14,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from tools.batch_pipeline import connect  # noqa: E402
+from tools.batch_pipeline import connect, parse_selection, question_rows  # noqa: E402
 from tools.delivery_records import (  # noqa: E402
     EXPORT_KEYS,
     load_records,
@@ -41,20 +41,26 @@ def build_report(
     connection: sqlite3.Connection,
     batch: str,
     records: list[dict],
+    selected_numbers: set[int] | None = None,
 ) -> dict:
     errors, warnings = validate_records(records)
-    missing_questions = connection.execute(
+    missing_query = (
         "SELECT q.task_id FROM questions q JOIN batches b ON b.id=q.batch_id "
         "WHERE b.name=? AND EXISTS(SELECT 1 FROM runs x WHERE x.question_id=q.id) "
-        "AND NOT EXISTS(SELECT 1 FROM records r WHERE r.question_id=q.id) "
-        "ORDER BY q.question_no",
-        (batch,),
+        "AND NOT EXISTS(SELECT 1 FROM records r WHERE r.question_id=q.id)"
+    )
+    missing_parameters: list[object] = [batch]
+    if selected_numbers:
+        missing_query += " AND q.question_no IN (" + ",".join("?" for _ in selected_numbers) + ")"
+        missing_parameters.extend(sorted(selected_numbers))
+    missing_questions = connection.execute(
+        missing_query + " ORDER BY q.question_no", missing_parameters,
     ).fetchall()
     errors.extend(
         f"{row['task_id']}: launched question has no delivery record"
         for row in missing_questions
     )
-    source_rows = connection.execute(
+    source_query = (
         "SELECT r.record_id, r.turn_no, r.user_prompt, r.session_id, r.trajectory_file, "
         "r.initial_snapshot, r.reproducibility, r.harness, r.harness_version, "
         "r.task_type, r.difficulty, r.languages, q.prompt AS source_prompt, "
@@ -68,9 +74,13 @@ def build_report(
         "(SELECT x.harness_version FROM runs x WHERE x.question_id=q.id "
         " ORDER BY x.launched_at DESC, x.id DESC LIMIT 1) AS source_harness_version "
         "FROM records r JOIN questions q ON q.id=r.question_id "
-        "JOIN batches b ON b.id=q.batch_id WHERE b.name=?",
-        (batch,),
-    ).fetchall()
+        "JOIN batches b ON b.id=q.batch_id WHERE b.name=?"
+    )
+    source_parameters: list[object] = [batch]
+    if selected_numbers:
+        source_query += " AND q.question_no IN (" + ",".join("?" for _ in selected_numbers) + ")"
+        source_parameters.extend(sorted(selected_numbers))
+    source_rows = connection.execute(source_query, source_parameters).fetchall()
     for row in source_rows:
         common_fields = {
             "initial_snapshot": "source_snapshot",
@@ -124,11 +134,17 @@ def apply_fixes(
     connection: sqlite3.Connection,
     batch: str,
     fixes_path: Path,
+    selected_numbers: set[int] | None = None,
 ) -> tuple[int, dict]:
     before_records = load_records(connection, batch)
+    if selected_numbers:
+        before_records = [
+            record for record in before_records
+            if int(record["question_no"]) in selected_numbers
+        ]
     if not before_records:
         raise ValueError(f"batch has no delivery records: {batch}")
-    before_report = build_report(connection, batch, before_records)
+    before_report = build_report(connection, batch, before_records, selected_numbers)
     by_id = {record["record_id"]: record for record in before_records}
     timestamp = now()
     changed_records = 0
@@ -188,7 +204,12 @@ def apply_fixes(
         changed_records += 1
 
     after_records = load_records(connection, batch)
-    after_report = build_report(connection, batch, after_records)
+    if selected_numbers:
+        after_records = [
+            record for record in after_records
+            if int(record["question_no"]) in selected_numbers
+        ]
+    after_report = build_report(connection, batch, after_records, selected_numbers)
     new_errors = sorted(set(after_report["errors"]) - set(before_report["errors"]))
     new_warnings = sorted(set(after_report["warnings"]) - set(before_report["warnings"]))
     if new_errors or new_warnings:
@@ -201,11 +222,20 @@ def apply_fixes(
     return changed_records, after_report
 
 
-def finalize(connection: sqlite3.Connection, batch: str) -> tuple[int, dict]:
+def finalize(
+    connection: sqlite3.Connection,
+    batch: str,
+    selected_numbers: set[int] | None = None,
+) -> tuple[int, dict]:
     records = load_records(connection, batch)
+    if selected_numbers:
+        records = [
+            record for record in records
+            if int(record["question_no"]) in selected_numbers
+        ]
     if not records:
         raise ValueError(f"batch has no delivery records: {batch}")
-    report = build_report(connection, batch, records)
+    report = build_report(connection, batch, records, selected_numbers)
     if not report["passed"]:
         return 0, report
     timestamp = now()
@@ -223,6 +253,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--db", type=Path, default=Path("production.sqlite3"))
     parser.add_argument("--batch", required=True)
+    parser.add_argument("--select", help="question numbers, for example 1,3-5")
     parser.add_argument("--report", type=Path)
     parser.add_argument("--fixes", type=Path)
     parser.add_argument("--finalize", action="store_true")
@@ -233,15 +264,21 @@ def main() -> int:
     connection: sqlite3.Connection | None = None
     try:
         connection = connect(args.db.resolve())
+        selected_numbers: set[int] | None = None
+        if args.select:
+            selected_numbers = {
+                int(row["question_no"])
+                for row in parse_selection(args.select, question_rows(connection, args.batch))
+            }
         if args.fixes:
             changed, report = apply_fixes(
-                connection, args.batch, args.fixes.resolve()
+                connection, args.batch, args.fixes.resolve(), selected_numbers
             )
             write_report(args.report.resolve() if args.report else None, report)
             print(f"已修正 {changed} 条交付记录；请继续处理剩余问题并重新质检。")
             return 0 if report["passed"] else 1
         if args.finalize:
-            passed_count, report = finalize(connection, args.batch)
+            passed_count, report = finalize(connection, args.batch, selected_numbers)
             write_report(args.report.resolve() if args.report else None, report)
             if not report["passed"]:
                 print("仍有不符合规范的字段，不能标记通过。", file=sys.stderr)
@@ -250,9 +287,14 @@ def main() -> int:
             return 0
 
         records = load_records(connection, args.batch)
+        if selected_numbers:
+            records = [
+                record for record in records
+                if int(record["question_no"]) in selected_numbers
+            ]
         if not records:
             raise ValueError(f"batch has no delivery records: {args.batch}")
-        report = build_report(connection, args.batch, records)
+        report = build_report(connection, args.batch, records, selected_numbers)
         write_report(args.report.resolve() if args.report else None, report)
         return 0 if report["passed"] else 1
     except (OSError, ValueError, sqlite3.Error) as exc:

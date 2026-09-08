@@ -421,19 +421,32 @@ class ConsoleData:
         batch = str(body.get("batch", "")).strip()
         if not BATCH_RE.fullmatch(batch):
             raise ValueError("批次名无效")
+        requested_numbers = body.get("numbers")
+        selected_numbers = None if requested_numbers is None else self.validate_selection(batch, requested_numbers)[1]
         with closing(self._write_connection()) as connection:
             batch_row = connection.execute("SELECT * FROM batches WHERE name=?", (batch,)).fetchone()
-            rows = connection.execute(
+            query = (
                 "SELECT q.id, q.question_no FROM questions q JOIN batches b ON b.id=q.batch_id "
-                "WHERE b.name=? ORDER BY q.question_no", (batch,),
-            ).fetchall()
+                "WHERE b.name=?"
+            )
+            parameters: list[object] = [batch]
+            if selected_numbers:
+                query += " AND q.question_no IN (" + ",".join("?" for _ in selected_numbers) + ")"
+                parameters.extend(selected_numbers)
+            query += " ORDER BY q.question_no"
+            rows = connection.execute(query, parameters).fetchall()
             if batch_row is None or not rows:
                 raise ValueError("批次不存在或没有题目")
+            if selected_numbers and {int(row["question_no"]) for row in rows} != set(selected_numbers):
+                raise ValueError("所选题目不存在")
             active = connection.execute(
-                "SELECT 1 FROM pipeline_jobs WHERE batch_name=? AND status IN ('queued','running')", (batch,)
+                "SELECT 1 FROM pipeline_jobs p JOIN pipeline_items pi ON pi.pipeline_job_id=p.id "
+                "WHERE p.batch_name=? AND p.status IN ('queued','running') "
+                "AND pi.question_no IN (" + ",".join("?" for _ in rows) + ") LIMIT 1",
+                [batch, *(int(row["question_no"]) for row in rows)],
             ).fetchone()
             if active:
-                raise ValueError(f"批次 {batch} 已有正在执行的一键任务")
+                raise ValueError(f"批次 {batch} 的所选题目已有正在执行的流水线任务")
             values = self.read_env()
             required = {
                 "CC_SWITCH_BASE_URL": "中转 URL",
@@ -445,11 +458,12 @@ class ConsoleData:
             if missing:
                 raise ValueError("请先在运行配置中填写：" + "、".join(missing))
             existing_runs = connection.execute(
-                "SELECT COUNT(*) FROM runs r JOIN questions q ON q.id=r.question_id "
-                "JOIN batches b ON b.id=q.batch_id WHERE b.name=?", (batch,),
+                "SELECT COUNT(*) FROM runs WHERE question_id IN ("
+                + ",".join("?" for _ in rows) + ")",
+                [int(row["id"]) for row in rows],
             ).fetchone()[0]
             if existing_runs:
-                raise ValueError("该批次已有模型运行记录；一键全流程仅用于尚未跑题的新批次")
+                raise ValueError("所选题目已有模型运行记录；全流程仅用于尚未跑题的题目")
             image = values.get("CC_CLAUDE_DOCKER_IMAGE", "").strip() or "claude-cli:latest"
             command = values.get("CC_CLAUDE_DOCKER_COMMAND", "claude").strip() or "claude"
             model_mode = values.get("CC_PIPELINE_MODEL_MODE", "local").strip().lower() or "local"
