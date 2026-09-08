@@ -125,7 +125,10 @@
           </div>
           <div class="author-keywords" id="author-common-fields">
             <label class="settings-field"><span>业务关键词</span><input id="author-business" name="business" required maxlength="500" placeholder="例如 本地新闻、城市服务、空间租赁"></label>
-            <label class="settings-field"><span>技术关键词</span><input id="author-technology" name="technology" maxlength="500" placeholder="例如 Go、React、SQLite、Docker"></label>
+            <label class="settings-field"><span>是否需要 Docker</span><select id="author-technology" name="technology">
+              <option value="不需要 Docker">不需要 Docker</option>
+              <option value="需要 Docker">需要 Docker</option>
+            </select></label>
           </div>
           <label class="settings-field" id="author-notes-field"><span>补充要求</span><textarea id="author-notes" name="notes" maxlength="3000" rows="4" placeholder="填写架构侧重、仓库来源或需要避开的方向"></textarea></label>
           <label class="settings-field"><span>命令预览</span><textarea class="command-preview" id="author-command" rows="9" readonly></textarea></label>

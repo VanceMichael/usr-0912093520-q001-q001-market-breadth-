@@ -280,9 +280,10 @@ class ConsoleData:
     def author_prompt(batch: str, count: int, business: str, technology: str, notes: str,
                       mode: str = "0-1", task_type: str = "0-1 代码生成", mother: dict | None = None,
                       derived_notes: str = "", defect_tolerance: str = "") -> str:
+        technology_label = "Docker 要求" if technology in {"需要 Docker", "不需要 Docker"} else "技术关键词"
         requirements = "；".join(filter(None, (
             f"业务关键词：{business}" if business else "",
-            f"技术关键词：{technology}" if technology else "",
+            f"{technology_label}：{technology}" if technology else "",
             f"补充要求：{notes}" if notes else "",
         )))
         if mode == "derived":
