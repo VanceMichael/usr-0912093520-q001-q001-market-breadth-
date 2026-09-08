@@ -183,6 +183,12 @@ def main() -> int:
                 ).fetchone()[0]
                 if attempts < args.max_attempts:
                     rows.append(row)
+                else:
+                    connection.execute(
+                        "UPDATE questions SET status='blocked',updated_at=? WHERE id=?",
+                        (now(), row["id"]),
+                    )
+            connection.commit()
             rows = rows[: args.concurrency]
         if not rows:
             print("No runnable READY questions available.", flush=True)

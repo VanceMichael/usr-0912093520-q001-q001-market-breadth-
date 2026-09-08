@@ -44,6 +44,46 @@ class OrchestratorTest(unittest.TestCase):
             self.assertEqual([row[0] for row in statuses], ["succeeded", "succeeded"])
             self.assertEqual(len(list((root / "runs" / "b").glob("b-*/docker-*.log"))), 2)
 
+    def test_exhausted_question_is_blocked_without_another_container(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            db = root / "production.sqlite3"
+            folder = root / "b" / "q001"
+            folder.mkdir(parents=True)
+            with connect(db) as connection:
+                connection.execute(
+                    "INSERT INTO batches(name,folder_path,markdown_path,question_count,created_at,updated_at) "
+                    "VALUES('b',?,?,1,'now','now')",
+                    (str(root / "b"), str(root / "b.md")),
+                )
+                batch_id = connection.execute("SELECT id FROM batches").fetchone()[0]
+                prompt = "build a complete service"
+                connection.execute(
+                    "INSERT INTO questions(batch_id,question_no,task_id,folder_name,folder_path,title,prompt,prompt_sha256,task_type,difficulty,languages,reproducibility,mechanical_qc,qc_decision,qc_prompt_sha256,status,created_at,updated_at) "
+                    "VALUES(?,1,'b-001','q001',?,'t',?,?,?,?,?,'none','pass','pass',?,'approved','now','now')",
+                    (batch_id, str(folder), prompt, orchestrator.prompt_hash(prompt), "0-1 代码生成", "中等", "Python", orchestrator.prompt_hash(prompt)),
+                )
+                question_id = connection.execute("SELECT id FROM questions").fetchone()[0]
+                for attempt in (1, 2):
+                    connection.execute(
+                        "INSERT INTO runs(question_id,batch_run_id,launched_at,status) VALUES(?,?,?,'failed')",
+                        (question_id, f"failed-{attempt}", f"time-{attempt}"),
+                    )
+                connection.commit()
+            env = root / ".env"
+            env.write_text("", encoding="utf-8")
+            with mock.patch.object(orchestrator.subprocess, "run") as run:
+                with mock.patch("sys.argv", [
+                    "orchestrator", "--db", str(db), "--batch", "b",
+                    "--env-file", str(env), "--data-root", str(root / "runs"),
+                    "--max-attempts", "2",
+                ]):
+                    self.assertEqual(orchestrator.main(), 0)
+                run.assert_not_called()
+            with connect(db) as connection:
+                status = connection.execute("SELECT status FROM questions").fetchone()[0]
+            self.assertEqual(status, "blocked")
+
 
 if __name__ == "__main__":
     unittest.main()
