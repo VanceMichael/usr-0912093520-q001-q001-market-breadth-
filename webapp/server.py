@@ -250,6 +250,10 @@ class ConsoleData:
                 " ORDER BY x.launched_at DESC, x.id DESC LIMIT 1) AS latest_session_id, "
                 "(SELECT x.harness_version FROM runs x WHERE x.question_id=q.id "
                 " ORDER BY x.launched_at DESC, x.id DESC LIMIT 1) AS harness_version, "
+                "(SELECT x.status FROM runs x WHERE x.question_id=q.id "
+                " ORDER BY x.launched_at DESC, x.id DESC LIMIT 1) AS latest_run_status, "
+                "(SELECT x.error_message FROM runs x WHERE x.question_id=q.id "
+                " ORDER BY x.launched_at DESC, x.id DESC LIMIT 1) AS latest_run_error, "
                 "(SELECT COUNT(*) FROM records r WHERE r.question_id=q.id) AS record_count, "
                 "(SELECT COUNT(*) FROM records r WHERE r.question_id=q.id "
                 " AND r.delivery_qc_passed=1) AS passed_record_count, "
@@ -272,14 +276,23 @@ class ConsoleData:
                     and row["status"] in {"approved", "running", "completed"}
                 )
                 run_count = int(row["run_count"] or 0)
+                run_status = str(row["latest_run_status"] or "")
+                run_complete = run_status == "succeeded" or (
+                    not run_status and row["status"] == "completed"
+                )
                 record_count = int(row["record_count"] or 0)
                 passed_count = int(row["passed_record_count"] or 0)
                 delivery_qc = record_count > 0 and passed_count == record_count
                 exported = delivery_qc and int(row["question_no"]) in exported_numbers
                 if not question_qc:
                     stage_index, stage_label = 1, "题目待质检"
-                elif run_count == 0:
-                    stage_index, stage_label = 2, "待模型跑题"
+                elif not run_complete:
+                    if run_status == "running":
+                        stage_index, stage_label = 2, "模型跑题中"
+                    elif run_status in {"failed", "timeout"}:
+                        stage_index, stage_label = 2, "模型跑题待重试"
+                    else:
+                        stage_index, stage_label = 2, "待模型跑题"
                 elif record_count == 0:
                     stage_index, stage_label = 3, "待交付生产"
                 elif not delivery_qc:
@@ -303,6 +316,8 @@ class ConsoleData:
                     "qc_decision": row["qc_decision"],
                     "qc_current": qc_current,
                     "run_count": run_count,
+                    "run_status": run_status,
+                    "run_error": row["latest_run_error"] or "",
                     "launched_at": row["launched_at"] or "",
                     "session_id": row["latest_session_id"] or "",
                     "harness_version": row["harness_version"] or "",
@@ -314,13 +329,13 @@ class ConsoleData:
                     "exported": exported,
                     "stage_index": stage_index,
                     "stage_label": stage_label,
-                    "can_launch": question_qc and row["status"] == "approved" and run_count == 0,
+                    "can_launch": question_qc and row["status"] == "approved" and not run_complete,
                 })
 
         total = len(questions)
         stages = [
             {"id": 1, "label": "题目质检", "complete": sum(q["question_qc"] for q in questions)},
-            {"id": 2, "label": "模型跑题", "complete": sum(q["run_count"] > 0 for q in questions)},
+            {"id": 2, "label": "模型跑题", "complete": sum(q["run_status"] == "succeeded" for q in questions)},
             {"id": 3, "label": "交付生产", "complete": sum(q["record_count"] > 0 for q in questions)},
             {"id": 4, "label": "交付质检", "complete": sum(q["delivery_qc"] for q in questions)},
             {"id": 5, "label": "Excel 交付", "complete": sum(q["exported"] for q in questions)},

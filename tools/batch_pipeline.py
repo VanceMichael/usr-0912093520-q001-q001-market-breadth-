@@ -16,7 +16,7 @@ from datetime import datetime
 from pathlib import Path
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 TASK_TYPES = {
     "0-1 代码生成", "Feature 迭代", "Bug 修复", "代码理解",
     "代码重构", "工程化", "代码测试",
@@ -113,6 +113,16 @@ CREATE TABLE IF NOT EXISTS runs (
     harness TEXT NOT NULL DEFAULT 'Claude Code',
     harness_version TEXT NOT NULL DEFAULT '',
     session_id TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'registered',
+    started_at TEXT NOT NULL DEFAULT '',
+    finished_at TEXT NOT NULL DEFAULT '',
+    exit_code INTEGER,
+    error_message TEXT NOT NULL DEFAULT '',
+    container_id TEXT NOT NULL DEFAULT '',
+    log_path TEXT NOT NULL DEFAULT '',
+    trajectory_root TEXT NOT NULL DEFAULT '',
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    heartbeat_at TEXT NOT NULL DEFAULT '',
     UNIQUE (question_id, batch_run_id)
 );
 
@@ -174,6 +184,9 @@ def connect(database: Path) -> sqlite3.Connection:
     database.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(database)
     connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA busy_timeout=10000")
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA synchronous=NORMAL")
     connection.executescript(SCHEMA)
     record_columns = {
         row["name"] for row in connection.execute("PRAGMA table_info(records)")
@@ -221,6 +234,21 @@ def connect(database: Path) -> sqlite3.Connection:
         connection.execute(
             "UPDATE runs SET harness_version=codex_version WHERE harness_version=''"
         )
+    run_migrations = {
+        "status": "TEXT NOT NULL DEFAULT 'registered'",
+        "started_at": "TEXT NOT NULL DEFAULT ''",
+        "finished_at": "TEXT NOT NULL DEFAULT ''",
+        "exit_code": "INTEGER",
+        "error_message": "TEXT NOT NULL DEFAULT ''",
+        "container_id": "TEXT NOT NULL DEFAULT ''",
+        "log_path": "TEXT NOT NULL DEFAULT ''",
+        "trajectory_root": "TEXT NOT NULL DEFAULT ''",
+        "retry_count": "INTEGER NOT NULL DEFAULT 0",
+        "heartbeat_at": "TEXT NOT NULL DEFAULT ''",
+    }
+    for name, definition in run_migrations.items():
+        if name not in run_columns:
+            connection.execute(f"ALTER TABLE runs ADD COLUMN {name} {definition}")
     connection.execute(
         "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -747,6 +775,36 @@ def list_questions(connection: sqlite3.Connection, batch: str) -> None:
         print(f"{row['question_no']:>3}  {mark:<7}  {row['task_id']:<14}  {row['title']}  [{row['folder_name']}]")
 
 
+def relocate_paths(connection: sqlite3.Connection, workspace: Path) -> int:
+    """Rebind stored absolute paths after the project is copied to another host."""
+    workspace = workspace.resolve(strict=True)
+    batches = connection.execute("SELECT id,name FROM batches ORDER BY id").fetchall()
+    updated = 0
+    for batch in batches:
+        folder = workspace / batch["name"]
+        markdown = folder / f"题目_{batch['name']}.md"
+        if not folder.is_dir():
+            raise ValueError(f"batch folder does not exist under new workspace: {folder}")
+        connection.execute(
+            "UPDATE batches SET folder_path=?,markdown_path=?,updated_at=? WHERE id=?",
+            (str(folder), str(markdown), now(), batch["id"]),
+        )
+        questions = connection.execute(
+            "SELECT id,folder_name FROM questions WHERE batch_id=?", (batch["id"],)
+        ).fetchall()
+        for question in questions:
+            question_folder = folder / question["folder_name"]
+            if not question_folder.is_dir():
+                raise ValueError(f"question folder does not exist under new workspace: {question_folder}")
+            connection.execute(
+                "UPDATE questions SET folder_path=?,updated_at=? WHERE id=?",
+                (str(question_folder), now(), question["id"]),
+            )
+            updated += 1
+    connection.commit()
+    return updated
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--db", type=Path, default=Path("production.sqlite3"))
@@ -780,6 +838,8 @@ def main() -> int:
     repo_parser.add_argument("--snapshot", required=True)
     render_parser = subparsers.add_parser("render")
     render_parser.add_argument("--batch", required=True)
+    relocate_parser = subparsers.add_parser("relocate")
+    relocate_parser.add_argument("--workspace", type=Path, required=True)
 
     args = parser.parse_args()
     try:
@@ -805,6 +865,9 @@ def main() -> int:
             print(f"Updated repository metadata for {args.batch} question {args.number}")
         elif args.command == "render":
             print(render_batch(connection, args.batch))
+        elif args.command == "relocate":
+            count = relocate_paths(connection, args.workspace)
+            print(f"Relocated {count} question paths under {args.workspace.resolve()}")
         connection.close()
         return 0
     except (OSError, ValueError, RuntimeError, sqlite3.Error, subprocess.SubprocessError) as exc:

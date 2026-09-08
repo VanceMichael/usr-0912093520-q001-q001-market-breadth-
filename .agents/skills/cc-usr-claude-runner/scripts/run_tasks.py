@@ -96,16 +96,26 @@ def select_launch_mode(requested: str) -> str:
     return "iterm" if platform.system() == "Darwin" and iterm_available() else "server"
 
 
-def open_server(launcher: Path, folder: Path) -> subprocess.Popen[bytes]:
+def open_server(launcher: Path, folder: Path, log_path: Path | None = None) -> subprocess.Popen[bytes]:
     """Start an unattended Claude process detached from the launching terminal."""
-    return subprocess.Popen(
-        [str(launcher), "--headless"],
-        cwd=folder,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    stdout = stderr = subprocess.DEVNULL
+    if log_path is not None:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = log_path.open("ab")
+        stdout = handle
+        stderr = subprocess.STDOUT
+    try:
+        return subprocess.Popen(
+            [str(launcher), "--headless"],
+            cwd=folder,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout,
+            stderr=stderr,
+            start_new_session=True,
+        )
+    finally:
+        if log_path is not None:
+            handle.close()
 
 
 def main() -> int:
@@ -227,7 +237,8 @@ def main() -> int:
                 return 1
         else:
             try:
-                process = open_server(launcher, Path(row["folder_path"]).resolve())
+                log_path = run_dir / "worker.log"
+                process = open_server(launcher, Path(row["folder_path"]).resolve(), log_path)
                 (run_dir / "process.pid").write_text(f"{process.pid}\n", encoding="ascii")
             except OSError as exc:
                 print(f"Failed to start server process for {row['task_id']}: {exc}", file=sys.stderr)
@@ -236,9 +247,11 @@ def main() -> int:
         timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
         connection.execute(
             "INSERT INTO runs(question_id, batch_run_id, launched_at, codex_version, "
-            "relay_provider, relay_host, relay_wire_api, model, harness, harness_version) "
-            "VALUES(?, ?, ?, ?, '', '', '', '', 'Claude Code', ?)",
-            (row["id"], batch_run_id, timestamp, version, version),
+            "relay_provider, relay_host, relay_wire_api, model, harness, harness_version, "
+            "status, started_at, finished_at, exit_code, error_message, container_id, "
+            "log_path, trajectory_root, retry_count, heartbeat_at) "
+            "VALUES(?, ?, ?, ?, '', '', '', '', 'Claude Code', ?, 'running', ?, '', NULL, '', '', ?, '', 0, ?)",
+            (row["id"], batch_run_id, timestamp, version, version, timestamp, str(log_path) if mode == "server" else "", timestamp),
         )
         connection.execute(
             "UPDATE questions SET status='running', updated_at=? WHERE id=?",

@@ -1,0 +1,9 @@
+.git
+.idea
+.env
+09*/
+runs/
+production.sqlite3*
+*.xlsx
+__pycache__/
+*.py[cod]

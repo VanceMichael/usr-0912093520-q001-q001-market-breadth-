@@ -1,0 +1,18 @@
+services:
+  scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile.scheduler
+    image: ccusr-scheduler:local
+    working_dir: ${HOST_PROJECT_ROOT:-/app}
+    command: ["python3", "-m", "tools.orchestrator", "--batch", "090901", "--concurrency", "2", "--loop"]
+    volumes:
+      - ${HOST_PROJECT_ROOT:-.}:${HOST_PROJECT_ROOT:-/app}
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+
+  worker-image:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    image: ccusr-claude-worker:local
