@@ -122,7 +122,10 @@ def parse_html(source_url: str, payload: bytes) -> list[dict[str, str]]:
         parsed_url = urlparse(article_url)
         if parsed_url.scheme not in {"http", "https"} or parsed_url.netloc != source_host:
             continue
-        if article_url == source_url or len(title) < 8 or len(title) > 180:
+        path = parsed_url.path.lower()
+        blocked_titles = {"about us", "home", "首页", "联系我们", "登录", "注册", "更多", "下一页", "上一页"}
+        article_hint = any(token in path for token in ("/202", ".shtml", "/article", "/content", "/finance/"))
+        if article_url == source_url or title.casefold() in blocked_titles or len(title) < 10 or len(title) > 180 or not article_hint:
             continue
         if article_url in seen:
             continue
@@ -153,6 +156,7 @@ def ingest(database: Path, feeds: list[str], timeout: int = 20) -> tuple[int, li
     errors: list[str] = []
     with connect(database.resolve()) as connection:
         for source_url in feeds:
+            before_count = added
             try:
                 items = fetch(source_url, timeout)
             except Exception as exc:  # noqa: BLE001 - one bad feed must not stop the cycle
@@ -165,6 +169,8 @@ def ingest(database: Path, feeds: list[str], timeout: int = 20) -> tuple[int, li
                     (item["source_url"], item["article_url"], item["title"], item["summary"], item["published_at"], topic_hash(item), timestamp, timestamp),
                 )
                 added += int(result.rowcount == 1)
+            if added == before_count:
+                errors.append(f"{source_url}: no article-like topics found")
         connection.commit()
     return added, errors
 

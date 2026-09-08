@@ -32,6 +32,7 @@ class NewsTopicTest(unittest.TestCase):
         <a href="/world/202609/08-article.shtml">A meaningful article title</a>
         <a href="/world/202609/08-article.shtml">A meaningful article title</a>
         <a href="https://other.example/x">External link should be ignored</a>
+        <a href="/about">About us</a>
         </body></html>'''
         items = parse_feed("https://channel.example/news.shtml", html)
         self.assertEqual(len(items), 1)
