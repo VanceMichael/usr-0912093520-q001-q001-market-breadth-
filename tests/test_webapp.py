@@ -140,9 +140,11 @@ class WebConsoleTests(unittest.TestCase):
                 "submitter": "新提交人",
             })
             self.assertEqual(result["config"]["model"], "claude-new")
+            self.assertEqual(result["config"]["model_mode"], "local")
             content = env_file.read_text(encoding="utf-8")
             self.assertIn('CC_SWITCH_BASE_URL="https://relay.example.com/v1"', content)
             self.assertIn('CC_SWITCH_API_KEY="new-secret"', content)
+            self.assertIn('CC_PIPELINE_MODEL_MODE="local"', content)
             self.assertNotIn("old-secret", content)
             if os.name != "nt":
                 self.assertEqual(env_file.stat().st_mode & 0o777, 0o600)
@@ -334,8 +336,10 @@ class WebConsoleTests(unittest.TestCase):
                     result = data.create_pipeline_job({"batch": "0911"})
                     self.assertEqual(result["job_id"], 1)
                     runner.assert_called_once()
+                    self.assertEqual(runner.call_args.args[7], "local")
                 jobs = data.pipeline_jobs()
                 self.assertEqual(jobs[0]["status"], "queued")
+                self.assertEqual(jobs[0]["model_mode"], "local")
                 self.assertEqual(jobs[0]["model_concurrency"], 2)
                 self.assertEqual(len(jobs[0]["items"]), 1)
                 self.assertIn("heartbeat_at", jobs[0]["items"][0])
@@ -378,6 +382,7 @@ class WebConsoleTests(unittest.TestCase):
                 self.assertEqual(retried["retry_of_job_id"], first["job_id"])
                 self.assertEqual(jobs[0]["status"], "queued")
                 self.assertEqual(jobs[0]["retry_of_job_id"], first["job_id"])
+                self.assertEqual(jobs[0]["model_mode"], "local")
                 self.assertEqual(len(jobs), 1)
                 connection = sqlite3.connect(database)
                 source = connection.execute(
@@ -391,6 +396,61 @@ class WebConsoleTests(unittest.TestCase):
                 shutdown = getattr(data.pipeline_executor, "shutdown", None)
                 if shutdown:
                     shutdown(wait=True)
+
+    def test_docker_pipeline_mode_is_persisted_and_passed_to_process(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = self.make_database(root)
+            (root / ".env").write_text(
+                "CC_SWITCH_BASE_URL=https://relay.example.com\n"
+                "CC_SWITCH_MODEL=claude-test\n"
+                "CC_SWITCH_API_KEY=test-secret\n"
+                "CC_USR_SUBMITTER=测试提交人\n"
+                "CC_PIPELINE_MODEL_MODE=docker\n",
+                encoding="utf-8",
+            )
+            data = ConsoleData(database, root)
+            try:
+                with mock.patch.object(data, "_run_pipeline_process") as runner:
+                    data.create_pipeline_job({"batch": "0911"})
+                    runner.assert_called_once()
+                    self.assertEqual(runner.call_args.args[7], "docker")
+                self.assertEqual(data.pipeline_jobs()[0]["model_mode"], "docker")
+            finally:
+                data.author_executor.shutdown(wait=True)
+                data.pipeline_executor.shutdown(wait=True)
+
+    def test_local_environment_status_does_not_require_docker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = self.make_database(root)
+            (root / ".env").write_text(
+                "CC_SWITCH_BASE_URL=https://relay.example.com\n"
+                "CC_SWITCH_MODEL=claude-test\n"
+                "CC_SWITCH_API_KEY=test-secret\n"
+                "CC_USR_SUBMITTER=测试提交人\n"
+                "CC_PIPELINE_MODEL_MODE=local\n",
+                encoding="utf-8",
+            )
+            data = ConsoleData(database, root)
+            try:
+                def which(name):
+                    return {"codex": "codex", "claude": "claude"}.get(name)
+
+                def run(command, **_kwargs):
+                    return mock.Mock(returncode=0, stdout="1.0.0\n")
+
+                with mock.patch("webapp.server.shutil.which", side_effect=which), mock.patch(
+                    "webapp.server.subprocess.run", side_effect=run
+                ), mock.patch("webapp.server.docker_info", side_effect=AssertionError("Docker should not be checked")):
+                    status = data.environment_status()
+                names = {check["name"] for check in status["checks"]}
+                self.assertTrue(status["ok"])
+                self.assertIn("本地 Claude CLI", names)
+                self.assertNotIn("Docker CLI", names)
+            finally:
+                data.author_executor.shutdown(wait=True)
+                data.pipeline_executor.shutdown(wait=True)
 
     def test_pipeline_jobs_returns_only_latest_attempt_and_log_tail(self):
         with tempfile.TemporaryDirectory() as directory:

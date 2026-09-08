@@ -103,7 +103,7 @@
       </section>
 
       <section class="pipeline-jobs-panel" id="pipeline-jobs-panel" aria-labelledby="pipeline-jobs-title">
-        <div class="section-heading"><div><h2 id="pipeline-jobs-title">自动流水线</h2><p>按配置并行执行 Codex 质检、Docker Claude 跑题、交付生产、交付质检和 Excel 导出。</p></div><button class="button secondary" type="button" id="pipeline-jobs-refresh"><i data-lucide="refresh-cw"></i>刷新任务</button></div>
+        <div class="section-heading"><div><h2 id="pipeline-jobs-title">自动流水线</h2><p>按配置并行执行 Codex 质检、Claude 跑题、交付生产、交付质检和 Excel 导出。</p></div><button class="button secondary" type="button" id="pipeline-jobs-refresh"><i data-lucide="refresh-cw"></i>刷新任务</button></div>
         <div id="pipeline-job-list" class="pipeline-job-list"><div class="empty-state"><strong>暂无自动流水线任务</strong></div></div>
       </section>
 
@@ -141,7 +141,8 @@
           <label class="settings-field"><span>模型名称</span><input id="config-model" name="model" required placeholder="claude-sonnet"></label>
           <label class="settings-field"><span>API Key <small id="config-key-hint"></small></span><span class="password-field"><input id="config-api-key" name="api_key" type="password" placeholder="留空表示保留现有 Key"><button class="field-icon" id="toggle-api-key" type="button" title="显示 API Key" aria-label="显示 API Key"><i data-lucide="eye"></i></button></span></label>
           <label class="settings-field"><span>提交人</span><input id="config-submitter" name="submitter" required placeholder="真实姓名"></label>
-          <div class="pipeline-config-fields" aria-label="Docker 流水线配置">
+          <label class="settings-field"><span>模型运行方式</span><select id="config-model-mode" name="model_mode"><option value="local">本地 Claude CLI</option><option value="docker">Docker Claude CLI</option></select></label>
+          <div class="pipeline-config-fields" aria-label="Claude 流水线配置">
             <label class="settings-field"><span>Claude Docker 镜像</span><input id="config-docker-image" placeholder="claude-cli:latest"></label>
             <label class="settings-field"><span>容器内命令</span><input id="config-docker-command" placeholder="claude"></label>
             <div class="pipeline-concurrency-fields">
@@ -154,7 +155,7 @@
           <div class="settings-actions"><span class="settings-note">配置文件权限会自动设置为仅当前用户可读写。</span><button class="button primary" type="submit" id="save-config"><i data-lucide="save"></i>保存配置</button></div>
         </form>
         <section class="environment-panel" aria-labelledby="environment-title">
-          <div class="section-heading"><div><h3 id="environment-title">运行环境</h3><p>启动自动流水线前检查 Codex、Docker 引擎和 Claude CLI。默认镜像异常时可自动重建。</p></div><button class="button secondary" type="button" id="environment-repair"><i data-lucide="wrench"></i>检测并修复</button></div>
+          <div class="section-heading"><div><h3 id="environment-title">运行环境</h3><p>启动自动流水线前检查 Codex 和当前选择的 Claude CLI 运行环境。</p></div><button class="button secondary" type="button" id="environment-repair"><i data-lucide="wrench"></i>检测并修复</button></div>
           <div id="environment-status" class="environment-status"><div class="empty-state"><strong>尚未检测</strong><span>点击“检测并修复”检查本机环境。</span></div></div>
         </section>
       </section>

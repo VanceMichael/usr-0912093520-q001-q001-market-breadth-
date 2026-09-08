@@ -192,6 +192,7 @@ function renderSettings() {
   $("#config-qc-concurrency").value = state.config.qc_concurrency || 2;
   $("#config-model-concurrency").value = state.config.model_concurrency || 2;
   $("#config-codex-concurrency").value = state.config.codex_concurrency || 2;
+  $("#config-model-mode").value = state.config.model_mode || "local";
 }
 
 function renderEnvironment() {
@@ -267,7 +268,7 @@ function renderPipelineJobs() {
   }
   list.innerHTML = state.pipelineJobs.map((job) => `
     <article class="pipeline-job status-${escapeHtml(job.status)}">
-      <div class="pipeline-job-head"><div><strong>#${job.id} · ${escapeHtml(job.batch_name)}</strong><span>${job.question_count} 题 · Docker ${escapeHtml(job.docker_image)}</span></div><div class="job-actions">${job.can_retry ? `<button class="button secondary compact" type="button" data-pipeline-retry="${job.id}"><i data-lucide="rotate-ccw"></i>从失败处重试</button>` : ""}<span class="job-status">${escapeHtml(pipelineStatus(job.status))}</span></div></div>
+      <div class="pipeline-job-head"><div><strong>#${job.id} · ${escapeHtml(job.batch_name)}</strong><span>${job.question_count} 题 · ${job.model_mode === "docker" ? `Docker ${escapeHtml(job.docker_image)}` : "本地 Claude CLI"}</span></div><div class="job-actions">${job.can_retry ? `<button class="button secondary compact" type="button" data-pipeline-retry="${job.id}"><i data-lucide="rotate-ccw"></i>从失败处重试</button>` : ""}<span class="job-status">${escapeHtml(pipelineStatus(job.status))}</span></div></div>
       <div class="pipeline-job-meta"><span>质检并发 ${job.qc_concurrency}</span><span>模型并发 ${job.model_concurrency}</span><span>交付并发 ${job.codex_concurrency}</span>${job.retry_of_job_id ? `<span>重试自 #${job.retry_of_job_id}</span>` : ""}<span>${escapeHtml(formatDate(job.created_at))}</span></div>
       <div class="pipeline-item-grid">${(job.items || []).map((item) => `<span class="pipeline-item status-${escapeHtml(item.status.replaceAll("_", "-"))} health-${escapeHtml(item.health_status || "unknown")}"${item.error ? ` title="${escapeHtml(item.error)}"` : ""}><span>第 ${item.question_no} 题：${escapeHtml(pipelineItemLabel(item))}</span>${item.status === "model_running" && item.health_detail ? `<small>${escapeHtml(item.health_detail)} · 最近活动 ${escapeHtml(formatDate(item.activity_at || item.heartbeat_at))}</small>` : ""}</span>`).join("")}</div>
       ${job.can_retry ? `<div class="job-actions"><button class="button secondary compact" type="button" data-author-retry="${job.id}"><i data-lucide="rotate-ccw"></i>从失败处重试</button></div>` : ""}
@@ -755,6 +756,7 @@ $("#settings-form").addEventListener("submit", async (event) => {
         qc_concurrency: Number($("#config-qc-concurrency").value),
         model_concurrency: Number($("#config-model-concurrency").value),
         codex_concurrency: Number($("#config-codex-concurrency").value),
+        model_mode: $("#config-model-mode").value,
       }),
     });
     state.config = result.config;

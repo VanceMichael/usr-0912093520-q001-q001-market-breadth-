@@ -82,6 +82,13 @@ def build_docker_claude_command(
     ]
 
 
+def build_local_claude_command(claude: str, prompt: str) -> list[str]:
+    return [
+        claude, "--print", "--dangerously-skip-permissions",
+        "--permission-mode", "bypassPermissions", "--permission-prompts", "none", prompt,
+    ]
+
+
 class Pipeline:
     def __init__(self, database: Path, batch: str, job_id: int, emit) -> None:
         self.database = database.resolve()
@@ -378,9 +385,25 @@ class Pipeline:
         self.log("环境检测通过：Docker 引擎、非 root Claude 用户和 Claude CLI 均可用")
         return version_text(result.stdout)
 
+    def local_preflight(self, command: str) -> str:
+        claude = shutil.which(command) or (command if Path(command).is_file() else None)
+        if not claude:
+            raise RuntimeError("未找到本地 Claude CLI")
+        result = subprocess.run(
+            [claude, "--version"], text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, check=False, timeout=30,
+        )
+        if result.returncode:
+            raise RuntimeError("本地 Claude CLI 无法运行：" + result.stdout.strip()[-500:])
+        version = version_text(result.stdout)
+        if version == "0.0.0":
+            raise RuntimeError("本地 Claude CLI 未返回有效版本")
+        self.log(f"环境检测通过：本地 Claude CLI {version}")
+        return version
+
     def run_model(
         self, row: sqlite3.Row, image: str, command: str, model_version: str,
-        config: dict[str, str],
+        config: dict[str, str], model_mode: str = "local",
     ) -> None:
         assert self.pipeline_root is not None
         question_id = int(row["id"])
@@ -400,8 +423,10 @@ class Pipeline:
         self.item(
             question_id, status="model_running", started_at=launch_time,
             heartbeat_at=launch_time, activity_at=launch_time,
-            health_status="starting", health_detail="正在启动 Claude 容器",
+            health_status="starting", health_detail="正在启动本地 Claude CLI" if model_mode == "local" else "正在启动 Claude 容器",
         )
+        if model_mode == "local":
+            return self.run_local_model(row, command, trajectory_root, launch_time, config)
         docker = shutil.which("docker") or "docker"
         host_workspace = str(folder)
         host_home = str(trajectory_root)
@@ -486,6 +511,52 @@ class Pipeline:
             health_detail="Claude 容器已正常完成", finished_at=finished,
         )
 
+    def run_local_model(
+        self, row: sqlite3.Row, command: str, trajectory_root: Path,
+        launch_time: str, config: dict[str, str],
+    ) -> None:
+        question_id = int(row["id"])
+        claude = shutil.which(command) or command
+        command_line = build_local_claude_command(claude, row["prompt"])
+        env = os.environ.copy()
+        env.update({
+            "ANTHROPIC_BASE_URL": config["CC_SWITCH_BASE_URL"],
+            "ANTHROPIC_AUTH_TOKEN": config["CC_SWITCH_API_KEY"],
+            "ANTHROPIC_MODEL": config["CC_SWITCH_MODEL"],
+            "CLAUDE_CONFIG_DIR": str(trajectory_root),
+            "CI": "1",
+        })
+        self.log(f"题目 {row['task_id']}：启动本地 Claude CLI（仅传 SQLite 原始 Prompt）")
+        process = subprocess.Popen(
+            command_line, cwd=Path(row["folder_path"]), env=env, text=True,
+            encoding="utf-8", errors="replace", stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        assert process.stdout is not None
+        output = ""
+        for line in process.stdout:
+            line = line.rstrip()
+            if not line:
+                continue
+            output = (output + line + "\n")[-OUTPUT_LIMIT:]
+            now = timestamp()
+            self.item(
+                question_id, output=output.rstrip(), heartbeat_at=now,
+                activity_at=now, health_status="healthy",
+                health_detail="本地 Claude CLI 运行正常，刚刚产生新输出",
+            )
+            self.log(f"[{row['task_id']}] {line}")
+        returncode = process.wait(timeout=86400)
+        finished = timestamp()
+        if returncode:
+            error = f"本地 Claude CLI 退出码：{returncode}"
+            self.item(question_id, status="failed", error=error, finished_at=finished, health_status="failed", health_detail=error)
+            raise RuntimeError(f"{row['task_id']} 模型运行失败：{error}")
+        with closing(self.db()) as connection:
+            connection.execute("UPDATE questions SET status='completed', updated_at=? WHERE id=?", (finished, question_id))
+            connection.commit()
+        self.item(question_id, status="model_completed", heartbeat_at=finished, activity_at=finished, health_status="completed", health_detail="本地 Claude CLI 已正常完成", finished_at=finished)
+
     @staticmethod
     def docker_run_health(
         docker: str, container_name: str, trajectory_root: Path, fallback_activity: str,
@@ -529,12 +600,13 @@ class Pipeline:
 
     def model_stage(
         self, image: str, command: str, concurrency: int, model_version: str,
-        rows: list[sqlite3.Row], config: dict[str, str],
+        rows: list[sqlite3.Row], config: dict[str, str], model_mode: str = "local",
     ) -> None:
-        self.log(f"阶段 2/4：Docker Claude CLI 并行跑题，并发数 {concurrency}")
-        with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="claude-docker") as pool:
+        label = "本地 Claude CLI" if model_mode == "local" else "Docker Claude CLI"
+        self.log(f"阶段 2/4：{label}并行跑题，并发数 {concurrency}")
+        with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="claude-model") as pool:
             futures = {
-                pool.submit(self.run_model, row, image, command, model_version, config): row
+                pool.submit(self.run_model, row, image, command, model_version, config, model_mode): row
                 for row in rows
             }
             errors = []
@@ -784,7 +856,7 @@ class Pipeline:
             raise RuntimeError(f"{row['task_id']} 恢复后工作区仍不是干净初始快照")
         self.log(f"题目 {row['task_id']}：重试前已恢复到初始快照 {baseline}")
 
-    def execute(self, image: str, command: str, qc_concurrency: int, model_concurrency: int, codex_concurrency: int) -> None:
+    def execute(self, image: str, command: str, qc_concurrency: int, model_concurrency: int, codex_concurrency: int, model_mode: str = "local") -> None:
         with closing(self.db()) as connection:
             batch = connection.execute("SELECT * FROM batches WHERE name=?", (self.batch,)).fetchone()
             rows = question_rows(connection, self.batch)
@@ -810,7 +882,9 @@ class Pipeline:
         config = self.runtime_config()
         self.log("阶段 0/4：检查并修复运行环境")
         self.codex_preflight()
-        model_version = self.docker_preflight(image, command)
+        if model_mode not in {"local", "docker"}:
+            raise ValueError("模型运行方式必须是 local 或 docker")
+        model_version = self.local_preflight(command) if model_mode == "local" else self.docker_preflight(image, command)
         self.ensure_active()
         qc_pending = [row for row in rows if not self.question_qc_passed(row)]
         qc_pending_ids = {int(row["id"]) for row in qc_pending}
@@ -845,7 +919,7 @@ class Pipeline:
             if retry_of_job_id is not None:
                 for row in model_pending:
                     self.restore_question_workspace(row)
-            self.model_stage(image, command, model_concurrency, model_version, model_pending, config)
+            self.model_stage(image, command, model_concurrency, model_version, model_pending, config, model_mode)
         else:
             self.log("阶段 2/4：模型跑题已有成功结果，跳过")
         self.ensure_active()
@@ -884,6 +958,7 @@ def main() -> int:
     parser.add_argument("--job-id", type=int, required=True)
     parser.add_argument("--image", required=True)
     parser.add_argument("--claude-command", default="claude")
+    parser.add_argument("--model-mode", choices=("local", "docker"), default="local")
     parser.add_argument("--model-concurrency", type=int, default=2)
     parser.add_argument("--qc-concurrency", type=int, default=2)
     parser.add_argument("--codex-concurrency", type=int, default=2)
@@ -900,7 +975,7 @@ def main() -> int:
                 print("流水线任务已不再处于可运行状态", file=sys.stderr)
                 return 130
         runner = Pipeline(args.db, args.batch, args.job_id, print)
-        runner.execute(args.image, args.claude_command, max(1, min(args.qc_concurrency, 8)), max(1, min(args.model_concurrency, 8)), max(1, min(args.codex_concurrency, 8)))
+        runner.execute(args.image, args.claude_command, max(1, min(args.qc_concurrency, 8)), max(1, min(args.model_concurrency, 8)), max(1, min(args.codex_concurrency, 8)), args.model_mode)
         runner.set_job(status="completed", finished_at=timestamp(), last_message="全流程完成")
         return 0
     except PipelineInterrupted as exc:

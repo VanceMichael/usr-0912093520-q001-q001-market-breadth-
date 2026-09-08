@@ -36,6 +36,7 @@ ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 ENV_KEYS = ("CC_SWITCH_BASE_URL", "CC_SWITCH_MODEL", "CC_SWITCH_API_KEY", "CC_USR_SUBMITTER")
 PIPELINE_ENV_KEYS = (
     "CC_CLAUDE_DOCKER_IMAGE", "CC_CLAUDE_DOCKER_COMMAND",
+    "CC_PIPELINE_MODEL_MODE",
     "CC_PIPELINE_QC_CONCURRENCY", "CC_PIPELINE_MODEL_CONCURRENCY",
     "CC_PIPELINE_CODEX_CONCURRENCY",
 )
@@ -75,6 +76,7 @@ CREATE TABLE IF NOT EXISTS pipeline_jobs (
     codex_concurrency INTEGER NOT NULL DEFAULT 2,
     docker_image TEXT NOT NULL,
     docker_command TEXT NOT NULL DEFAULT 'claude',
+    model_mode TEXT NOT NULL DEFAULT 'local',
     status TEXT NOT NULL DEFAULT 'queued',
     output TEXT NOT NULL DEFAULT '',
     last_message TEXT NOT NULL DEFAULT '',
@@ -210,6 +212,10 @@ class ConsoleData:
             if "retry_of_job_id" not in columns:
                 connection.execute(
                     "ALTER TABLE pipeline_jobs ADD COLUMN retry_of_job_id INTEGER REFERENCES pipeline_jobs(id) ON DELETE SET NULL"
+                )
+            if "model_mode" not in columns:
+                connection.execute(
+                    "ALTER TABLE pipeline_jobs ADD COLUMN model_mode TEXT NOT NULL DEFAULT 'local'"
                 )
             item_columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(pipeline_items)")
@@ -378,6 +384,7 @@ class ConsoleData:
             jobs = connection.execute(
                 "SELECT p.id,p.batch_name,p.question_count,p.qc_concurrency,p.model_concurrency,"
                 "p.codex_concurrency,p.docker_image,p.docker_command,p.status,"
+                "p.model_mode,"
                 "substr(p.output,-30000) AS output,length(p.output) AS output_length,"
                 "p.last_message,p.error,p.pid,p.retry_of_job_id,p.created_at,p.started_at,p.finished_at "
                 "FROM pipeline_jobs p WHERE p.id=(SELECT MAX(latest.id) FROM pipeline_jobs latest "
@@ -445,6 +452,9 @@ class ConsoleData:
                 raise ValueError("该批次已有模型运行记录；一键全流程仅用于尚未跑题的新批次")
             image = values.get("CC_CLAUDE_DOCKER_IMAGE", "").strip() or "claude-cli:latest"
             command = values.get("CC_CLAUDE_DOCKER_COMMAND", "claude").strip() or "claude"
+            model_mode = values.get("CC_PIPELINE_MODEL_MODE", "local").strip().lower() or "local"
+            if model_mode not in {"local", "docker"}:
+                raise ValueError("模型运行方式必须是 local 或 docker")
             def concurrency(key: str, default: int) -> int:
                 try:
                     return max(1, min(int(values.get(key, str(default))), 8))
@@ -455,9 +465,9 @@ class ConsoleData:
             codex_concurrency = concurrency("CC_PIPELINE_CODEX_CONCURRENCY", 2)
             created = datetime.now().astimezone().isoformat(timespec="seconds")
             cursor = connection.execute(
-                "INSERT INTO pipeline_jobs(batch_name,question_count,qc_concurrency,model_concurrency,codex_concurrency,docker_image,docker_command,created_at) "
-                "VALUES(?,?,?,?,?,?,?,?)",
-                (batch, len(rows), qc_concurrency, model_concurrency, codex_concurrency, image, command, created),
+                "INSERT INTO pipeline_jobs(batch_name,question_count,qc_concurrency,model_concurrency,codex_concurrency,docker_image,docker_command,model_mode,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (batch, len(rows), qc_concurrency, model_concurrency, codex_concurrency, image, command, model_mode, created),
             )
             job_id = int(cursor.lastrowid)
             connection.executemany(
@@ -468,7 +478,7 @@ class ConsoleData:
         script = self.project_root / "tools" / "auto_pipeline.py"
         self.pipeline_executor.submit(
             self._run_pipeline_process, job_id, batch, image, command,
-            qc_concurrency, model_concurrency, codex_concurrency, script,
+            qc_concurrency, model_concurrency, codex_concurrency, model_mode, script,
         )
         return {"ok": True, "job_id": job_id, "message": f"一键流水线 #{job_id} 已启动"}
 
@@ -509,12 +519,12 @@ class ConsoleData:
             created = datetime.now().astimezone().isoformat(timespec="seconds")
             cursor = connection.execute(
                 "INSERT INTO pipeline_jobs(batch_name,question_count,qc_concurrency,model_concurrency,"
-                "codex_concurrency,docker_image,docker_command,retry_of_job_id,created_at,output,last_message) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                "codex_concurrency,docker_image,docker_command,model_mode,retry_of_job_id,created_at,output,last_message) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     source["batch_name"], len(rows), source["qc_concurrency"],
                     source["model_concurrency"], source["codex_concurrency"],
-                    source["docker_image"], source["docker_command"], source_job_id,
+                    source["docker_image"], source["docker_command"], source["model_mode"], source_job_id,
                     created, f"从失败任务 #{source_job_id} 继续执行\n",
                     f"等待从任务 #{source_job_id} 的失败位置继续",
                 ),
@@ -529,7 +539,7 @@ class ConsoleData:
         self.pipeline_executor.submit(
             self._run_pipeline_process, job_id, source["batch_name"], source["docker_image"],
             source["docker_command"], int(source["qc_concurrency"]),
-            int(source["model_concurrency"]), int(source["codex_concurrency"]), script,
+            int(source["model_concurrency"]), int(source["codex_concurrency"]), source["model_mode"], script,
         )
         return {
             "ok": True,
@@ -538,13 +548,18 @@ class ConsoleData:
             "message": f"重试任务 #{job_id} 已从失败位置启动",
         }
 
-    def _run_pipeline_process(self, job_id: int, batch: str, image: str, command: str, qc_concurrency: int, model_concurrency: int, codex_concurrency: int, script: Path) -> None:
+    def _run_pipeline_process(self, job_id: int, batch: str, image: str, command: str, qc_concurrency: int, model_concurrency: int, codex_concurrency: int, model_mode: str, script: Path) -> None:
         flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
         try:
             process = subprocess.Popen(
-                [sys.executable, str(script), "--db", str(self.database), "--batch", batch,
-                 "--job-id", str(job_id), "--image", image, "--claude-command", command,
-                 "--qc-concurrency", str(qc_concurrency), "--model-concurrency", str(model_concurrency), "--codex-concurrency", str(codex_concurrency)],
+                [
+                    sys.executable, str(script), "--db", str(self.database), "--batch", batch,
+                    "--job-id", str(job_id), "--image", image, "--claude-command", command,
+                    "--model-mode", model_mode,
+                    "--qc-concurrency", str(qc_concurrency),
+                    "--model-concurrency", str(model_concurrency),
+                    "--codex-concurrency", str(codex_concurrency),
+                ],
                 cwd=self.project_root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="replace", creationflags=flags,
                 start_new_session=os.name != "nt",
@@ -887,6 +902,7 @@ class ConsoleData:
             **runtime_info(),
             "docker_image": values.get("CC_CLAUDE_DOCKER_IMAGE", "").strip() or "claude-cli:latest",
             "docker_command": values.get("CC_CLAUDE_DOCKER_COMMAND", "").strip() or "claude",
+            "model_mode": values.get("CC_PIPELINE_MODEL_MODE", "local").strip().lower() or "local",
             "qc_concurrency": env_int("CC_PIPELINE_QC_CONCURRENCY", 2),
             "model_concurrency": env_int("CC_PIPELINE_MODEL_CONCURRENCY", 2),
             "codex_concurrency": env_int("CC_PIPELINE_CODEX_CONCURRENCY", 2),
@@ -915,6 +931,32 @@ class ConsoleData:
             except (OSError, subprocess.TimeoutExpired) as exc:
                 codex_detail = f"Codex CLI 无法运行：{exc}"
         add("Codex CLI", codex_ok, codex_detail)
+        mode = self.read_env().get("CC_PIPELINE_MODEL_MODE", "local").strip().lower() or "local"
+        if mode not in {"local", "docker"}:
+            add("模型运行方式", False, "必须是 local 或 docker")
+            mode = "local"
+        if mode == "local":
+            command = self.read_env().get("CC_CLAUDE_DOCKER_COMMAND", "claude").strip() or "claude"
+            claude = shutil.which(command) or (command if Path(command).is_file() else None)
+            claude_ok = False
+            claude_detail = str(claude or f"未找到本地 Claude CLI：{command}")
+            if claude:
+                try:
+                    probe = subprocess.run(
+                        [claude, "--version"], text=True, stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT, check=False, timeout=30,
+                    )
+                    claude_ok = probe.returncode == 0 and bool(probe.stdout.strip())
+                    claude_detail = probe.stdout.strip()[-300:] or claude_detail
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    claude_detail = str(exc)
+            add("本地 Claude CLI", claude_ok, claude_detail)
+            return {
+                "ok": all(bool(check["ok"]) for check in checks),
+                "checked_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+                "checks": checks, "repair_attempted": repair,
+                "repair_messages": repair_messages,
+            }
         docker = shutil.which("docker")
         add("Docker CLI", bool(docker), str(docker or "未找到 docker，请安装 Docker Desktop"))
         image = self.read_env().get("CC_CLAUDE_DOCKER_IMAGE", "").strip() or "claude-cli:latest"
@@ -999,13 +1041,15 @@ class ConsoleData:
     @staticmethod
     def _validate_env_input(values: dict[str, object]) -> dict[str, str]:
         result = {}
-        for field in ("base_url", "model", "api_key", "submitter", "docker_image", "docker_command"):
+        for field in ("base_url", "model", "api_key", "submitter", "docker_image", "docker_command", "model_mode"):
             value = values.get(field, "")
             if not isinstance(value, str) or "\x00" in value or "\n" in value or "\r" in value:
                 raise ValueError(f"{field} 配置无效")
             result[field] = value.strip()
         if not result["base_url"] or not result["model"] or not result["submitter"]:
             raise ValueError("中转 URL、模型名和提交人不能为空")
+        if result["model_mode"] not in {"local", "docker"}:
+            raise ValueError("model_mode must be local or docker")
         parsed = urlparse(result["base_url"])
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
             raise ValueError("中转 URL 必须是完整的 http(s) 地址")
@@ -1026,6 +1070,7 @@ class ConsoleData:
             "submitter": body.get("submitter", current["CC_USR_SUBMITTER"]),
             "docker_image": body.get("docker_image", current.get("CC_CLAUDE_DOCKER_IMAGE", "claude-cli:latest")),
             "docker_command": body.get("docker_command", current.get("CC_CLAUDE_DOCKER_COMMAND", "claude")),
+            "model_mode": body.get("model_mode", current.get("CC_PIPELINE_MODEL_MODE", "local")) or "local",
         }
         values = self._validate_env_input(incoming)
         concurrency_values = {}
@@ -1057,6 +1102,7 @@ class ConsoleData:
             "CC_USR_SUBMITTER": values["submitter"],
             "CC_CLAUDE_DOCKER_IMAGE": values["docker_image"],
             "CC_CLAUDE_DOCKER_COMMAND": values["docker_command"],
+            "CC_PIPELINE_MODEL_MODE": values["model_mode"],
             **concurrency_values,
         }
         lines = self.env_file.read_text(encoding="utf-8").splitlines() if self.env_file.exists() else []
