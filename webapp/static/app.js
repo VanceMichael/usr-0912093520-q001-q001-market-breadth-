@@ -10,6 +10,7 @@ const state = {
   config: null,
   environment: null,
   authorJobs: [],
+  mothers: [],
   pipelineJobs: [],
 };
 let drawerCloseTimer = null;
@@ -130,7 +131,6 @@ function renderRows() {
         <button class="icon-button" data-action="detail" title="查看详情" aria-label="查看详情"><i data-lucide="eye"></i></button>
         <button class="icon-button" data-action="copy" title="复制 Prompt" aria-label="复制 Prompt"><i data-lucide="copy"></i></button>
         <button class="icon-button" data-action="folder" title="打开题目目录" aria-label="打开题目目录"><i data-lucide="folder-open"></i></button>
-        ${question.run_count === 0 ? `<button class="icon-button" data-action="single-pipeline" title="单题跑全流程" aria-label="单题跑全流程"><i data-lucide="play-circle"></i></button>` : ""}
       </div></td>
     </tr>`;
   }).join("");
@@ -193,7 +193,6 @@ function renderSettings() {
   $("#config-qc-concurrency").value = state.config.qc_concurrency || 2;
   $("#config-model-concurrency").value = state.config.model_concurrency || 2;
   $("#config-codex-concurrency").value = state.config.codex_concurrency || 2;
-  $("#config-model-mode").value = state.config.model_mode || "local";
 }
 
 function renderEnvironment() {
@@ -243,13 +242,13 @@ function pipelineStatus(status) {
   })[status] || status;
 }
 
-function pipelineItemLabel(item, modelMode = "local") {
+function pipelineItemLabel(item) {
   if (item.status !== "model_running") return pipelineStatus(item.status);
   return ({
-    starting: modelMode === "docker" ? "模型容器启动中" : "本地 Claude CLI 启动中",
+    starting: "模型容器启动中",
     healthy: "模型运行正常",
     idle: "模型运行中，暂时无新轨迹",
-    unavailable: modelMode === "docker" ? "模型容器状态异常" : "本地 Claude CLI 状态异常",
+    unavailable: "模型容器状态异常",
     stalled: "模型运行已停滞",
   })[item.health_status] || "模型运行中，等待健康确认";
 }
@@ -269,9 +268,9 @@ function renderPipelineJobs() {
   }
   list.innerHTML = state.pipelineJobs.map((job) => `
     <article class="pipeline-job status-${escapeHtml(job.status)}">
-      <div class="pipeline-job-head"><div><strong>#${job.id} · ${escapeHtml(job.batch_name)}</strong><span>${job.question_count} 题 · ${job.model_mode === "docker" ? `Docker ${escapeHtml(job.docker_image)}` : "本地 Claude CLI"}</span></div><div class="job-actions">${job.can_retry ? `<button class="button secondary compact" type="button" data-pipeline-retry="${job.id}"><i data-lucide="rotate-ccw"></i>从失败处重试</button>` : ""}<span class="job-status">${escapeHtml(pipelineStatus(job.status))}</span></div></div>
+      <div class="pipeline-job-head"><div><strong>#${job.id} · ${escapeHtml(job.batch_name)}</strong><span>${job.question_count} 题 · Docker ${escapeHtml(job.docker_image)}</span></div><div class="job-actions">${job.can_retry ? `<button class="button secondary compact" type="button" data-pipeline-retry="${job.id}"><i data-lucide="rotate-ccw"></i>从失败处重试</button>` : ""}<span class="job-status">${escapeHtml(pipelineStatus(job.status))}</span></div></div>
       <div class="pipeline-job-meta"><span>质检并发 ${job.qc_concurrency}</span><span>模型并发 ${job.model_concurrency}</span><span>交付并发 ${job.codex_concurrency}</span>${job.retry_of_job_id ? `<span>重试自 #${job.retry_of_job_id}</span>` : ""}<span>${escapeHtml(formatDate(job.created_at))}</span></div>
-      <div class="pipeline-item-grid">${(job.items || []).map((item) => `<span class="pipeline-item status-${escapeHtml(item.status.replaceAll("_", "-"))} health-${escapeHtml(item.health_status || "unknown")}"${item.error ? ` title="${escapeHtml(item.error)}"` : ""}><span>第 ${item.question_no} 题：${escapeHtml(pipelineItemLabel(item, job.model_mode))}</span>${item.status === "model_running" && item.health_detail ? `<small>${escapeHtml(item.health_detail)} · 最近活动 ${escapeHtml(formatDate(item.activity_at || item.heartbeat_at))}</small>` : ""}</span>`).join("")}</div>
+      <div class="pipeline-item-grid">${(job.items || []).map((item) => `<span class="pipeline-item status-${escapeHtml(item.status.replaceAll("_", "-"))} health-${escapeHtml(item.health_status || "unknown")}"${item.error ? ` title="${escapeHtml(item.error)}"` : ""}><span>第 ${item.question_no} 题：${escapeHtml(pipelineItemLabel(item))}</span>${item.status === "model_running" && item.health_detail ? `<small>${escapeHtml(item.health_detail)} · 最近活动 ${escapeHtml(formatDate(item.activity_at || item.heartbeat_at))}</small>` : ""}</span>`).join("")}</div>
       ${job.can_retry ? `<div class="job-actions"><button class="button secondary compact" type="button" data-author-retry="${job.id}"><i data-lucide="rotate-ccw"></i>从失败处重试</button></div>` : ""}
       ${job.error ? `<div class="author-job-error">${escapeHtml(job.error)}</div>` : ""}
       <pre class="author-job-output">${escapeHtml(job.output || job.last_message || "等待流水线启动...")}</pre>
@@ -330,7 +329,7 @@ async function loadPipelineJobs() {
 async function startAutoPipeline() {
   const button = $("#auto-pipeline-button");
   if (!state.batch) return;
-  openModal("一键全流程", `将对批次 ${state.batch} 执行 Codex 题目质检、Claude 并行跑题、Codex 交付生产、交付质检和 Excel 导出。`, "开始执行", async () => {
+  openModal("一键全流程", `将对批次 ${state.batch} 执行 Codex 题目质检、Docker Claude 并行跑题、Codex 交付生产、交付质检和 Excel 导出。`, "开始执行", async () => {
     closeModal();
     const original = button.innerHTML;
     button.disabled = true;
@@ -359,7 +358,7 @@ function renderAuthorJobs() {
   list.innerHTML = state.authorJobs.map((job) => `
     <article class="author-job status-${escapeHtml(job.status)}">
       <div class="author-job-head"><div><strong>#${job.id} · ${escapeHtml(job.batch_name)}</strong><span>${job.question_count} 题 · 创建于 ${escapeHtml(formatDate(job.created_at))}</span></div><span class="job-status">${escapeHtml(authorJobStatus(job))}</span></div>
-      <div class="author-job-meta"><span>开始：${escapeHtml(formatDate(job.started_at))}</span><span>结束：${escapeHtml(formatDate(job.finished_at))}</span><span>PID：${escapeHtml(job.pid || "-")}</span></div>
+      <div class="author-job-meta"><span>${job.author_mode === "derived" ? `派生 · ${escapeHtml(job.task_type || "非 0-1")}` : "0-1 新建母题"}</span><span>开始：${escapeHtml(formatDate(job.started_at))}</span><span>结束：${escapeHtml(formatDate(job.finished_at))}</span><span>PID：${escapeHtml(job.pid || "-")}</span></div>
       ${job.error ? `<div class="author-job-error">${escapeHtml(job.error)}</div>` : ""}
       <pre class="author-job-output">${escapeHtml(job.output || job.last_message || "等待 Codex CLI 启动...")}</pre>
     </article>`).join("");
@@ -390,6 +389,36 @@ function startSinglePipeline(question, button) {
       refreshIcons();
     }
   });
+}
+
+function selectedAuthorMode() {
+  return document.querySelector('input[name="author-mode"]:checked')?.value || "0-1";
+}
+
+function renderMotherLibrary() {
+  const select = $("#author-mother");
+  if (!select) return;
+  const selected = select.value;
+  select.innerHTML = '<option value="">请选择已通过基础检查的母项目</option>' + state.mothers.map((mother) =>
+    `<option value="${mother.id}">${escapeHtml(mother.title)} · ${escapeHtml(mother.source_task_id)} · 已用 ${mother.use_count} 次</option>`
+  ).join("");
+  if (state.mothers.some((mother) => String(mother.id) === selected)) select.value = selected;
+  const mother = state.mothers.find((item) => String(item.id) === select.value);
+  $("#mother-summary").textContent = mother
+    ? `代码路径：${mother.workspace_path}\nGit 地址：${mother.repo_url || "尚未登记"}\n初始快照：${mother.initial_snapshot || "尚未登记"}\n已派生使用：${mother.use_count} 次 · Bug 修复${mother.bugfix_ready ? "可用" : "不可用"} · Feature 迭代${mother.iteration_ready ? "可用" : "不可用"}`
+    : "选择母库项目后显示代码路径、Git 地址、初始快照和使用次数。";
+}
+
+function renderAuthorMode() {
+  const derived = selectedAuthorMode() === "derived";
+  $("#derived-author-fields").hidden = !derived;
+  renderMotherLibrary();
+  renderAuthorCommand();
+}
+
+function renderMotherModeAndCommand() {
+  renderMotherLibrary();
+  renderAuthorCommand();
 }
 
 function retryAuthorJob(jobId) {
@@ -436,6 +465,14 @@ async function loadAuthorJobs() {
   }
 }
 
+async function loadMothers() {
+  try {
+    const result = await api("/api/mother-library");
+    state.mothers = result.mothers || [];
+    renderMotherLibrary();
+  } catch (error) { toast(error.message, true); }
+}
+
 async function startCodexAuthorJob() {
   const button = $("#codex-author-button");
   const body = {
@@ -444,6 +481,11 @@ async function startCodexAuthorJob() {
     business: $("#author-business").value.trim(),
     technology: $("#author-technology").value.trim(),
     notes: $("#author-notes").value.trim(),
+    mode: selectedAuthorMode(),
+    task_type: $("#author-task-type").value,
+    mother_id: $("#author-mother").value ? Number($("#author-mother").value) : null,
+    derived_notes: $("#author-derived-notes").value.trim(),
+    defect_tolerance: $("#author-defect-tolerance").value.trim(),
   };
   button.disabled = true;
   const original = button.innerHTML;
@@ -562,6 +604,14 @@ function authorPrompt() {
   const business = $("#author-business").value.trim().replace(/\s+/g, " ");
   const technology = $("#author-technology").value.trim().replace(/\s+/g, " ");
   const notes = $("#author-notes").value.trim().replace(/\s+/g, " ");
+  const mode = selectedAuthorMode();
+  if (mode === "derived") {
+    const mother = state.mothers.find((item) => String(item.id) === $("#author-mother").value);
+    const taskType = $("#author-task-type").value;
+    const derivedNotes = $("#author-derived-notes").value.trim().replace(/\s+/g, " ");
+    const tolerance = $("#author-defect-tolerance").value.trim().replace(/\s+/g, " ");
+    return `使用 $cc-usr-question-author 基于母库生成派生题目。\n批次名：${batch}\n题目数量：${count}\n题型：${taskType}\n母库项目：${mother ? `${mother.title}（ID ${mother.id}，代码路径 ${mother.workspace_path}，Git ${mother.repo_url || "待登记"}，已用 ${mother.use_count} 次）` : "<请选择母库项目>"}\n派生方向：${derivedNotes || "围绕母项目已有业务设计真实的后续工作"}\n可接受的小瑕疵：${tolerance || "允许不影响构建和主要流程的小问题，并记录为可迭代方向"}\n出题要求：${[business && `业务关键词：${business}`, technology && `技术关键词：${technology}`, notes && `补充要求：${notes}`].filter(Boolean).join("；") || "<填写出题关键词>"}\n严格遵守项目规范和母库引用规则，保留母题关系并完成独立快照与质检，不要启动目标模型。`;
+  }
   const requirements = [
     business && `业务关键词：${business}`,
     technology && `技术关键词：${technology}`,
@@ -715,7 +765,6 @@ $("#question-rows").addEventListener("click", async (event) => {
   if (button.dataset.action === "folder") {
     executeAction("/api/actions/open", { kind: "question", id }, button, `已打开 ${question.task_id} 目录`).catch(() => {});
   }
-  if (button.dataset.action === "single-pipeline") startSinglePipeline(question, button);
 });
 $("#open-batch").addEventListener("click", () => executeAction("/api/actions/open", { kind: "batch", id: state.batch }, $("#open-batch"), "批次目录已打开").catch(() => {}));
 $("#qc-check").addEventListener("click", async () => {
@@ -734,6 +783,9 @@ $("#launch-button").addEventListener("click", () => {
   });
 });
 $("#author-form").addEventListener("input", renderAuthorCommand);
+document.querySelectorAll('input[name="author-mode"]').forEach((input) => input.addEventListener("change", renderAuthorMode));
+$("#author-mother").addEventListener("change", renderMotherModeAndCommand);
+$("#author-task-type").addEventListener("change", renderAuthorCommand);
 $("#author-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   await copyText(authorPrompt(), "出题命令已复制", false);
@@ -783,7 +835,6 @@ $("#settings-form").addEventListener("submit", async (event) => {
         qc_concurrency: Number($("#config-qc-concurrency").value),
         model_concurrency: Number($("#config-model-concurrency").value),
         codex_concurrency: Number($("#config-codex-concurrency").value),
-        model_mode: $("#config-model-mode").value,
       }),
     });
     state.config = result.config;
@@ -844,4 +895,5 @@ loadDashboard();
 loadConfig();
 loadEnvironment();
 loadAuthorJobs();
+loadMothers();
 loadPipelineJobs();

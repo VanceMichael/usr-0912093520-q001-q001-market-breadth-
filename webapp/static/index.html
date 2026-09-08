@@ -114,6 +114,18 @@
             <label class="settings-field"><span>批次名</span><input id="author-batch" name="batch" required minlength="2" maxlength="32" pattern="[A-Za-z0-9][A-Za-z0-9_-]{1,31}" placeholder="例如 0911"></label>
             <label class="settings-field"><span>题目数量</span><input id="author-count" name="count" type="number" required min="1" max="20" value="10"></label>
           </div>
+          <fieldset class="author-mode"><legend>出题模式</legend><label><input type="radio" name="author-mode" value="0-1" checked><span>0-1 新建母题</span></label><label><input type="radio" name="author-mode" value="derived"><span>基于母库生成其他题型</span></label></fieldset>
+          <div id="derived-author-fields" hidden>
+            <div class="author-keywords">
+              <label class="settings-field"><span>母库项目</span><select id="author-mother" name="mother_id"><option value="">请选择已通过基础检查的母项目</option></select></label>
+              <label class="settings-field"><span>派生题型</span><select id="author-task-type" name="task_type"><option>Bug 修复</option><option>Feature 迭代</option><option>代码理解</option><option>代码重构</option><option>工程化</option><option>代码测试</option></select></label>
+            </div>
+            <div class="mother-summary" id="mother-summary">选择母库项目后显示代码路径、Git 地址、初始快照和使用次数。</div>
+            <div class="author-keywords">
+              <label class="settings-field"><span>派生方向</span><input id="author-derived-notes" maxlength="2000" placeholder="例如围绕已有预约流程增加取消与补偿处理"></label>
+              <label class="settings-field"><span>可接受的小瑕疵</span><input id="author-defect-tolerance" maxlength="1000" placeholder="例如允许不影响构建的小问题，并记录为后续方向"></label>
+            </div>
+          </div>
           <div class="author-keywords">
             <label class="settings-field"><span>业务关键词</span><input id="author-business" name="business" required maxlength="500" placeholder="例如 本地新闻、城市服务、空间租赁"></label>
             <label class="settings-field"><span>技术关键词</span><input id="author-technology" name="technology" maxlength="500" placeholder="例如 Go、React、SQLite、Docker"></label>

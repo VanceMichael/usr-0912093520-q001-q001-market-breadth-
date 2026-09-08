@@ -5,6 +5,7 @@ Use an internal JSON object only as input to `tools/batch_pipeline.py create-bat
 ```json
 {
   "batch": "0911",
+  "author_mode": "0-1",
   "brief": "用户给出的本批次出题要求",
   "questions": [
     {
@@ -20,13 +21,16 @@ Use an internal JSON object only as input to `tools/batch_pipeline.py create-bat
       "reproducibility": "无外部依赖",
       "expected_areas": ["api", "web"],
       "difficulty_evidence": ["需要追踪跨模块状态流"],
-      "similarity_tags": ["domain", "state-transition"]
+      "similarity_tags": ["domain", "state-transition"],
+      "mother_id": null
     }
   ]
 }
 ```
 
-For batch authoring, every first-turn `task_type` must be `0-1 代码生成`. Other task types remain valid only for later conversation turns and delivery records; they are not accepted by `create-batch`.
+`author_mode` is required in new specs and defaults to `0-1` for older callers. In `0-1` mode every first-turn `task_type` must be `0-1 代码生成`; successful source rows are registered in `mother_library`. In `derived` mode, `mother_id` must reference an existing mother row and each first-turn task must use a non-0-1 type, such as `Bug 修复` or `Feature 迭代`. `create-batch` records `questions.mother_id`, one `mother_usages` row per derived question, and increments `mother_library.use_count` transactionally. The derived Prompt remains a new first-turn requirement in its own workspace; it is not a later conversational turn copied from the mother.
+
+The mother row is the source of truth for the original 0-1 Prompt, local workspace, GitHub URL, immutable snapshot, local SHA, usage count, recent usage, readiness flags, and defect notes. A small known defect may be retained and used as the subject of a bug-fix or iteration task. Do not reject it unless the project cannot build/start, the repository or snapshot is inaccessible/mismatched, or the requested derived behavior cannot be isolated.
 
 Allowed first-turn difficulties: `中等`, `困难`, `地狱`.
 

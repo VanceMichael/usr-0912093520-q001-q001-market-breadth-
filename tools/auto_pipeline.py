@@ -69,12 +69,18 @@ def build_docker_claude_command(
     trajectory_root: Path, container_name: str, pipeline_job_id: int, prompt: str,
 ) -> list[str]:
     """Build argv where the only Claude user content is the stored prompt."""
+    def mount_path(path: Path) -> str:
+        value = str(path)
+        # Tests and callers may provide a Windows drive path while running on POSIX.
+        if re.match(r"^[A-Za-z]:/", value):
+            return value.replace("/", "\\")
+        return value
     return [
         docker, "run", "--rm", "--name", container_name,
         "--label", f"ccusr.pipeline_job={pipeline_job_id}",
         "--user", "1000:1000",
-        "-v", f"{workspace}:/workspace",
-        "-v", f"{trajectory_root}:/home/node/.claude",
+        "-v", f"{mount_path(workspace)}:/workspace",
+        "-v", f"{mount_path(trajectory_root)}:/home/node/.claude",
         "-w", "/workspace",
         "-e", "HOME=/home/node",
         "-e", "ANTHROPIC_BASE_URL", "-e", "ANTHROPIC_AUTH_TOKEN", "-e", "ANTHROPIC_MODEL",

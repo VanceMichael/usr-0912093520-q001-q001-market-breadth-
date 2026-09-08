@@ -17,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 TASK_TYPES = {
     "0-1 代码生成", "Feature 迭代", "Bug 修复", "代码理解",
     "代码重构", "工程化", "代码测试",
@@ -85,6 +85,9 @@ CREATE TABLE IF NOT EXISTS batches (
     markdown_path TEXT NOT NULL,
     brief TEXT NOT NULL DEFAULT '',
     question_count INTEGER NOT NULL CHECK (question_count > 0),
+    author_mode TEXT NOT NULL DEFAULT '0-1',
+    mother_id INTEGER,
+    task_types TEXT NOT NULL DEFAULT '0-1 代码生成',
     status TEXT NOT NULL DEFAULT 'draft',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -101,6 +104,8 @@ CREATE TABLE IF NOT EXISTS questions (
     prompt TEXT NOT NULL,
     prompt_sha256 TEXT NOT NULL,
     task_type TEXT NOT NULL,
+    author_mode TEXT NOT NULL DEFAULT '0-1',
+    mother_id INTEGER,
     difficulty TEXT NOT NULL,
     languages TEXT NOT NULL,
     repo_url TEXT NOT NULL DEFAULT '',
@@ -191,6 +196,37 @@ CREATE TABLE IF NOT EXISTS records (
 CREATE INDEX IF NOT EXISTS idx_questions_batch ON questions(batch_id, question_no);
 CREATE INDEX IF NOT EXISTS idx_records_question ON records(question_id, turn_no);
 
+CREATE TABLE IF NOT EXISTS mother_library (
+    id INTEGER PRIMARY KEY,
+    source_question_id INTEGER NOT NULL UNIQUE REFERENCES questions(id) ON DELETE RESTRICT,
+    source_batch TEXT NOT NULL,
+    source_task_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    workspace_path TEXT NOT NULL,
+    repo_url TEXT NOT NULL DEFAULT '',
+    initial_snapshot TEXT NOT NULL DEFAULT '',
+    local_initial_sha TEXT NOT NULL DEFAULT '',
+    use_count INTEGER NOT NULL DEFAULT 0 CHECK (use_count >= 0),
+    last_used_at TEXT NOT NULL DEFAULT '',
+    bugfix_ready INTEGER NOT NULL DEFAULT 1 CHECK (bugfix_ready IN (0, 1)),
+    iteration_ready INTEGER NOT NULL DEFAULT 1 CHECK (iteration_ready IN (0, 1)),
+    defect_note TEXT NOT NULL DEFAULT '',
+    notes TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS mother_usages (
+    id INTEGER PRIMARY KEY,
+    mother_id INTEGER NOT NULL REFERENCES mother_library(id) ON DELETE RESTRICT,
+    derived_question_id INTEGER NOT NULL UNIQUE REFERENCES questions(id) ON DELETE RESTRICT,
+    derived_task_type TEXT NOT NULL,
+    used_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mother_library_ready ON mother_library(bugfix_ready, iteration_ready, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_mother_usages_mother ON mother_usages(mother_id, used_at DESC);
+
 CREATE TABLE IF NOT EXISTS author_jobs (
     id INTEGER PRIMARY KEY,
     batch_name TEXT NOT NULL,
@@ -198,6 +234,9 @@ CREATE TABLE IF NOT EXISTS author_jobs (
     business TEXT NOT NULL DEFAULT '',
     technology TEXT NOT NULL DEFAULT '',
     notes TEXT NOT NULL DEFAULT '',
+    author_mode TEXT NOT NULL DEFAULT '0-1',
+    task_type TEXT NOT NULL DEFAULT '0-1 代码生成',
+    mother_id INTEGER,
     prompt TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'queued',
     output TEXT NOT NULL DEFAULT '',
@@ -262,6 +301,34 @@ def connect(database: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(database)
     connection.row_factory = sqlite3.Row
     connection.executescript(SCHEMA)
+    batch_columns = {row["name"] for row in connection.execute("PRAGMA table_info(batches)")}
+    if "author_mode" not in batch_columns:
+        connection.execute("ALTER TABLE batches ADD COLUMN author_mode TEXT NOT NULL DEFAULT '0-1'")
+    if "mother_id" not in batch_columns:
+        connection.execute("ALTER TABLE batches ADD COLUMN mother_id INTEGER")
+    if "task_types" not in batch_columns:
+        connection.execute("ALTER TABLE batches ADD COLUMN task_types TEXT NOT NULL DEFAULT '0-1 代码生成'")
+    question_columns = {row["name"] for row in connection.execute("PRAGMA table_info(questions)")}
+    if "author_mode" not in question_columns:
+        connection.execute("ALTER TABLE questions ADD COLUMN author_mode TEXT NOT NULL DEFAULT '0-1'")
+    if "mother_id" not in question_columns:
+        connection.execute("ALTER TABLE questions ADD COLUMN mother_id INTEGER")
+    # Backfill the mother catalog for databases created before the catalog existed.
+    connection.execute(
+        "INSERT OR IGNORE INTO mother_library(source_question_id, source_batch, source_task_id, title, prompt, workspace_path, "
+        "repo_url, initial_snapshot, local_initial_sha, created_at, updated_at) "
+        "SELECT q.id, b.name, q.task_id, q.title, q.prompt, q.folder_path, q.repo_url, q.initial_snapshot, q.local_initial_sha, "
+        "q.created_at, q.updated_at FROM questions q JOIN batches b ON b.id=q.batch_id "
+        "WHERE q.author_mode='0-1' AND q.task_type=?",
+        (FIRST_TURN_TASK_TYPE,),
+    )
+    author_columns = {row["name"] for row in connection.execute("PRAGMA table_info(author_jobs)")}
+    if "author_mode" not in author_columns:
+        connection.execute("ALTER TABLE author_jobs ADD COLUMN author_mode TEXT NOT NULL DEFAULT '0-1'")
+    if "task_type" not in author_columns:
+        connection.execute("ALTER TABLE author_jobs ADD COLUMN task_type TEXT NOT NULL DEFAULT '0-1 代码生成'")
+    if "mother_id" not in author_columns:
+        connection.execute("ALTER TABLE author_jobs ADD COLUMN mother_id INTEGER")
     record_columns = {
         row["name"] for row in connection.execute("PRAGMA table_info(records)")
     }
@@ -610,13 +677,25 @@ def create_batch(connection: sqlite3.Connection, workspace: Path, spec_path: Pat
     questions = spec["questions"]
     if not questions:
         raise ValueError("questions array is empty")
-    batch_dir = (workspace / name).resolve()
+    batch_dir = (workspace / name).absolute()
     try:
-        batch_dir.relative_to(workspace.resolve())
+        batch_dir.relative_to(workspace.absolute())
     except ValueError as exc:
         raise ValueError("batch directory must stay inside the workspace") from exc
     if batch_dir.exists():
         raise FileExistsError(f"batch directory already exists: {batch_dir}")
+    author_mode = str(spec.get("author_mode", "0-1")).strip() or "0-1"
+    if author_mode not in {"0-1", "derived"}:
+        raise ValueError("author_mode must be 0-1 or derived")
+    mother_id = spec.get("mother_id")
+    if author_mode == "derived":
+        if isinstance(mother_id, bool) or not isinstance(mother_id, int) or mother_id <= 0:
+            raise ValueError("derived batches require a valid mother_id")
+        mother = connection.execute("SELECT * FROM mother_library WHERE id=?", (mother_id,)).fetchone()
+        if mother is None:
+            raise ValueError("mother_id does not exist")
+    else:
+        mother_id = None
 
     seen_folders: set[str] = set()
     prepared = []
@@ -639,10 +718,16 @@ def create_batch(connection: sqlite3.Connection, workspace: Path, spec_path: Pat
             raise ValueError(f"question {index} first-turn prompt must be one paragraph")
         if task_type not in TASK_TYPES:
             raise ValueError(f"question {index} has invalid task_type")
-        if task_type != FIRST_TURN_TASK_TYPE:
+        if author_mode == "0-1" and task_type != FIRST_TURN_TASK_TYPE:
             raise ValueError(
                 f"question {index} first-turn task_type must be {FIRST_TURN_TASK_TYPE}"
             )
+        if author_mode == "derived" and task_type == FIRST_TURN_TASK_TYPE:
+            raise ValueError(f"question {index} derived task_type cannot be {FIRST_TURN_TASK_TYPE}")
+        if author_mode == "derived" and task_type == "Bug 修复" and not mother["bugfix_ready"]:
+            raise ValueError("selected mother is not ready for Bug 修复")
+        if author_mode == "derived" and task_type == "Feature 迭代" and not mother["iteration_ready"]:
+            raise ValueError("selected mother is not ready for Feature 迭代")
         if difficulty not in DIFFICULTIES or difficulty == "简单":
             raise ValueError(f"question {index} first-turn difficulty must be 中等/困难/地狱")
         if not isinstance(languages, list) or not languages or not all(
@@ -658,9 +743,10 @@ def create_batch(connection: sqlite3.Connection, workspace: Path, spec_path: Pat
     markdown_path = batch_dir / f"题目_{name}.md"
     try:
         cursor = connection.execute(
-            "INSERT INTO batches(name, folder_path, markdown_path, brief, question_count, created_at, updated_at) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?)",
-            (name, str(batch_dir), str(markdown_path), str(spec.get("brief", "")).strip(), len(prepared), timestamp, timestamp),
+            "INSERT INTO batches(name, folder_path, markdown_path, brief, question_count, author_mode, mother_id, task_types, created_at, updated_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (name, str(batch_dir), str(markdown_path), str(spec.get("brief", "")).strip(), len(prepared), author_mode, mother_id,
+             ", ".join(sorted({item[5] for item in prepared})), timestamp, timestamp),
         )
         batch_id = cursor.lastrowid
         for index, item, folder_name, title, prompt, task_type, difficulty, languages, reproducibility in prepared:
@@ -671,13 +757,13 @@ def create_batch(connection: sqlite3.Connection, workspace: Path, spec_path: Pat
             connection.execute(
                 """INSERT INTO questions(
                     batch_id, question_no, task_id, folder_name, folder_path, title, prompt,
-                    prompt_sha256, task_type, difficulty, languages, repo_url, initial_snapshot,
+                    prompt_sha256, task_type, author_mode, mother_id, difficulty, languages, repo_url, initial_snapshot,
                     local_initial_sha, reproducibility, expected_areas, difficulty_evidence,
                     similarity_tags, created_at, updated_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     batch_id, index, task_id, folder_name, str(folder), title, prompt,
-                    prompt_hash(prompt), task_type, difficulty, ", ".join(languages),
+                    prompt_hash(prompt), task_type, author_mode, mother_id, difficulty, ", ".join(languages),
                     str(item.get("repo_url", "")).strip(),
                     str(item.get("initial_snapshot", "")).strip(), local_sha, reproducibility,
                     json.dumps(item.get("expected_areas", []), ensure_ascii=False),
@@ -685,6 +771,26 @@ def create_batch(connection: sqlite3.Connection, workspace: Path, spec_path: Pat
                     json.dumps(item.get("similarity_tags", []), ensure_ascii=False),
                     timestamp, timestamp,
                 ),
+            )
+            if author_mode == "0-1":
+                connection.execute(
+                    "INSERT INTO mother_library(source_question_id, source_batch, source_task_id, title, prompt, workspace_path, created_at, updated_at) "
+                    "SELECT id, ?, task_id, title, prompt, folder_path, ?, ? FROM questions WHERE batch_id=? AND question_no=?",
+                    (name, timestamp, timestamp, batch_id, index),
+                )
+        if author_mode == "derived":
+            question_ids = connection.execute(
+                "SELECT id FROM questions WHERE batch_id=? ORDER BY question_no", (batch_id,)
+            ).fetchall()
+            for row in question_ids:
+                connection.execute(
+                    "INSERT INTO mother_usages(mother_id, derived_question_id, derived_task_type, used_at) "
+                    "SELECT ?, ?, task_type, ? FROM questions WHERE id=?",
+                    (mother_id, row["id"], timestamp, row["id"]),
+                )
+            connection.execute(
+                "UPDATE mother_library SET use_count=use_count+?, last_used_at=?, updated_at=? WHERE id=?",
+                (len(question_ids), timestamp, timestamp, mother_id),
             )
         connection.commit()
         render_batch(connection, name)
@@ -927,6 +1033,11 @@ def set_repository(
         "qc_decision='pending', qc_prompt_sha256='', human_approved=0, status='draft', updated_at=? WHERE id=?",
         (normalized_repo, snapshot, local_sha, now(), row["id"]),
     )
+    connection.execute(
+        "UPDATE mother_library SET repo_url=?, initial_snapshot=?, local_initial_sha=?, updated_at=? "
+        "WHERE source_question_id=?",
+        (normalized_repo, snapshot, local_sha, now(), row["id"]),
+    )
     connection.commit()
     render_batch(connection, batch)
 
@@ -944,6 +1055,14 @@ def list_batches(connection: sqlite3.Connection) -> None:
             for question in question_rows(connection, row["name"])
         )
         print(f"{row['name']:<12} {ready}/{row['question_count']} READY  {row['folder_path']}")
+
+
+def list_mothers(connection: sqlite3.Connection) -> None:
+    rows = connection.execute(
+        "SELECT id, source_batch, source_task_id, title, workspace_path, repo_url, initial_snapshot, "
+        "use_count, last_used_at, bugfix_ready, iteration_ready FROM mother_library ORDER BY updated_at DESC, id DESC"
+    ).fetchall()
+    print(json.dumps([dict(row) for row in rows], ensure_ascii=False, indent=2))
 
 
 def list_questions(connection: sqlite3.Connection, batch: str) -> None:
@@ -968,6 +1087,7 @@ def main() -> int:
     create_parser.add_argument("--workspace", type=Path, default=Path.cwd())
     list_parser = subparsers.add_parser("list")
     list_parser.add_argument("--batch")
+    subparsers.add_parser("mother-list")
     qc_parser = subparsers.add_parser("qc-check")
     qc_parser.add_argument("--batch", required=True)
     qc_parser.add_argument("--select")
@@ -1000,6 +1120,8 @@ def main() -> int:
             create_batch(connection, args.workspace.resolve(), args.spec.resolve())
         elif args.command == "list":
             list_questions(connection, args.batch) if args.batch else list_batches(connection)
+        elif args.command == "mother-list":
+            list_mothers(connection)
         elif args.command == "qc-check":
             return run_mechanical_qc(connection, args.batch, args.select)
         elif args.command == "duplicate-check":

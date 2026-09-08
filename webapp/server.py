@@ -45,7 +45,7 @@ AUTHOR_JOB_STATUSES = {"queued", "running", "completed", "failed", "interrupted"
 
 sys.path.insert(0, str(PROJECT_ROOT))
 from tools.runtime_environment import docker_info, repair_docker_engine  # noqa: E402
-from tools.batch_pipeline import SCHEMA_VERSION  # noqa: E402
+from tools.batch_pipeline import SCHEMA_VERSION, connect as initialize_database  # noqa: E402
 
 AUTHOR_JOB_SCHEMA = """
 CREATE TABLE IF NOT EXISTS author_jobs (
@@ -55,6 +55,9 @@ CREATE TABLE IF NOT EXISTS author_jobs (
     business TEXT NOT NULL DEFAULT '',
     technology TEXT NOT NULL DEFAULT '',
     notes TEXT NOT NULL DEFAULT '',
+    author_mode TEXT NOT NULL DEFAULT '0-1',
+    task_type TEXT NOT NULL DEFAULT '0-1 代码生成',
+    mother_id INTEGER,
     prompt TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'queued',
     output TEXT NOT NULL DEFAULT '',
@@ -169,13 +172,18 @@ def secure_file(path: Path) -> None:
 
 class ConsoleData:
     def __init__(self, database: Path, project_root: Path = PROJECT_ROOT) -> None:
-        self.database = database.resolve()
-        self.project_root = project_root.resolve()
+        # Preserve the caller's absolute spelling (notably /var vs /private on macOS)
+        # so generated commands and UI paths match the workspace the user selected.
+        self.database = Path(database).absolute()
+        self.project_root = Path(project_root).absolute()
         self.env_file = self.project_root / ".env"
         self.author_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="codex-author")
         self.pipeline_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pipeline")
         self._pipeline_processes: dict[int, subprocess.Popen[str]] = {}
         self._pipeline_process_lock = threading.Lock()
+        if self.database.is_file():
+            connection = initialize_database(self.database)
+            connection.close()
         self._initialize_author_jobs()
         self._initialize_pipeline_jobs()
 
@@ -190,6 +198,13 @@ class ConsoleData:
             return
         with closing(self._write_connection()) as connection:
             connection.executescript(AUTHOR_JOB_SCHEMA)
+            columns = {row["name"] for row in connection.execute("PRAGMA table_info(author_jobs)")}
+            if "author_mode" not in columns:
+                connection.execute("ALTER TABLE author_jobs ADD COLUMN author_mode TEXT NOT NULL DEFAULT '0-1'")
+            if "task_type" not in columns:
+                connection.execute("ALTER TABLE author_jobs ADD COLUMN task_type TEXT NOT NULL DEFAULT '0-1 代码生成'")
+            if "mother_id" not in columns:
+                connection.execute("ALTER TABLE author_jobs ADD COLUMN mother_id INTEGER")
             timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
             connection.execute(
                 "UPDATE author_jobs SET status='interrupted', error=?, finished_at=? "
@@ -253,12 +268,32 @@ class ConsoleData:
         self._cleanup_pipeline_containers(active_ids)
 
     @staticmethod
-    def author_prompt(batch: str, count: int, business: str, technology: str, notes: str) -> str:
+    def author_prompt(batch: str, count: int, business: str, technology: str, notes: str,
+                      mode: str = "0-1", task_type: str = "0-1 代码生成", mother: dict | None = None,
+                      derived_notes: str = "", defect_tolerance: str = "") -> str:
         requirements = "；".join(filter(None, (
             f"业务关键词：{business}" if business else "",
             f"技术关键词：{technology}" if technology else "",
             f"补充要求：{notes}" if notes else "",
         )))
+        if mode == "derived":
+            mother_text = "；".join(filter(None, (
+                f"母库编号：{mother.get('id')}" if mother else "",
+                f"母项目：{mother.get('title')}" if mother else "",
+                f"代码路径：{mother.get('workspace_path')}" if mother else "",
+                f"Git 地址：{mother.get('repo_url')}" if mother else "",
+                f"母题已使用：{mother.get('use_count', 0)} 次" if mother else "",
+            )))
+            return (
+                "在项目根目录执行派生出题任务。先读取项目规范和 cc-usr-question-author 的全部引用，"
+                "使用母库中的 0-1 母项目生成独立的非 0-1 题目批次。\n"
+                f"批次名：{batch}\n题目数量：{count}\n题型：{task_type}\n"
+                f"母库信息：{mother_text}\n出题要求：{requirements}\n"
+                f"派生方向：{derived_notes or '围绕母项目已有业务设计真实的后续工作'}\n"
+                f"可接受的小瑕疵：{defect_tolerance or '允许不影响构建和主要流程的小问题，并将其记录为可迭代方向'}\n"
+                "保留母项目路径、Git 地址、初始快照和派生使用关系；每道题使用独立工作区和独立 Prompt，"
+                "完成快照发布、机械质检和重复题质检。不要读取任何目标模型轨迹、回复或产物，也不要启动目标模型。"
+            )
         return (
             "在项目根目录执行出题任务。先完整读取 项目规范.md、"
             ".agents/skills/cc-usr-question-author/SKILL.md 和 "
@@ -278,7 +313,7 @@ class ConsoleData:
         )
 
     @staticmethod
-    def _validate_author_fields(body: dict[str, object]) -> tuple[str, int, str, str, str]:
+    def _validate_author_fields(body: dict[str, object]) -> tuple[str, int, str, str, str, str, str, int | None, str, str]:
         batch = str(body.get("batch", "")).strip()
         if not BATCH_RE.fullmatch(batch):
             raise ValueError("批次名必须使用 2-32 位字母、数字、下划线或连字符")
@@ -293,12 +328,32 @@ class ConsoleData:
             values.append(" ".join(value.split()))
         if not values[0]:
             raise ValueError("业务关键词不能为空")
-        return batch, count, values[0], values[1], values[2]
+        mode = str(body.get("mode", "0-1")).strip() or "0-1"
+        if mode not in {"0-1", "derived"}:
+            raise ValueError("出题模式无效")
+        task_type = str(body.get("task_type", "0-1 代码生成")).strip()
+        if mode == "0-1" and task_type != "0-1 代码生成":
+            raise ValueError("0-1 模式只能使用 0-1 代码生成")
+        if mode == "derived" and task_type not in {"Feature 迭代", "Bug 修复", "代码理解", "代码重构", "工程化", "代码测试"}:
+            raise ValueError("派生模式请选择非 0-1 题型")
+        mother_id = body.get("mother_id")
+        if mode == "derived":
+            if isinstance(mother_id, bool) or not isinstance(mother_id, int) or mother_id <= 0:
+                raise ValueError("派生模式必须选择母库项目")
+        else:
+            mother_id = None
+        extra = []
+        for key, limit in (("derived_notes", 2000), ("defect_tolerance", 1000)):
+            value = body.get(key, "")
+            if not isinstance(value, str) or "\x00" in value or len(value) > limit:
+                raise ValueError(f"{key} 内容无效")
+            extra.append(" ".join(value.split()))
+        return batch, count, values[0], values[1], values[2], mode, task_type, mother_id, extra[0], extra[1]
 
     def author_jobs(self, limit: int = 20) -> list[dict]:
         with closing(self.connect()) as connection:
             rows = connection.execute(
-                "SELECT id,batch_name,question_count,business,technology,notes,prompt,status,"
+                "SELECT id,batch_name,question_count,business,technology,notes,author_mode,task_type,mother_id,prompt,status,"
                 "substr(output,-30000) AS output,length(output) AS output_length,last_message,"
                 "error,pid,created_at,started_at,finished_at FROM author_jobs "
                 "ORDER BY created_at DESC,id DESC LIMIT ?",
@@ -352,11 +407,11 @@ class ConsoleData:
                 "不要删除已有可用产物，也不要重复创建同名批次。"
             )
             cursor = connection.execute(
-                "INSERT INTO author_jobs(batch_name,question_count,business,technology,notes,"
-                "prompt,status,created_at,last_message) VALUES(?,?,?,?,?,?,'queued',?,?)",
+                "INSERT INTO author_jobs(batch_name,question_count,business,technology,notes,author_mode,task_type,mother_id,"
+                "prompt,status,created_at,last_message) VALUES(?,?,?,?,?,?,?,?,?,'queued',?,?)",
                 (
                     source["batch_name"], source["question_count"], source["business"],
-                    source["technology"], source["notes"], prompt, created,
+                    source["technology"], source["notes"], source["author_mode"], source["task_type"], source["mother_id"], prompt, created,
                     f"等待重试出题任务 #{source_job_id}",
                 ),
             )
@@ -686,11 +741,22 @@ class ConsoleData:
         self.pipeline_executor.shutdown(wait=False, cancel_futures=True)
 
     def create_author_job(self, body: dict[str, object]) -> dict[str, object]:
-        batch, count, business, technology, notes = self._validate_author_fields(body)
+        batch, count, business, technology, notes, mode, task_type, mother_id, derived_notes, defect_tolerance = self._validate_author_fields(body)
         codex = shutil.which("codex")
         if not codex:
             raise RuntimeError("未找到 Codex CLI，请先安装并确保 codex 在 PATH 中")
-        prompt = self.author_prompt(batch, count, business, technology, notes)
+        mother = None
+        if mother_id is not None:
+            with closing(self.connect()) as read_connection:
+                row = read_connection.execute("SELECT * FROM mother_library WHERE id=?", (mother_id,)).fetchone()
+                if row is None:
+                    raise ValueError("母库项目不存在")
+                if task_type == "Bug 修复" and not row["bugfix_ready"]:
+                    raise ValueError("该母项目暂不适合生成 Bug 修复题")
+                if task_type == "Feature 迭代" and not row["iteration_ready"]:
+                    raise ValueError("该母项目暂不适合生成 Feature 迭代题")
+                mother = dict(row)
+        prompt = self.author_prompt(batch, count, business, technology, notes, mode, task_type, mother, derived_notes, defect_tolerance)
         timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
         with closing(self._write_connection()) as connection:
             existing = connection.execute("SELECT 1 FROM batches WHERE name=?", (batch,)).fetchone()
@@ -703,9 +769,9 @@ class ConsoleData:
             if active:
                 raise ValueError(f"批次 {batch} 已有正在执行的出题任务")
             cursor = connection.execute(
-                "INSERT INTO author_jobs(batch_name, question_count, business, technology, notes, "
-                "prompt, status, created_at) VALUES(?,?,?,?,?,?,'queued',?)",
-                (batch, count, business, technology, notes, prompt, timestamp),
+                "INSERT INTO author_jobs(batch_name, question_count, business, technology, notes, author_mode, task_type, mother_id, "
+                "prompt, status, created_at) VALUES(?,?,?,?,?,?,?,?,?,'queued',?)",
+                (batch, count, business, technology, notes, mode, task_type, mother_id, prompt, timestamp),
             )
             job_id = int(cursor.lastrowid)
             connection.commit()
@@ -1171,11 +1237,24 @@ class ConsoleData:
                 "question_count": row["actual_questions"],
                 "record_count": row["record_count"],
                 "qc_record_count": row["qc_record_count"],
+                "author_mode": row["author_mode"],
+                "mother_id": row["mother_id"],
                 "folder_path": row["folder_path"],
                 "created_at": row["created_at"],
             }
             for row in rows
         ]
+
+    def mother_library(self, limit: int = 200) -> list[dict]:
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                "SELECT m.*, COUNT(u.id) AS derived_count "
+                "FROM mother_library m LEFT JOIN mother_usages u ON u.mother_id=m.id "
+                "WHERE m.repo_url <> '' AND m.initial_snapshot <> '' AND m.local_initial_sha <> '' "
+                "GROUP BY m.id ORDER BY m.updated_at DESC, m.id DESC LIMIT ?",
+                (max(1, min(limit, 500)),),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     @staticmethod
     def _export_files(batch_folder: Path) -> tuple[list[dict], list[dict]]:
@@ -1291,6 +1370,9 @@ class ConsoleData:
                     "question_no": row["question_no"],
                     "task_id": row["task_id"],
                     "title": row["title"],
+                    "author_mode": row["author_mode"],
+                    "mother_id": row["mother_id"],
+                    "task_type": row["task_type"],
                     "repo_url": row["repo_url"],
                     "folder_name": row["folder_name"],
                     "task_type": row["task_type"],
@@ -1378,6 +1460,9 @@ class ConsoleData:
             "difficulty": question["difficulty"],
             "languages": question["languages"],
             "repo_url": question["repo_url"],
+            "author_mode": question["author_mode"],
+            "mother_id": question["mother_id"],
+            "task_type": question["task_type"],
             "initial_snapshot": question["initial_snapshot"],
             "folder_path": question["folder_path"],
             "reproducibility": question["reproducibility"],
@@ -1495,7 +1580,7 @@ class ConsoleData:
             ).fetchone()
         if batch_row is None:
             raise ValueError("batch does not exist")
-        trajectory_root = Path(batch_row["folder_path"]).resolve() / ".runs"
+        trajectory_root = Path(batch_row["folder_path"]).absolute() / ".runs"
         script = self.project_root / ".agents/skills/cc-usr-excel-exporter/scripts/export_xlsx.py"
         command = [
             sys.executable, str(script), "--db", str(self.database), "--batch", batch_name,
@@ -1574,6 +1659,9 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/author-jobs":
                 self.send_json({"jobs": self.data.author_jobs()})
+                return
+            if parsed.path == "/api/mother-library":
+                self.send_json({"mothers": self.data.mother_library()})
                 return
             if parsed.path == "/api/pipeline-jobs":
                 self.send_json({"jobs": self.data.pipeline_jobs()})

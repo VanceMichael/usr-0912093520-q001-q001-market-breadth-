@@ -315,7 +315,7 @@ def main() -> int:
             )
             launcher.chmod(0o700)
             try:
-                process = open_server(launcher, Path(row["folder_path"]).resolve())
+                process = open_server(launcher, Path(row["folder_path"]))
                 (run_dir / "process.pid").write_text(f"{process.pid}\n", encoding="ascii")
             except OSError as exc:
                 print(f"Failed to start server process for {row['task_id']}: {exc}", file=sys.stderr)
