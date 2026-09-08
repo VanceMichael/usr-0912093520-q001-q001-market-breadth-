@@ -8,6 +8,8 @@ COPY --from=go-runtime /usr/local/go /usr/local/go
 
 RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
     && ln -s /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx \
+    && ln -s /usr/local/go/bin/go /usr/local/bin/go \
+    && ln -s /usr/local/go/bin/gofmt /usr/local/bin/gofmt \
     && useradd --create-home --uid 1000 worker
 
 RUN apt-get update \
