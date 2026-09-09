@@ -151,6 +151,12 @@ class SchedulerStore:
             desired = "running"
         actual = "running" if desired == "running" else "paused" if desired == "paused" else "stopped"
         started_at = now()
+        with closing(self.connect()) as connection:
+            connection.execute(
+                "UPDATE scheduler_cycles SET status='interrupted',finished_at=?,error=? WHERE status='running'",
+                (started_at, "调度器进程重启，上一周期被中断"),
+            )
+            connection.commit()
         updated = self.update(
             desired_state=desired,
             actual_state=actual,

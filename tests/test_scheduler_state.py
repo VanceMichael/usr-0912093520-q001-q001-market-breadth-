@@ -49,6 +49,18 @@ def test_scheduler_failure_and_retry_clear_circuit_state() -> None:
         assert state["last_error"] == ""
 
 
+def test_scheduler_startup_marks_previous_running_cycles_interrupted() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        store = make_store(Path(raw))
+        cycle_id = store.begin_cycle()
+        assert store.cycles()[0]["status"] == "running"
+        restarted = SchedulerStore(store.database)
+        restarted.startup()
+        cycle = next(item for item in restarted.cycles() if item["id"] == cycle_id)
+        assert cycle["status"] == "interrupted"
+        assert cycle["finished_at"]
+
+
 def test_scheduler_rejects_unknown_control_action() -> None:
     with tempfile.TemporaryDirectory() as raw:
         store = make_store(Path(raw))
