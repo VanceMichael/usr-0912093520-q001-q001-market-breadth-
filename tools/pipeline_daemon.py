@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import fcntl
 import json
+import math
 import os
 import signal
 import shutil
@@ -188,7 +189,10 @@ def load_runtime_env(path: Path) -> None:
             os.environ["CC_AUTHOR_DIFFICULTY_WEIGHTS"] = value
         elif key == "CC_AUTHOR_BATCH_SIZE" and value:
             os.environ["CC_AUTHOR_BATCH_SIZE"] = value
-        elif key in {"CC_PIPELINE_MODEL_CONCURRENCY", "CC_CLAUDE_DOCKER_IMAGE"} and value:
+        elif key in {
+            "CC_PIPELINE_MODEL_CONCURRENCY", "CC_PIPELINE_CODEX_CONCURRENCY",
+            "CC_CLAUDE_DOCKER_IMAGE",
+        } and value:
             os.environ[key] = value
 
 
@@ -276,16 +280,19 @@ def count_ready(database: Path) -> int:
         return int(connection.execute("SELECT COUNT(*) FROM questions WHERE status='approved' AND mechanical_qc='pass' AND qc_decision='pass' AND qc_prompt_sha256=prompt_sha256").fetchone()[0])
 
 
-def runnable_batches(database: Path, max_attempts: int) -> list[str]:
+def active_batches(database: Path) -> list[str]:
     with connect(database.resolve()) as connection:
-        return [row["name"] for row in connection.execute(
-            "SELECT DISTINCT b.name FROM batches b JOIN questions q ON q.batch_id=b.id "
-            "WHERE q.status='approved' AND q.mechanical_qc='pass' AND q.qc_decision='pass' "
-            "AND q.qc_prompt_sha256=q.prompt_sha256 AND "
-            "(SELECT COUNT(*) FROM runs r WHERE r.question_id=q.id AND r.status IN ('failed','timeout')) < ? "
-            "ORDER BY b.created_at",
-            (max_attempts,),
+        return [str(row["name"]) for row in connection.execute(
+            "SELECT name FROM batches WHERE status NOT IN ('completed','partial','failed') ORDER BY created_at"
         )]
+
+
+def manual_jobs_active(database: Path) -> bool:
+    with connect(database.resolve()) as connection:
+        return connection.execute(
+            "SELECT 1 FROM author_jobs WHERE status IN ('queued','running') "
+            "UNION ALL SELECT 1 FROM pipeline_jobs WHERE status IN ('queued','running') LIMIT 1"
+        ).fetchone() is not None
 
 
 def has_new_topics(database: Path) -> bool:
@@ -301,62 +308,28 @@ def create_batch(database: Path, codex: str, topic: dict, batch: str, log: Path,
     return run_command(codex_command(codex, prompt), PROJECT_ROOT, log, timeout, store)
 
 
-def process_ready(database: Path, codex: str, log: Path, timeout: int, store: SchedulerStore | None = None) -> int:
-    with connect(database.resolve()) as connection:
-        batches = [dict(row) for row in connection.execute(
-            "SELECT name,folder_path FROM batches WHERE status!='completed' ORDER BY created_at"
-        )]
-    for batch_row in batches:
-        batch = batch_row["name"]
-        with connect(database.resolve()) as connection:
-            needs_producer = connection.execute("SELECT COUNT(*) FROM questions q JOIN batches b ON b.id=q.batch_id WHERE b.name=? AND EXISTS(SELECT 1 FROM runs r WHERE r.question_id=q.id AND r.status='succeeded') AND NOT EXISTS(SELECT 1 FROM records d WHERE d.question_id=q.id)", (batch,)).fetchone()[0]
-        if needs_producer:
-            if store:
-                store.heartbeat(phase="delivery", batch=batch, detail="正在生成交付记录")
-                store.event("phase_started", "开始生成交付记录", phase="delivery", batch=batch)
-            prompt = f"使用 $cc-usr-delivery-producer 处理批次 {batch} 的全部已完成题目，读取原始 Claude JSONL 轨迹和实际产物，按项目规范逐轮评分入库；不要修改目标模型代码。完成后停止。"
-            if run_command(codex_command(codex, prompt), PROJECT_ROOT, log, timeout, store) != 0:
-                return 1
-        with connect(database.resolve()) as connection:
-            needs_qc = connection.execute("SELECT COUNT(*) FROM records r JOIN questions q ON q.id=r.question_id JOIN batches b ON b.id=q.batch_id WHERE b.name=? AND r.delivery_qc_passed=0", (batch,)).fetchone()[0]
-        if needs_qc:
-            if store:
-                store.heartbeat(phase="delivery_qc", batch=batch, detail="正在执行交付质检")
-                store.event("phase_started", "开始交付质检", phase="delivery_qc", batch=batch)
-            prompt = f"使用 $cc-usr-delivery-qc 质检批次 {batch} 的全部交付记录；从可核验证据修正问题并最终写入质检通过，不要导出 Excel。完成后停止。"
-            if run_command(codex_command(codex, prompt), PROJECT_ROOT, log, timeout, store) != 0:
-                return 1
-        with connect(database.resolve()) as connection:
-            totals = connection.execute(
-                "SELECT COUNT(DISTINCT q.id),COUNT(DISTINCT CASE WHEN q.status='completed' THEN q.id END),"
-                "COUNT(DISTINCT CASE WHEN r.id IS NOT NULL THEN q.id END),"
-                "COUNT(CASE WHEN r.id IS NOT NULL AND r.delivery_qc_passed=0 THEN 1 END) "
-                "FROM questions q JOIN batches b ON b.id=q.batch_id LEFT JOIN records r ON r.question_id=q.id WHERE b.name=?",
-                (batch,),
-            ).fetchone()
-        total_questions, completed_questions, recorded_questions, unpassed_records = map(int, totals)
-        if total_questions and (completed_questions, recorded_questions, unpassed_records) == (total_questions, total_questions, 0):
-            if store:
-                store.heartbeat(phase="export", batch=batch, detail="正在导出 Excel 和 JSONL")
-                store.event("phase_started", "开始导出交付文件", phase="export", batch=batch)
-            batch_folder = Path(batch_row["folder_path"])
-            before = set(batch_folder.glob("*.xlsx"))
-            prompt = f"使用 $cc-usr-excel-exporter 导出批次 {batch} 中已经通过交付质检的完整记录，复制原始 JSONL 轨迹并报告输出路径；不要修改评分或记录。完成后停止。"
-            if run_command(codex_command(codex, prompt), PROJECT_ROOT, log, timeout, store) != 0:
-                return 1
-            if not set(batch_folder.glob("*.xlsx")) - before:
-                print(f"batch {batch}: exporter reported success but created no workbook", file=sys.stderr, flush=True)
-                return 1
-            with connect(database.resolve()) as connection:
-                connection.execute("UPDATE batches SET status='completed',updated_at=? WHERE name=?", (now(), batch))
-                connection.commit()
-    return 0
+def pipeline_batch_timeout(
+    question_count: int, model_concurrency: int, codex_concurrency: int,
+    worker_timeout: int, agent_timeout: int, max_attempts: int,
+) -> int:
+    model_budget = math.ceil(question_count / max(1, model_concurrency)) * worker_timeout * max_attempts
+    delivery_budget = math.ceil(question_count / max(1, codex_concurrency)) * agent_timeout * 2
+    return max(model_budget, delivery_budget) + agent_timeout + 600
 
 
 def run_batch(database: Path, args: argparse.Namespace, batch: str, store: SchedulerStore | None = None) -> int:
     if store:
-        store.heartbeat(phase="model", batch=batch, detail="Claude Code 容器正在跑题")
-        store.event("phase_started", "开始 Claude Code 模型跑题", phase="model", batch=batch)
+        store.heartbeat(phase="model", batch=batch, detail="Claude 模型池与 Codex 交付池正在流水线处理")
+        store.event("phase_started", "开始模型与交付并行流水线", phase="model", batch=batch)
+    with connect(database.resolve()) as connection:
+        question_count = int(connection.execute(
+            "SELECT COUNT(*) FROM questions q JOIN batches b ON b.id=q.batch_id WHERE b.name=?",
+            (batch,),
+        ).fetchone()[0])
+    batch_timeout = pipeline_batch_timeout(
+        question_count, args.concurrency, args.codex_concurrency,
+        args.worker_timeout, args.agent_timeout, args.max_attempts,
+    )
     return run_command(
         [
             sys.executable, str(PROJECT_ROOT / "tools" / "orchestrator.py"),
@@ -365,12 +338,16 @@ def run_batch(database: Path, args: argparse.Namespace, batch: str, store: Sched
             "--data-root", str(args.data_root.resolve()),
             "--image", args.worker_image,
             "--concurrency", str(args.concurrency),
+            "--deliver",
+            "--codex", args.codex,
+            "--codex-concurrency", str(args.codex_concurrency),
+            "--agent-timeout", str(args.agent_timeout),
             "--max-attempts", str(args.max_attempts),
             "--timeout", str(args.worker_timeout),
         ],
         PROJECT_ROOT,
         args.log_dir.resolve() / f"workers-{batch}.log",
-        max(args.agent_timeout, args.worker_timeout * args.max_attempts + 300),
+        batch_timeout,
         store,
     )
 
@@ -383,6 +360,10 @@ def cycle(args: argparse.Namespace, store: SchedulerStore | None = None) -> tupl
         args.concurrency = max(1, min(8, int(os.environ.get("CC_PIPELINE_MODEL_CONCURRENCY", args.concurrency))))
     except ValueError:
         pass
+    try:
+        args.codex_concurrency = max(1, min(8, int(os.environ.get("CC_PIPELINE_CODEX_CONCURRENCY", args.codex_concurrency))))
+    except ValueError:
+        pass
     args.worker_image = os.environ.get("CC_CLAUDE_DOCKER_IMAGE", args.worker_image).strip() or args.worker_image
     if store:
         store.heartbeat(phase="news", batch="", detail="正在抓取新闻主题")
@@ -392,13 +373,15 @@ def cycle(args: argparse.Namespace, store: SchedulerStore | None = None) -> tupl
         print(f"news warning: {error}", file=sys.stderr, flush=True)
     if errors and not added and not has_new_topics(database):
         return 1, ""
-    for existing_batch in runnable_batches(database, args.max_attempts):
+    if manual_jobs_active(database):
+        if store:
+            store.heartbeat(phase="idle", batch="", detail="手动任务运行中，自动调度暂不接单")
+        return 0, ""
+    for existing_batch in active_batches(database):
         if run_batch(database, args, existing_batch, store):
             return 1, existing_batch
-    if process_ready(database, args.codex, args.log_dir.resolve() / "delivery.log", args.agent_timeout, store):
-        return 1, ""
     created_batch = ""
-    if count_ready(database) < args.ready_watermark:
+    if not active_batches(database) and count_ready(database) < args.ready_watermark:
         topic = claim_topic(database)
         if topic:
             batch = f"news{datetime.now().strftime('%m%d%H%M%S')}"
@@ -418,7 +401,7 @@ def cycle(args: argparse.Namespace, store: SchedulerStore | None = None) -> tupl
             run_code = run_batch(database, args, batch, store)
             if run_code:
                 return run_code, batch
-    return process_ready(database, args.codex, args.log_dir.resolve() / "delivery.log", args.agent_timeout, store), created_batch
+    return 0, created_batch
 
 
 def main() -> int:
@@ -431,6 +414,7 @@ def main() -> int:
     parser.add_argument("--data-root", type=Path, default=PROJECT_ROOT / "runs")
     parser.add_argument("--worker-image", default="ccusr-claude-worker:local")
     parser.add_argument("--concurrency", type=int, default=2)
+    parser.add_argument("--codex-concurrency", type=int, default=1)
     parser.add_argument("--max-attempts", type=int, default=2)
     parser.add_argument("--worker-timeout", type=int, default=3600)
     parser.add_argument("--ready-watermark", type=int, default=4)

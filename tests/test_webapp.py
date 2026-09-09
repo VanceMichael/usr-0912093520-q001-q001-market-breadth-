@@ -257,6 +257,20 @@ class WebConsoleTests(unittest.TestCase):
             finally:
                 data.shutdown()
 
+    def test_running_scheduler_blocks_manual_work_on_the_same_machine(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = ConsoleData(self.make_database(root), root)
+            try:
+                data.scheduler_store.startup()
+                with self.assertRaisesRegex(RuntimeError, "自动调度器正在运行"):
+                    data._ensure_manual_work_allowed()
+                data.scheduler_store.request_control("stop")
+                data.scheduler_store.update(actual_state="stopped")
+                data._ensure_manual_work_allowed()
+            finally:
+                data.shutdown()
+
     def test_remote_scheduler_control_is_proxied_to_selected_vps(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

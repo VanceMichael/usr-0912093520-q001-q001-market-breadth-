@@ -5,12 +5,16 @@ from pathlib import Path
 from unittest import mock
 
 from tools.pipeline_daemon import (
+    active_batches,
     cleanup_logs,
     create_batch,
     difficulty_distribution,
     difficulty_plan,
     load_runtime_env,
+    manual_jobs_active,
+    pipeline_batch_timeout,
 )
+from tools.batch_pipeline import connect
 
 
 def test_runtime_env_loads_escaped_difficulty_weights() -> None:
@@ -80,3 +84,33 @@ def test_automatic_author_prompt_is_backend_only() -> None:
     assert "不得要求或创建任何前端页面" in prompt
     assert "不得生成全栈题" in prompt
     assert "不依赖浏览器操作" in prompt
+
+
+def test_terminal_batches_are_not_scheduled_again() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        database = Path(raw) / "production.sqlite3"
+        with connect(database) as connection:
+            for name, status in (("active", "draft"), ("done", "completed"), ("some", "partial"), ("none", "failed")):
+                connection.execute(
+                    "INSERT INTO batches(name,folder_path,markdown_path,question_count,status,created_at,updated_at) "
+                    "VALUES(?,?,?,?,?,'now','now')",
+                    (name, str(Path(raw) / name), str(Path(raw) / f"{name}.md"), 1, status),
+                )
+            connection.execute(
+                "INSERT INTO author_jobs(batch_name,question_count,prompt,status,created_at) "
+                "VALUES('manual',1,'prompt','running','now')"
+            )
+            connection.commit()
+        assert active_batches(database) == ["active"]
+        assert manual_jobs_active(database)
+
+
+def test_batch_timeout_scales_with_question_waves_and_delivery_pool() -> None:
+    assert pipeline_batch_timeout(
+        question_count=10,
+        model_concurrency=2,
+        codex_concurrency=2,
+        worker_timeout=3600,
+        agent_timeout=3600,
+        max_attempts=2,
+    ) == 40200

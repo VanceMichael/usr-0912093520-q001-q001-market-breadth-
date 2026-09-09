@@ -337,8 +337,11 @@ def now() -> str:
 
 def connect(database: Path) -> sqlite3.Connection:
     database.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(database)
+    connection = sqlite3.connect(database, timeout=30)
     connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA busy_timeout=30000")
+    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute("PRAGMA foreign_keys=ON")
     connection.executescript(SCHEMA)
     feed_initialized = connection.execute(
         "SELECT 1 FROM schema_meta WHERE key='news_feeds_initialized'"

@@ -90,6 +90,7 @@ class SchedulerStore:
         connection = sqlite3.connect(self.database, timeout=30)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA busy_timeout=30000")
+        connection.execute("PRAGMA journal_mode=WAL")
         return connection
 
     def ensure(self) -> None:

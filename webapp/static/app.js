@@ -340,6 +340,8 @@ function renderScheduler() {
     const percent = batch.status === "completed" ? 100 : (total ? Math.round(passed * 100 / total) : 0);
     let label = "题目准备中";
     if (batch.status === "completed") label = "已交付";
+    else if (batch.status === "partial") label = "部分交付";
+    else if (batch.status === "failed") label = "无可交付题目";
     else if (passed) label = "交付质检中";
     else if (Number(batch.records)) label = "交付生产中";
     else if (Number(batch.running)) label = "Claude 跑题中";

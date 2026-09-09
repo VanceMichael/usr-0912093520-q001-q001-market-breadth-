@@ -260,7 +260,25 @@ class ConsoleData:
         connection = sqlite3.connect(self.database, timeout=30)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA busy_timeout=30000")
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA foreign_keys=ON")
         return connection
+
+    def _ensure_manual_work_allowed(self) -> None:
+        state = self.scheduler_store.state()
+        heartbeat = str(state.get("heartbeat_at") or "")
+        online = False
+        if heartbeat and state.get("pid"):
+            try:
+                age = (datetime.now().astimezone() - datetime.fromisoformat(heartbeat)).total_seconds()
+                online = 0 <= age <= 15
+            except ValueError:
+                pass
+        if online and (
+            str(state.get("desired_state") or "") in {"running", "draining", "restarting"}
+            or str(state.get("actual_state") or "") == "running"
+        ):
+            raise RuntimeError("自动调度器正在运行，请先暂停或停止调度器，再启动手动任务")
 
     @staticmethod
     def _validate_vps_node(body: dict[str, object]) -> tuple[int | None, str, str, str, int]:
@@ -694,6 +712,7 @@ class ConsoleData:
         ]
 
     def create_pipeline_job(self, body: dict[str, object]) -> dict[str, object]:
+        self._ensure_manual_work_allowed()
         batch = str(body.get("batch", "")).strip()
         if not BATCH_RE.fullmatch(batch):
             raise ValueError("批次名无效")
@@ -964,6 +983,7 @@ class ConsoleData:
         self.pipeline_executor.shutdown(wait=False, cancel_futures=True)
 
     def create_author_job(self, body: dict[str, object]) -> dict[str, object]:
+        self._ensure_manual_work_allowed()
         normalized_body = dict(body)
         if str(normalized_body.get("mode", "0-1")).strip() == "derived":
             mothers = self.mother_library()
@@ -1276,7 +1296,9 @@ class ConsoleData:
         with closing(self.connect()) as connection:
             queue = {
                 "news_ready": int(connection.execute("SELECT COUNT(*) FROM news_topics WHERE status='new'").fetchone()[0]),
-                "batches_active": int(connection.execute("SELECT COUNT(*) FROM batches WHERE status!='completed'").fetchone()[0]),
+                "batches_active": int(connection.execute(
+                    "SELECT COUNT(*) FROM batches WHERE status NOT IN ('completed','partial','failed')"
+                ).fetchone()[0]),
                 "questions_ready": int(connection.execute("SELECT COUNT(*) FROM questions WHERE status='approved'").fetchone()[0]),
                 "questions_running": int(connection.execute("SELECT COUNT(*) FROM questions WHERE status='running'").fetchone()[0]),
                 "questions_completed": int(connection.execute("SELECT COUNT(*) FROM questions WHERE status='completed'").fetchone()[0]),
@@ -1291,7 +1313,7 @@ class ConsoleData:
                 "FROM batches b LEFT JOIN questions q ON q.batch_id=b.id "
                 "LEFT JOIN runs x ON x.question_id=q.id "
                 "LEFT JOIN records r ON r.question_id=q.id "
-                "GROUP BY b.id ORDER BY CASE WHEN b.status='completed' THEN 1 ELSE 0 END,b.created_at DESC LIMIT 12"
+                "GROUP BY b.id ORDER BY CASE WHEN b.status IN ('completed','partial','failed') THEN 1 ELSE 0 END,b.created_at DESC LIMIT 12"
             ).fetchall()
             batches = [dict(row) for row in batch_rows]
         config = self.env_config()
