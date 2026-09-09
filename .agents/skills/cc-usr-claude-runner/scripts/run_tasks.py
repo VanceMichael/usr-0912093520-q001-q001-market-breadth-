@@ -116,7 +116,7 @@ def write_windows_launcher(
             f"& {powershell_quote(sys.executable)} {powershell_quote(str(launch_helper))} "
             f"--env-file {powershell_quote(str(env_file))} "
             f"--db {powershell_quote(str(database))} "
-            f"--question-id {question_id} --claude {powershell_quote(claude)}"
+            f"--question-id {question_id} --claude {powershell_quote(claude)} --headless"
         ),
         "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
     ]
@@ -145,10 +145,11 @@ def open_windows(launcher: Path) -> subprocess.Popen[str]:
 
 
 def select_launch_mode(requested: str) -> str:
-    """Resolve auto mode from the host environment, with explicit overrides."""
+    """Resolve launch mode; auto is always unattended, with explicit overrides."""
     if requested in {"iterm", "server"}:
         return requested
-    return "iterm" if platform.system() == "Darwin" and iterm_available() else "server"
+    # Auto launches must not stop on Claude Code's workspace-trust prompt.
+    return "server"
 
 
 def open_server(launcher: Path, folder: Path) -> subprocess.Popen[bytes]:
