@@ -49,7 +49,7 @@ SNAPSHOT_RE = re.compile(r"^https://github\.com/[^/]+/[^/]+/commit/[0-9a-fA-F]{4
 ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 ENV_KEYS = (
     "CC_SWITCH_BASE_URL", "CC_SWITCH_MODEL", "CC_SWITCH_API_KEY", "CC_USR_SUBMITTER",
-    "CC_GITHUB_TOKEN", "CC_AUTHOR_DIFFICULTY",
+    "CC_GITHUB_TOKEN", "CC_AUTHOR_DIFFICULTY", "CC_AUTHOR_BATCH_SIZE",
 )
 PIPELINE_ENV_KEYS = (
     "CC_CLAUDE_DOCKER_IMAGE", "CC_CLAUDE_DOCKER_COMMAND",
@@ -1160,6 +1160,14 @@ class ConsoleData:
                 values[key] = self._env_value(raw)
         return values
 
+    @staticmethod
+    def _author_batch_size(raw: object) -> int:
+        try:
+            value = int(str(raw or "10").strip())
+        except (TypeError, ValueError):
+            return 10
+        return max(1, min(value, 20))
+
     def env_config(self) -> dict[str, object]:
         values = self.read_env()
         key = values["CC_SWITCH_API_KEY"]
@@ -1185,6 +1193,7 @@ class ConsoleData:
             "github_token_configured": bool(github_token),
             "github_token_hint": f"已配置（末尾 {github_token[-4:]}）" if len(github_token) >= 4 else ("已配置" if github_token else "未配置"),
             "author_difficulty": values.get("CC_AUTHOR_DIFFICULTY", "中等").strip() or "中等",
+            "author_batch_size": self._author_batch_size(values.get("CC_AUTHOR_BATCH_SIZE", "")),
             **runtime_info(),
             "docker_image": values.get("CC_CLAUDE_DOCKER_IMAGE", "").strip() or "claude-cli:latest",
             "docker_command": values.get("CC_CLAUDE_DOCKER_COMMAND", "").strip() or "claude",
@@ -1397,6 +1406,7 @@ class ConsoleData:
             "api_key": body.get("api_key", ""),
             "github_token": body.get("github_token", ""),
             "author_difficulty": body.get("author_difficulty", current.get("CC_AUTHOR_DIFFICULTY", "中等")),
+            "author_batch_size": body.get("author_batch_size", current.get("CC_AUTHOR_BATCH_SIZE", "10") or "10"),
             "submitter": body.get("submitter", current["CC_USR_SUBMITTER"]),
             "docker_image": body.get("docker_image", current.get("CC_CLAUDE_DOCKER_IMAGE", "claude-cli:latest")),
             "docker_command": body.get("docker_command", current.get("CC_CLAUDE_DOCKER_COMMAND", "claude")),
@@ -1410,6 +1420,15 @@ class ConsoleData:
         author_difficulty = str(incoming["author_difficulty"] or "中等").strip()
         if author_difficulty not in AUTHOR_DIFFICULTIES:
             raise ValueError("出题难度必须是中等、困难或地狱")
+        raw_batch_size = incoming["author_batch_size"]
+        if isinstance(raw_batch_size, bool) or not isinstance(raw_batch_size, (int, str)):
+            raise ValueError("author_batch_size 配置无效")
+        try:
+            author_batch_size = int(raw_batch_size)
+        except ValueError as exc:
+            raise ValueError("author_batch_size 配置无效") from exc
+        if not 1 <= author_batch_size <= 20:
+            raise ValueError("每批题数必须是 1-20")
         news_feeds = body.get("news_feeds")
         if news_feeds is not None:
             self.update_news_feeds(news_feeds)
@@ -1442,6 +1461,7 @@ class ConsoleData:
             "CC_USR_SUBMITTER": values["submitter"],
             "CC_GITHUB_TOKEN": github_token,
             "CC_AUTHOR_DIFFICULTY": author_difficulty,
+            "CC_AUTHOR_BATCH_SIZE": str(author_batch_size),
             "CC_CLAUDE_DOCKER_IMAGE": values["docker_image"],
             "CC_CLAUDE_DOCKER_COMMAND": values["docker_command"],
             "CC_PIPELINE_MODEL_MODE": values["model_mode"],

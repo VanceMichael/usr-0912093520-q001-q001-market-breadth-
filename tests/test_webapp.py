@@ -177,6 +177,7 @@ class WebConsoleTests(unittest.TestCase):
             self.assertIn('CC_SWITCH_BASE_URL="https://relay.example.com/v1"', content)
             self.assertIn('CC_SWITCH_API_KEY="new-secret"', content)
             self.assertIn('CC_PIPELINE_MODEL_MODE="local"', content)
+            self.assertIn('CC_AUTHOR_BATCH_SIZE="10"', content)
             self.assertNotIn("old-secret", content)
             self.assertEqual(len(result["config"]["news_feeds"]), 3)
             if os.name != "nt":
@@ -243,8 +244,10 @@ class WebConsoleTests(unittest.TestCase):
                 "submitter": "提交人",
                 "github_token": token,
                 "author_difficulty": "中等",
+                "author_batch_size": 10,
             })
             self.assertEqual(result["config"]["author_difficulty"], "中等")
+            self.assertEqual(result["config"]["author_batch_size"], 10)
             self.assertEqual(result["config"]["github_token_hint"], "已配置（末尾 7890）")
             self.assertNotIn(token, json.dumps(result["config"], ensure_ascii=False))
             content = (root / ".env").read_text(encoding="utf-8")

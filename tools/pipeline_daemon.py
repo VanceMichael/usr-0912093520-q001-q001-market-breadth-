@@ -41,7 +41,7 @@ def run_command(command: list[str], cwd: Path, log: Path, timeout: int) -> int:
 
 
 def load_runtime_env(path: Path) -> None:
-    """Load the GitHub token and authoring preference for child CLI processes."""
+    """Load the GitHub token and authoring preferences for child CLI processes."""
     if not path.is_file():
         return
     for line in path.read_text(encoding="utf-8").splitlines():
@@ -58,6 +58,16 @@ def load_runtime_env(path: Path) -> None:
             os.environ.setdefault("GITHUB_TOKEN", value)
         elif key == "CC_AUTHOR_DIFFICULTY" and value:
             os.environ.setdefault("CC_AUTHOR_DIFFICULTY", value)
+        elif key == "CC_AUTHOR_BATCH_SIZE" and value:
+            os.environ.setdefault("CC_AUTHOR_BATCH_SIZE", value)
+
+
+def author_batch_size() -> int:
+    try:
+        value = int(os.environ.get("CC_AUTHOR_BATCH_SIZE", "10").strip() or "10")
+    except ValueError:
+        return 10
+    return max(1, min(value, 20))
 
 
 def codex_command(codex: str, prompt: str) -> list[str]:
@@ -116,7 +126,8 @@ def create_batch(database: Path, codex: str, topic: dict, batch: str, log: Path,
     difficulty = os.environ.get("CC_AUTHOR_DIFFICULTY", "中等").strip() or "中等"
     if difficulty not in {"中等", "困难", "地狱"}:
         difficulty = "中等"
-    prompt = f"""你是持续生产控制 agent。严格读取并遵守项目根目录的 项目规范.md，以及 .agents/skills/cc-usr-question-author/SKILL.md 和 cc-usr-question-qc/SKILL.md。现在创建一个名为 {batch} 的首轮 0-1 代码生成批次，生成 2 道彼此明显不同、业务导向、可执行验收的题目。所有题目的 difficulty 字段必须填写为“{difficulty}”，不得擅自使用其他难度。新闻主题只作为业务背景种子，不要复制新闻标题，不要把新闻事实当成实现要求，也不要使用新闻网站代码或受版权保护的正文。先检查现有 production.sqlite3 的题目避免重复；完成真实初始工程、GitHub 可访问快照、机械质检和重复性质检后才算完成。主题种子如下：{context}。全过程只修改本项目和题目工作区，完成后输出批次名、每题状态和任何阻塞原因。"""
+    batch_size = author_batch_size()
+    prompt = f"""你是持续生产控制 agent。严格读取并遵守项目根目录的 项目规范.md，以及 .agents/skills/cc-usr-question-author/SKILL.md 和 cc-usr-question-qc/SKILL.md。现在创建一个名为 {batch} 的首轮 0-1 代码生成批次，生成 {batch_size} 道彼此明显不同、业务导向、可执行验收的题目。所有题目的 difficulty 字段必须填写为“{difficulty}”，不得擅自使用其他难度。新闻主题只作为业务背景种子，不要复制新闻标题，不要把新闻事实当成实现要求，也不要使用新闻网站代码或受版权保护的正文。先检查现有 production.sqlite3 的题目避免重复；完成真实初始工程、GitHub 可访问快照、机械质检和重复性质检后才算完成。主题种子如下：{context}。全过程只修改本项目和题目工作区，完成后输出批次名、每题状态和任何阻塞原因。"""
     return run_command(codex_command(codex, prompt), PROJECT_ROOT, log, timeout)
 
 

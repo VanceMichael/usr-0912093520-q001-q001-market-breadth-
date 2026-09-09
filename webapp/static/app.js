@@ -270,6 +270,7 @@ function renderSettings() {
   $("#config-github-token").value = "";
   $("#config-github-token-hint").textContent = state.config.github_token_hint || "";
   $("#config-author-difficulty").value = state.config.author_difficulty || "中等";
+  $("#config-author-batch-size").value = state.config.author_batch_size || 10;
   $("#config-model-mode").value = state.config.model_mode || "local";
   $("#config-docker-image").value = state.config.docker_image || "claude-cli:latest";
   $("#config-docker-command").value = state.config.docker_command || "claude";
@@ -953,6 +954,7 @@ $("#settings-form").addEventListener("submit", async (event) => {
         submitter: $("#config-submitter").value,
         github_token: $("#config-github-token").value,
         author_difficulty: $("#config-author-difficulty").value,
+        author_batch_size: Number($("#config-author-batch-size").value),
         model_mode: $("#config-model-mode").value,
         docker_image: $("#config-docker-image").value,
         docker_command: $("#config-docker-command").value,
