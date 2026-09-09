@@ -74,7 +74,9 @@ def test_automatic_author_prompt_is_backend_only() -> None:
     prompt = run.call_args.args[0][-1]
     assert "生成 10 道" in prompt
     assert "只允许纯后端项目" in prompt
-    assert "Go、Python、Node.js（JavaScript 或 TypeScript）、Java、Kotlin、C#/.NET、Rust、PHP" in prompt
+    assert "Go、Python、Node.js（JavaScript 或 TypeScript）、Java" in prompt
+    for excluded in ("Kotlin", "C#/.NET", "Rust", "PHP"):
+        assert excluded not in prompt
     assert "不得要求或创建任何前端页面" in prompt
     assert "不得生成全栈题" in prompt
     assert "不依赖浏览器操作" in prompt

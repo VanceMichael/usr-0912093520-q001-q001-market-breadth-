@@ -335,7 +335,9 @@ class WebConsoleTests(unittest.TestCase):
 
         for prompt in (zero_to_one, derived):
             self.assertIn("只允许纯后端项目", prompt)
-            self.assertIn("Go、Python、Node.js（JavaScript 或 TypeScript）、Java、Kotlin、C#/.NET、Rust、PHP", prompt)
+            self.assertIn("Go、Python、Node.js（JavaScript 或 TypeScript）、Java", prompt)
+            for excluded in ("Kotlin", "C#/.NET", "Rust", "PHP"):
+                self.assertNotIn(excluded, prompt)
             self.assertIn("不得要求或创建任何前端页面", prompt)
             self.assertIn("不得生成全栈题", prompt)
             self.assertIn("不依赖浏览器操作", prompt)

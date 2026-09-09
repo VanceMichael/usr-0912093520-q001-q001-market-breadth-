@@ -9,10 +9,6 @@ BACKEND_LANGUAGES = (
     "Python",
     "Node.js（JavaScript 或 TypeScript）",
     "Java",
-    "Kotlin",
-    "C#/.NET",
-    "Rust",
-    "PHP",
 )
 
 
