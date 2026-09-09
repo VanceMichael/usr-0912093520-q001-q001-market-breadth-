@@ -13,6 +13,8 @@ Read `项目规范.md`, [references/delivery-qc-checklist.md](references/deliver
 
 ## Workflow
 
+质检不是只报告问题的检查步骤，而是“发现即处理”的闭环。任何错误、警告、缺失字段、轨迹不匹配、分数与描述冲突、轮次链断裂或可疑证据一旦发现，必须立即回到权威来源核对并修正；不得先记录“质检通过”、不得带着已知问题导出，也不得把问题留给用户手工补。
+
 1. Check every record in the requested batch:
 
 ```bash
@@ -22,10 +24,10 @@ python3 .agents/skills/cc-usr-delivery-qc/scripts/validate_records.py \
 
 For an explicitly selected question subset, add `--select 1,3-5`; the same selector may be used with `--fixes` and `--finalize` so that a single-question pipeline does not validate unrelated batch records.
 
-2. Review all 28 export fields, not just the reported mechanical errors. Confirm exact prompts, identifiers and trajectory file names, the one-based `当前对话轮次排序`, valid enums and score ranges, snapshot and session consistency, timestamps, parent chains, score-description agreement, and natural evidence-based descriptions. `审核备注` is populated only by finalization.
+2. Review all 28 export fields, not just the reported mechanical errors. Confirm exact prompts, identifiers and trajectory file names, the one-based `当前对话轮次排序`, valid enums and score ranges, snapshot and session consistency, timestamps, parent chains, score-description agreement, and natural evidence-based descriptions. `审核备注` is populated only by finalization. Treat every reported error and warning as an immediate repair task; do not defer it or mark the batch passed while it remains.
    - For every row, open the original JSONL named by `trajectory_file` and match the exact `(SessionID, PromptID, user_prompt)` triple. A terminal `stream-json` output, an execution summary, a prior-turn prompt, or a homepage URL is not evidence and must fail QC. A `继续` turn must contain the literal current user text `继续` while inheriting only the allowed classification metadata.
    - Apply the score ceilings in the producer scoring rubric. In particular, prose admitting no plan/status tracking cannot carry planning 4/5; prose admitting several failures, repeated retries, or unresolved verification cannot carry execution 4/5. Do not “fix” contradiction by deleting the evidence; lower the score or recover stronger evidence.
-3. Do not stop after listing a correctable issue. Resolve it from authoritative evidence: SQLite question/run metadata for inherited fields; the matched session for SessionID, PromptID, prompts, turns, timestamps, and process evidence; and the initial snapshot plus resulting workspace for product evidence. Never guess a missing value.
+3. Do not stop after listing a correctable issue. Resolve it immediately from authoritative evidence: SQLite question/run metadata for inherited fields; the matched session for SessionID, PromptID, prompts, turns, timestamps, and process evidence; and the initial snapshot plus resulting workspace for product evidence. Never guess a missing value. If the first repair does not clear the issue, continue the repair-and-recheck loop in the same task and report the exact blocker only when the source evidence is genuinely unavailable.
 4. Put supported corrections in a temporary JSON file. Each changed record needs a concrete reason:
 
 ```json
@@ -40,7 +42,7 @@ For an explicitly selected question subset, add `--select 1,3-5`; the same selec
 }
 ```
 
-5. Apply the corrections, delete the temporary JSON after it is accepted, and rerun the full check. Continue until no error or warning remains:
+5. Apply the corrections immediately, delete the temporary JSON after it is accepted, and rerun the full check in the same workflow. Continue the repair-and-recheck loop until the report has zero errors and zero warnings. A non-zero validation exit, an unchanged error, or a newly introduced warning means the batch is still blocked and must not be finalized:
 
 ```bash
 python3 .agents/skills/cc-usr-delivery-qc/scripts/validate_records.py \
@@ -48,7 +50,7 @@ python3 .agents/skills/cc-usr-delivery-qc/scripts/validate_records.py \
   --fixes <临时修正文件.json>
 ```
 
-6. Finalize only after the complete batch is compliant:
+6. Finalize only after the complete batch is compliant and the immediately preceding validation report has zero errors and zero warnings. If finalization itself reports a problem, return to the same evidence-based repair loop rather than treating the partial result as passed:
 
 ```bash
 python3 .agents/skills/cc-usr-delivery-qc/scripts/validate_records.py \

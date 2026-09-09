@@ -1,7 +1,7 @@
 interface:
   display_name: "用户满意度交付质检"
-  short_description: "检查并修正批次交付字段，复检通过后记录质检通过"
-  default_prompt: "使用 $cc-usr-delivery-qc 质检指定批次的全部交付记录，修正所有可核验的不合规字段，复检通过后记录质检通过；不要导出 Excel。"
+  short_description: "发现问题立即修正并复检，零错误零警告后记录质检通过"
+  default_prompt: "使用 $cc-usr-delivery-qc 质检指定批次的全部交付记录；发现任何错误、警告或证据冲突都立即依据权威来源修正并重新质检，直到零错误零警告后记录质检通过；不要导出 Excel。"
 
 policy:
   allow_implicit_invocation: true

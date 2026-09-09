@@ -953,7 +953,7 @@ function workflowPrompt() {
     return `使用 $cc-usr-delivery-producer 处理批次 ${batch} 的${scope}。自动定位对应的 Claude Code 会话，提取每轮 SessionID、PromptID 和当前对话轮次排序，读取轨迹、回复、代码、diff 与验证结果，严格按照 项目规范.md 的五维标准逐轮评分并写入 production.sqlite3。不要修改目标模型的代码或轨迹。`;
   }
   if (stage === 4) {
-    return `使用 $cc-usr-delivery-qc 质检批次 ${batch} 的${scope}交付记录。逐项检查 28 个提交字段，包括当前对话轮次排序，发现不合规项必须根据 SQLite、对应会话和实际产物修正并重新质检。全部符合规范后将审核备注写为“质检通过”。不要导出 Excel。`;
+    return `使用 $cc-usr-delivery-qc 质检批次 ${batch} 的${scope}交付记录。逐项检查 28 个提交字段，包括当前对话轮次排序；遇到任何错误、警告、缺失字段或证据冲突都要立即根据 SQLite、对应会话和实际产物修正，并在同一任务中反复复检直到零错误零警告。只有全部符合规范后才将审核备注写为“质检通过”。不要导出 Excel。`;
   }
   return `使用 $cc-usr-excel-exporter 导出批次 ${batch} 的${scope}。只导出已经通过交付质检的记录，按照 A:AB 28 列生成全新 Excel，同时复制对应原始 JSONL 轨迹，Excel 的“轨迹文件”列保持空白。`;
 }
