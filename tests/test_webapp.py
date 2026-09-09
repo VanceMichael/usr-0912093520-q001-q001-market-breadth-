@@ -322,6 +322,24 @@ class WebConsoleTests(unittest.TestCase):
                     "author_difficulty_weights": {"中等": 50, "困难": 20},
                 })
 
+    def test_author_prompts_restrict_zero_to_one_and_derived_tasks_to_backend(self):
+        zero_to_one = ConsoleData.author_prompt(
+            "backend-new", 10, "城市数据服务", "Python", "包含异步任务",
+            difficulty={"中等": 100},
+        )
+        derived = ConsoleData.author_prompt(
+            "backend-derived", 2, "", "", "", mode="derived", task_type="Feature 迭代",
+            mother={"id": 7, "title": "订单服务", "workspace_path": "/tmp/order", "repo_url": "https://example.com/order"},
+            difficulty={"困难": 100},
+        )
+
+        for prompt in (zero_to_one, derived):
+            self.assertIn("只允许纯后端项目", prompt)
+            self.assertIn("Go、Python、Node.js（JavaScript 或 TypeScript）、Java、Kotlin、C#/.NET、Rust、PHP", prompt)
+            self.assertIn("不得要求或创建任何前端页面", prompt)
+            self.assertIn("不得生成全栈题", prompt)
+            self.assertIn("不依赖浏览器操作", prompt)
+
     def test_empty_dashboard_includes_zero_summary(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

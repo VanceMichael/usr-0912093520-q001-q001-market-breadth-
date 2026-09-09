@@ -67,6 +67,7 @@ AUTHOR_JOB_STATUSES = {"queued", "running", "completed", "failed", "interrupted"
 sys.path.insert(0, str(PROJECT_ROOT))
 from tools.runtime_environment import docker_info, repair_docker_engine  # noqa: E402
 from tools.batch_pipeline import SCHEMA_VERSION, connect as initialize_database  # noqa: E402
+from tools.authoring_policy import backend_only_requirement  # noqa: E402
 from tools.scheduler_state import SchedulerStore  # noqa: E402
 
 AUTHOR_JOB_SCHEMA = """
@@ -505,6 +506,7 @@ class ConsoleData:
             return (
                 "在项目根目录执行派生出题任务。先读取项目规范和 cc-usr-question-author 的全部引用，"
                 "使用母库中的 0-1 母项目生成独立的非 0-1 题目批次。\n"
+                f"技术范围：{backend_only_requirement()}\n"
                 f"批次名：{batch}\n题目数量：{count}\n题型：{task_type}\n"
                 f"母库信息：{mother_text}\n难度分配：{difficulty_text}。每道题的 difficulty 字段必须严格按此分配填写。\n出题要求：{requirements or '根据母项目代码、已登记快照和《项目规范.md》自动生成，不需要额外填写关键词。'}\n"
                 f"派生方向：{derived_notes or '围绕母项目已有业务设计真实的后续工作'}\n"
@@ -518,6 +520,7 @@ class ConsoleData:
             ".agents/skills/cc-usr-question-author/references/task-contract.md、"
             ".agents/skills/cc-usr-question-author/references/content-quality.md，"
             "然后严格使用 cc-usr-question-author 的现有 SQLite 出题流程。\n"
+            f"技术范围：{backend_only_requirement()}\n"
             f"批次名：{batch}\n题目数量：{count}\n难度分配：{difficulty_text}。每道题的 difficulty 字段必须严格按此分配填写。\n出题要求：{requirements}\n"
             "创建完整批次和独立题目工作区，准备并提交干净 baseline，创建并推送可访问的 "
             "GitHub 仓库，登记精确的 40 位 SHA 快照，完成机械质检和重复题质检。"

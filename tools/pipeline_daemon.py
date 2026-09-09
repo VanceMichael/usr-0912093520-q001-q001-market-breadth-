@@ -24,6 +24,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from tools.batch_pipeline import connect  # noqa: E402
+from tools.authoring_policy import backend_only_requirement  # noqa: E402
 from tools.news_topics import DEFAULT_FEEDS, configured_feeds, ingest  # noqa: E402
 from tools.scheduler_state import SchedulerStore  # noqa: E402
 
@@ -296,7 +297,7 @@ def create_batch(database: Path, codex: str, topic: dict, batch: str, log: Path,
     context = json.dumps({key: topic.get(key, "") for key in ("title", "summary", "article_url", "source_url", "published_at")}, ensure_ascii=False)
     batch_size = author_batch_size()
     distribution = difficulty_distribution(batch_size, difficulty_plan())
-    prompt = f"""你是持续生产控制 agent。严格读取并遵守项目根目录的 项目规范.md，以及 .agents/skills/cc-usr-question-author/SKILL.md 和 cc-usr-question-qc/SKILL.md。现在创建一个名为 {batch} 的首轮 0-1 代码生成批次，生成 {batch_size} 道彼此明显不同、业务导向、可执行验收的题目。难度必须严格分配为：{distribution}；每道题的 difficulty 字段按此填写，不得擅自改变题数或难度。新闻主题只作为业务背景种子，不要复制新闻标题，不要把新闻事实当成实现要求，也不要使用新闻网站代码或受版权保护的正文。先检查现有 production.sqlite3 的题目避免重复；完成真实初始工程、GitHub 可访问快照、机械质检和重复性质检后才算完成。主题种子如下：{context}。全过程只修改本项目和题目工作区，完成后输出批次名、每题状态和任何阻塞原因。"""
+    prompt = f"""你是持续生产控制 agent。严格读取并遵守项目根目录的 项目规范.md，以及 .agents/skills/cc-usr-question-author/SKILL.md 和 cc-usr-question-qc/SKILL.md。现在创建一个名为 {batch} 的首轮 0-1 代码生成批次，生成 {batch_size} 道彼此明显不同、业务导向、可执行验收的题目。难度必须严格分配为：{distribution}；每道题的 difficulty 字段按此填写，不得擅自改变题数或难度。{backend_only_requirement()}新闻主题只作为业务背景种子，不要复制新闻标题，不要把新闻事实当成实现要求，也不要使用新闻网站代码或受版权保护的正文。先检查现有 production.sqlite3 的题目避免重复；完成真实初始工程、GitHub 可访问快照、机械质检和重复性质检后才算完成。主题种子如下：{context}。全过程只修改本项目和题目工作区，完成后输出批次名、每题状态和任何阻塞原因。"""
     return run_command(codex_command(codex, prompt), PROJECT_ROOT, log, timeout, store)
 
 
