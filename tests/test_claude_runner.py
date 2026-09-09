@@ -144,11 +144,11 @@ class RunnerTests(unittest.TestCase):
         with mock.patch.object(run_tasks.platform, "system", return_value="Linux"):
             self.assertEqual(run_tasks.select_launch_mode("auto"), "server")
 
-    def test_auto_mode_uses_iterm_when_available(self):
+    def test_auto_mode_remains_unattended_on_macos_with_iterm(self):
         with mock.patch.object(
             run_tasks.platform, "system", return_value="Darwin"
         ), mock.patch.object(run_tasks, "iterm_available", return_value=True):
-            self.assertEqual(run_tasks.select_launch_mode("auto"), "iterm")
+            self.assertEqual(run_tasks.select_launch_mode("auto"), "server")
 
     def test_launch_helper_uses_question_directory_and_exact_command(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -277,6 +277,7 @@ class RunnerTests(unittest.TestCase):
             ):
                 self.assertNotIn(forbidden, generated)
             self.assertIn("--question-id", generated)
+            self.assertIn("--headless", generated)
             self.assertIn("C:/npm/claude.cmd", generated)
             connection = connect(database)
             run = connection.execute("SELECT * FROM runs").fetchone()

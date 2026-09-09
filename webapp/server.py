@@ -2266,8 +2266,6 @@ class ConsoleData:
 
     def launch(self, batch: object, numbers: object) -> dict:
         batch_name, selected = self.validate_selection(batch, numbers)
-        if len(selected) > 4:
-            raise ValueError("单次最多启动 4 道题")
         script = self.project_root / ".agents/skills/cc-usr-claude-runner/scripts/run_tasks.py"
         return self.run_tool([
             sys.executable,
