@@ -111,6 +111,7 @@ def build_claude_command(claude: str, prompt: str, *, headless: bool = False) ->
         return [
             claude,
             "--print",
+            "--verbose",
             "--dangerously-skip-permissions",
             "--permission-mode",
             "bypassPermissions",

@@ -8,7 +8,7 @@ Put the relay URL, model name, and key in root `.env`; `.env.example` is the fie
 
 Preview shows the exact working directory while hiding all three configuration values and the prompt. Launch creates `<批次>/.runs/<时间>/<任务ID>/launch.command` for detached server runs or visible macOS iTerm2 runs, and `launch.ps1` for Windows PowerShell. `--mode auto` always uses unattended execution and shows it in iTerm2 on macOS when available; `--mode server` is detached; `--mode iterm` is an explicit interactive override. Both local and headless paths register the run in SQLite. Generated launchers contain only database/question references and paths, never the URL, model, key, or prompt.
 
-Each helper re-reads `.env`, maps the three values to Claude Code environment variables, changes into the question folder, and invokes `claude --dangerously-skip-permissions <SQLite 原始 prompt>` interactively, or `claude --print --dangerously-skip-permissions --permission-mode bypassPermissions --permission-prompts none <SQLite 原始 prompt>` headlessly. The runner never prints the key or reads the trajectory.
+Each helper re-reads `.env`, maps the three values to Claude Code environment variables, changes into the question folder, and invokes `claude --dangerously-skip-permissions <SQLite 原始 prompt>` interactively, or `claude --print --verbose --dangerously-skip-permissions --permission-mode bypassPermissions --permission-prompts none <SQLite 原始 prompt>` headlessly. The visible macOS headless window shows verbose tool activity; the runner never prints the key or reads the trajectory.
 
 One selected question starts one new session. Keep each conversation to at most ten counted turns. Network failures do not count; a human `继续` after thinking-limit exhaustion does count.
 

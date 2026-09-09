@@ -105,6 +105,7 @@ class RunnerTests(unittest.TestCase):
         )
         self.assertEqual(command[-1], prompt)
         self.assertIn("--print", command)
+        self.assertIn("--verbose", command)
         self.assertIn("--dangerously-skip-permissions", command)
         self.assertIn("--permission-mode", command)
         self.assertIn("bypassPermissions", command)
@@ -196,7 +197,7 @@ class RunnerTests(unittest.TestCase):
             output = stdout.getvalue()
             self.assertIn(f"cd {shlex.quote(str(row['folder_path']))}", output)
             self.assertIn(
-                "claude --print --dangerously-skip-permissions "
+                "claude --print --verbose --dangerously-skip-permissions "
                 "--permission-mode bypassPermissions --permission-prompts none "
                 "<SQLite 原始 prompt>",
                 output,
