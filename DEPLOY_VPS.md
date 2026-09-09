@@ -50,4 +50,25 @@ git pull --ff-only origin codex/vps-docker-pipeline
 sudo systemctl start ccusr-pipeline.service
 ```
 
+控制台和守护进程共享 `production.sqlite3` 中的调度状态。控制台“调度器”页面可以开始、暂停接单、排空后暂停、立即停止、逻辑重启和清除错误重试。守护进程即使处于“已停止”状态也会保持驻留并响应新的开始指令。
+
+VPS 控制台继续只监听回环地址。由本机建立隧道后访问：
+
+```bash
+ssh -N -L 18787:127.0.0.1:8787 ubuntu@43.161.250.107
+```
+
+认证成功后终端持续无输出是正常状态。浏览器打开 `http://127.0.0.1:18787/`；本机 `4173` 控制台也会通过该地址聚合 VPS 调度状态、事件、原始日志和交付包。
+
+## macOS 本机常驻
+
+本机和 VPS 完全独立抓取各自配置的新闻来源。安装本机 `launchd` 服务后，控制台和调度器会在登录时启动，并在异常退出后自动拉起：
+
+```bash
+chmod +x deploy/install_macos_services.sh
+./deploy/install_macos_services.sh
+```
+
+默认控制台地址为 `http://127.0.0.1:4173/`。Docker Desktop、Codex CLI 和 Claude Code 凭据仍需保持可用；电脑关机或休眠期间本机节点不会继续生产，VPS 不受影响。
+
 不要把 `/var/run/docker.sock` 暴露给 Claude worker；它只由宿主机调度器使用。长期生产建议使用 rootless Docker 或独立 worker 主机，并监控磁盘、模型额度、`runs/daemon/` 错误和 systemd 重启次数。

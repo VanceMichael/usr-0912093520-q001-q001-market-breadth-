@@ -223,6 +223,44 @@ class WebConsoleTests(unittest.TestCase):
             })
             self.assertEqual(saved["name"], "VPS-02")
 
+    def test_scheduler_snapshot_and_control_include_operational_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = ConsoleData(self.make_database(root), root)
+            try:
+                data.scheduler_store.startup()
+                with mock.patch.object(data, "_scheduler_containers", return_value=[]), mock.patch.object(
+                    data, "_scheduler_git", return_value={"branch": "test", "commit": "abc1234", "dirty": False}
+                ):
+                    snapshot = data.scheduler_snapshot()
+                self.assertTrue(snapshot["state"]["process_online"])
+                self.assertEqual(snapshot["git"]["branch"], "test")
+                self.assertEqual(snapshot["queue"]["questions_ready"], 1)
+                self.assertEqual(snapshot["config"]["batch_size"], 10)
+
+                result = data.scheduler_control("pause")
+                self.assertEqual(result["desired_state"], "paused")
+                events = data.scheduler_events({"limit": ["10"]})["events"]
+                self.assertEqual(events[-1]["event_type"], "control_requested")
+            finally:
+                data.shutdown()
+
+    def test_remote_scheduler_control_is_proxied_to_selected_vps(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = ConsoleData(self.make_database(root), root)
+            try:
+                response = {"ok": True, "desired_state": "paused"}
+                with mock.patch.object(
+                    data, "_vps_request", return_value=(json.dumps(response).encode(), {})
+                ) as request:
+                    result = data.vps_scheduler_control(1, "pause")
+                self.assertEqual(result, response)
+                self.assertEqual(request.call_args.kwargs["method"], "POST")
+                self.assertEqual(request.call_args.kwargs["payload"], {"action": "pause"})
+            finally:
+                data.shutdown()
+
     def test_env_config_keeps_existing_key_when_blank(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

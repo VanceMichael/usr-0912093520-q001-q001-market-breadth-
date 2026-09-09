@@ -14,11 +14,18 @@ const state = {
   authorJobs: [],
   mothers: [],
   pipelineJobs: [],
+  schedulers: [],
+  selectedScheduler: "local",
+  schedulerLogMode: "events",
+  schedulerEvents: [],
+  schedulerRawLogs: [],
 };
 let drawerCloseTimer = null;
 let authorJobsTimer = null;
 let authorJobsSignature = "";
 let pipelineJobsSignature = "";
+let schedulerTimer = null;
+let schedulerEventSource = null;
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
@@ -45,7 +52,9 @@ function formatDate(value) {
 function formatBytes(bytes) {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 ** 2) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+  if (bytes < 1024 ** 3) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+  if (bytes < 1024 ** 4) return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
+  return `${(bytes / 1024 ** 4).toFixed(1)} TB`;
 }
 
 async function api(path, options = {}) {
@@ -153,7 +162,7 @@ function renderFiles() {
     ? `已下载 ${downloads} 次 · 最近 ${formatDate(state.data.batch.last_downloaded_at)}`
     : "尚未下载交付包";
   status.classList.toggle("downloaded", downloads > 0);
-  $("#delivery-package-button").innerHTML = `<i data-lucide="archive-download"></i>${downloads ? "再次下载" : "下载交付包"}`;
+  $("#delivery-package-button").innerHTML = `<i data-lucide="file-archive"></i>${downloads ? "再次下载" : "下载交付包"}`;
   $("#file-list").innerHTML = files.length ? files.map((file) => `
     <div class="file-row">
       <span class="file-icon"><i data-lucide="${file.type === "workbook" ? "file-spreadsheet" : "file-json"}"></i></span>
@@ -168,8 +177,9 @@ function renderView() {
   const settingsView = state.view === "settings";
   const authorView = state.view === "author";
   const vpsView = state.view === "vps";
-  const nonProductionView = exportsView || settingsView || authorView || vpsView;
-  $(".batch-toolbar").hidden = settingsView || authorView || vpsView;
+  const schedulerView = state.view === "scheduler";
+  const nonProductionView = exportsView || settingsView || authorView || vpsView || schedulerView;
+  $(".batch-toolbar").hidden = settingsView || authorView || vpsView || schedulerView;
   $(".pipeline-band").hidden = nonProductionView;
   $(".list-controls").hidden = nonProductionView;
   $(".table-panel").hidden = nonProductionView;
@@ -177,6 +187,7 @@ function renderView() {
   $("#settings-view").hidden = !settingsView;
   $("#author-view").hidden = !authorView;
   $("#vps-view").hidden = !vpsView;
+  $("#scheduler-view").hidden = !schedulerView;
   $("#pipeline-jobs-panel").hidden = nonProductionView;
   const titles = {
     author: ["生成题目", "填写批次信息和关键词，生成可复制的标准出题命令。"],
@@ -185,6 +196,7 @@ function renderView() {
     exports: ["导出中心", "集中查看当前批次的工作簿和原始 JSONL 轨迹。"],
     settings: ["运行配置", "修改下一次 Claude Code 启动使用的中转地址、模型和提交人。"],
     vps: ["VPS 管理", "统一查看远程 VPS 节点状态、批次进度和交付物。"],
+    scheduler: ["调度器", "查看本机与独立 VPS 的生产现场、资源、容器和实时日志。"],
   };
   $("#page-title").textContent = titles[state.view][0];
   $("#page-subtitle").textContent = titles[state.view][1];
@@ -192,6 +204,7 @@ function renderView() {
   if (exportsView) renderFiles();
   else if (settingsView) renderSettings();
   else if (vpsView) renderVps();
+  else if (schedulerView) renderScheduler();
   else if (!authorView) renderRows();
 }
 
@@ -238,7 +251,7 @@ function renderVpsDetail() {
   const summary = dashboard.summary || {};
   const batch = dashboard.batch || {};
   const questions = dashboard.questions || [];
-  container.innerHTML = `<div class="vps-detail-head"><div><h3>${escapeHtml(node.name)} · ${escapeHtml(batch.name || "暂无批次")}</h3><p>${escapeHtml(node.base_url)} · 共 ${questions.length} 道题</p></div><div><a class="button secondary compact" href="${escapeHtml(node.base_url)}" target="_blank" rel="noreferrer">打开原始页面</a><button class="button primary compact" id="vps-package-download" type="button"><i data-lucide="archive-download"></i>下载交付包</button></div></div><div class="vps-summary"><span class="summary-chip">题目<strong>${summary.total || 0}</strong></span><span class="summary-chip">待处理<strong>${summary.waiting || 0}</strong></span><span class="summary-chip success">质检通过<strong>${summary.qc_passed || 0}</strong></span><span class="summary-chip success">已交付<strong>${summary.delivered || 0}</strong></span></div><div class="vps-batch-list">${questions.length ? questions.map((question) => `<div class="vps-batch"><div><strong>第 ${question.question_no} 题 · ${escapeHtml(question.title)}</strong><span>${escapeHtml(question.stage_label || "未知阶段")}</span></div><span class="tag ${question.exported ? "green" : "amber"}">${question.exported ? "已导出" : "进行中"}</span></div>`).join("") : `<div class="empty-state"><strong>当前批次暂无题目</strong></div>`}</div>`;
+  container.innerHTML = `<div class="vps-detail-head"><div><h3>${escapeHtml(node.name)} · ${escapeHtml(batch.name || "暂无批次")}</h3><p>${escapeHtml(node.base_url)} · 共 ${questions.length} 道题</p></div><div><a class="button secondary compact" href="${escapeHtml(node.base_url)}" target="_blank" rel="noreferrer">打开原始页面</a><button class="button primary compact" id="vps-package-download" type="button"><i data-lucide="file-archive"></i>下载交付包</button></div></div><div class="vps-summary"><span class="summary-chip">题目<strong>${summary.total || 0}</strong></span><span class="summary-chip">待处理<strong>${summary.waiting || 0}</strong></span><span class="summary-chip success">质检通过<strong>${summary.qc_passed || 0}</strong></span><span class="summary-chip success">已交付<strong>${summary.delivered || 0}</strong></span></div><div class="vps-batch-list">${questions.length ? questions.map((question) => `<div class="vps-batch"><div><strong>第 ${question.question_no} 题 · ${escapeHtml(question.title)}</strong><span>${escapeHtml(question.stage_label || "未知阶段")}</span></div><span class="tag ${question.exported ? "green" : "amber"}">${question.exported ? "已导出" : "进行中"}</span></div>`).join("") : `<div class="empty-state"><strong>当前批次暂无题目</strong></div>`}</div>`;
   $("#vps-package-download").addEventListener("click", downloadVpsPackage);
   refreshIcons();
 }
@@ -265,6 +278,185 @@ async function downloadVpsPackage() {
     document.body.append(anchor); anchor.click(); anchor.remove(); URL.revokeObjectURL(url);
     toast("远程交付包已开始下载");
   } catch (error) { toast(error.message, true); }
+}
+
+function schedulerSelection() {
+  return state.schedulers.find((item) => item.key === state.selectedScheduler) || state.schedulers[0] || null;
+}
+
+function schedulerStateLabel(value) {
+  return ({ running: "运行中", paused: "已暂停", draining: "正在排空", stopped: "已停止", restarting: "正在重启", error: "异常" })[value] || "未知";
+}
+
+function schedulerPhaseLabel(value) {
+  return ({ idle: "等待下一轮", news: "抓取新闻", author: "出题与题目质检", model: "Claude 跑题", delivery: "交付生产", delivery_qc: "交付质检", export: "Excel / JSONL 导出", error: "异常" })[value] || value || "未上报";
+}
+
+function renderResource(label, percent, detail, warning = 85) {
+  const value = Number(percent);
+  const known = Number.isFinite(value);
+  return `<div class="resource-row"><div><span>${escapeHtml(label)}</span><strong>${escapeHtml(detail)}</strong></div><div class="resource-track"><span class="${known && value >= warning ? "warning" : ""}" style="width:${known ? Math.min(100, Math.max(0, value)) : 0}%"></span></div></div>`;
+}
+
+function renderScheduler() {
+  const strip = $("#scheduler-node-strip");
+  if (!strip) return;
+  if (!state.schedulers.length) {
+    strip.innerHTML = `<div class="empty-state"><strong>正在读取调度节点</strong></div>`;
+    return;
+  }
+  if (!schedulerSelection()) state.selectedScheduler = state.schedulers[0].key;
+  strip.innerHTML = state.schedulers.map((item) => {
+    const runtime = item.snapshot?.state || {};
+    const online = item.online && runtime.process_online;
+    return `<button class="scheduler-node ${item.key === state.selectedScheduler ? "active" : ""}" data-scheduler-node="${escapeHtml(item.key)}"><span class="node-signal ${online ? "online" : ""}"></span><span><strong>${escapeHtml(item.name)}</strong><small>${item.kind === "local" ? "本机" : "独立 VPS"}</small></span><em>${online ? schedulerStateLabel(runtime.actual_state) : item.online ? "守护进程离线" : "节点离线"}</em></button>`;
+  }).join("");
+  const selected = schedulerSelection();
+  const snapshot = selected?.snapshot;
+  if (!selected?.online || !snapshot) {
+    $("#scheduler-overview").innerHTML = `<div class="scheduler-status-line offline"><div><span class="node-signal"></span><div><strong>${escapeHtml(selected?.name || "节点")}</strong><p>${escapeHtml(selected?.error || "控制台不可达，请检查 SSH 隧道和远端服务。")}</p></div></div></div>`;
+    $("#scheduler-queue").innerHTML = "";
+    $("#scheduler-resources").innerHTML = "";
+    $("#scheduler-batches").innerHTML = "";
+    $("#scheduler-containers").innerHTML = `<div class="empty-state"><strong>节点离线</strong></div>`;
+    $("#scheduler-cycles").innerHTML = "";
+    $$("[data-scheduler-action]").forEach((button) => { button.disabled = true; });
+    refreshIcons();
+    return;
+  }
+  $$("[data-scheduler-action]").forEach((button) => { button.disabled = false; });
+  const runtime = snapshot.state || {};
+  const online = Boolean(runtime.process_online);
+  const status = online ? runtime.actual_state : "stopped";
+  $("#scheduler-overview").innerHTML = `<div class="scheduler-status-line ${escapeHtml(status)}"><div><span class="node-signal ${online ? "online" : ""}"></span><div><strong>${escapeHtml(selected.name)} · ${online ? schedulerStateLabel(runtime.actual_state) : "守护进程离线"}</strong><p>${escapeHtml(schedulerPhaseLabel(runtime.phase))}${runtime.batch_name ? ` · ${escapeHtml(runtime.batch_name)}` : ""} · ${escapeHtml(runtime.detail || "暂无运行详情")}</p></div></div><dl><div><dt>心跳</dt><dd>${runtime.heartbeat_age_seconds === null ? "暂无" : `${runtime.heartbeat_age_seconds} 秒前`}</dd></div><div><dt>PID</dt><dd>${runtime.pid || "-"}</dd></div><div><dt>已完成周期</dt><dd>${runtime.cycle_count || 0}</dd></div><div><dt>连续失败</dt><dd>${runtime.consecutive_failures || 0}</dd></div></dl></div>${runtime.last_error ? `<div class="scheduler-error"><i data-lucide="triangle-alert"></i><span>${escapeHtml(runtime.last_error)}</span></div>` : ""}`;
+  const queue = snapshot.queue || {};
+  const stats = [["新闻待用", queue.news_ready], ["活跃批次", queue.batches_active], ["待跑题", queue.questions_ready], ["运行中", queue.questions_running], ["已完成题", queue.questions_completed], ["质检记录", queue.deliveries_passed]];
+  $("#scheduler-queue").innerHTML = stats.map(([label, value]) => `<div class="scheduler-stat"><span>${label}</span><strong>${value || 0}</strong></div>`).join("");
+  $("#scheduler-current-batch").textContent = runtime.batch_name ? `当前 ${runtime.batch_name}` : schedulerPhaseLabel(runtime.phase);
+  const batches = snapshot.batches || [];
+  $("#scheduler-batches").innerHTML = batches.length ? batches.map((batch) => {
+    const total = Number(batch.total || 0);
+    const passed = Number(batch.qc_passed || 0);
+    const percent = batch.status === "completed" ? 100 : (total ? Math.round(passed * 100 / total) : 0);
+    let label = "题目准备中";
+    if (batch.status === "completed") label = "已交付";
+    else if (passed) label = "交付质检中";
+    else if (Number(batch.records)) label = "交付生产中";
+    else if (Number(batch.running)) label = "Claude 跑题中";
+    else if (Number(batch.completed)) label = "等待交付生产";
+    return `<div class="scheduler-batch-row"><div><strong>${escapeHtml(batch.name)}</strong><span>${escapeHtml(label)} · ${total} 道</span></div><div class="batch-progress-track"><span style="width:${percent}%"></span></div><div class="batch-progress-numbers"><span>模型 ${batch.completed || 0}/${total}</span><span>记录 ${batch.records || 0}/${total}</span><span>质检 ${passed}/${total}</span></div></div>`;
+  }).join("") : `<div class="empty-state compact-empty"><strong>当前节点暂无批次</strong></div>`;
+  const resources = snapshot.resources || {};
+  const load = resources.load_average || [];
+  const cpuPercent = load.length ? Math.round(load[0] * 100 / Math.max(1, resources.cpu_count || 1)) : null;
+  $("#scheduler-resources").innerHTML = [
+    renderResource("CPU 负载", cpuPercent, `${resources.cpu_count || "-"} 核 · ${load.length ? load.join(" / ") : "暂无"}`),
+    renderResource("内存", resources.memory_percent, resources.memory_total ? `${formatBytes(resources.memory_used)} / ${formatBytes(resources.memory_total)}` : "暂无"),
+    renderResource("磁盘", resources.disk_percent, `${formatBytes(resources.disk_used || 0)} / ${formatBytes(resources.disk_total || 0)}`, 80),
+  ].join("");
+  const git = snapshot.git || {};
+  $("#scheduler-git").textContent = `${git.branch || "无分支"} @ ${git.commit || "未知"}${git.dirty ? " · 有未提交修改" : ""}`;
+  const config = snapshot.config || {};
+  const weights = Object.entries(config.difficulty_weights || {}).filter(([, value]) => Number(value) > 0).map(([key, value]) => `${key} ${value}%`).join(" / ");
+  $("#scheduler-config-summary").textContent = `每批 ${config.batch_size || 10} 道 · 并发 ${config.model_concurrency || 2} · ${weights || "中等 100%"}`;
+  const containers = snapshot.containers || [];
+  $("#scheduler-containers").innerHTML = containers.length ? containers.map((container) => `<div class="scheduler-container"><i data-lucide="box"></i><div><strong>${escapeHtml(container.name)}</strong><span>${escapeHtml(container.image)} · ${escapeHtml(container.status)}</span></div></div>`).join("") : `<div class="empty-state compact-empty"><strong>当前没有运行中的容器</strong></div>`;
+  const cycles = snapshot.cycles || [];
+  $("#scheduler-cycles").innerHTML = cycles.length ? cycles.map((cycle) => `<div class="scheduler-cycle"><span class="cycle-state ${escapeHtml(cycle.status)}"></span><div><strong>#${cycle.id} ${escapeHtml(cycle.batch_name || "常规巡检")}</strong><span>${formatDate(cycle.started_at)} · ${escapeHtml(cycle.status)}</span></div></div>`).join("") : `<div class="empty-state compact-empty"><strong>暂无运行周期</strong></div>`;
+  refreshIcons();
+}
+
+async function loadSchedulers({ quiet = false } = {}) {
+  try {
+    const local = await api("/api/scheduler");
+    if (!state.vpsNodes.length) {
+      const nodes = await api("/api/vps-nodes");
+      state.vpsNodes = nodes.nodes || [];
+    }
+    const remote = await Promise.all(state.vpsNodes.filter((node) => node.enabled).map(async (node) => {
+      try {
+        const snapshot = await api(`/api/vps-nodes/${node.id}/scheduler`);
+        return { key: `vps-${node.id}`, id: node.id, name: node.name, kind: "remote", online: true, baseUrl: node.base_url, snapshot };
+      } catch (error) {
+        return { key: `vps-${node.id}`, id: node.id, name: node.name, kind: "remote", online: false, baseUrl: node.base_url, error: error.message };
+      }
+    }));
+    state.schedulers = [{ key: "local", name: local.node?.name || "本机", kind: "local", online: true, snapshot: local }, ...remote];
+    renderScheduler();
+    if (state.view === "scheduler") await loadSchedulerLogs();
+  } catch (error) {
+    if (!quiet) toast(error.message, true);
+  }
+}
+
+async function loadSchedulerLogs() {
+  const selected = schedulerSelection();
+  if (!selected?.online) return;
+  if (schedulerEventSource) {
+    schedulerEventSource.close();
+    schedulerEventSource = null;
+  }
+  const params = new URLSearchParams({ limit: "500" });
+  const search = $("#scheduler-log-search").value.trim();
+  const level = $("#scheduler-log-level").value;
+  const phase = $("#scheduler-log-phase").value;
+  if (search) params.set("search", search);
+  if (level) params.set("level", level);
+  if (phase) params.set("phase", phase);
+  try {
+    if (state.schedulerLogMode === "raw") {
+      const base = selected.kind === "local" ? "/api/scheduler/logs" : `/api/vps-nodes/${selected.id}/scheduler/logs`;
+      const result = await api(`${base}?${params}`);
+      state.schedulerRawLogs = result.lines || [];
+      renderSchedulerLogs();
+      return;
+    }
+    const base = selected.kind === "local" ? "/api/scheduler/events" : `/api/vps-nodes/${selected.id}/scheduler/events`;
+    const result = await api(`${base}?${params}`);
+    state.schedulerEvents = result.events || [];
+    renderSchedulerLogs();
+    if (selected.kind === "local" && !search && !level) startSchedulerEventStream(result.next_after || 0);
+  } catch (error) {
+    $("#scheduler-log").innerHTML = `<div class="empty-state"><strong>日志读取失败</strong><span>${escapeHtml(error.message)}</span></div>`;
+  }
+}
+
+function startSchedulerEventStream(after) {
+  schedulerEventSource = new EventSource(`/api/scheduler/events/stream?after=${encodeURIComponent(after)}`);
+  schedulerEventSource.addEventListener("scheduler", (event) => {
+    try {
+      state.schedulerEvents.push(JSON.parse(event.data));
+      state.schedulerEvents = state.schedulerEvents.slice(-500);
+      renderSchedulerLogs();
+    } catch {}
+  });
+}
+
+function renderSchedulerLogs() {
+  const container = $("#scheduler-log");
+  if (state.schedulerLogMode === "raw") {
+    $("#scheduler-log-status").textContent = `原始日志 · ${state.schedulerRawLogs.length} 行`;
+    container.innerHTML = state.schedulerRawLogs.length ? `<pre>${state.schedulerRawLogs.map((item) => `<span><b>${escapeHtml(item.source)}</b> ${escapeHtml(item.line)}</span>`).join("\n")}</pre>` : `<div class="empty-state compact-empty"><strong>暂无匹配的原始日志</strong></div>`;
+  } else {
+    $("#scheduler-log-status").textContent = `结构化事件 · ${state.schedulerEvents.length} 条`;
+    container.innerHTML = state.schedulerEvents.length ? state.schedulerEvents.slice().reverse().map((event) => `<div class="scheduler-event ${escapeHtml(event.level)}"><time>${formatDate(event.created_at)}</time><span class="event-level">${escapeHtml(event.level)}</span><div><strong>${escapeHtml(event.message)}</strong><span>${escapeHtml(schedulerPhaseLabel(event.phase))}${event.batch_name ? ` · ${escapeHtml(event.batch_name)}` : ""}</span></div></div>`).join("") : `<div class="empty-state compact-empty"><strong>暂无匹配的调度事件</strong></div>`;
+  }
+}
+
+async function controlScheduler(action) {
+  const selected = schedulerSelection();
+  if (!selected?.online) return;
+  const execute = async () => {
+    const path = selected.kind === "local" ? "/api/scheduler/control" : `/api/vps-nodes/${selected.id}/scheduler/control`;
+    const result = await api(path, { method: "POST", body: JSON.stringify({ action }) });
+    toast(result.message || `已发送${schedulerStateLabel(result.desired_state)}指令`);
+    await loadSchedulers({ quiet: true });
+  };
+  if (action === "stop") {
+    openModal("立即停止调度器", "将终止当前 Codex 或 Claude Code 子进程及其任务容器。已写入数据库的进度会保留。", "确认停止", async () => { closeModal(); await execute(); });
+  } else {
+    await execute();
+  }
 }
 
 function renderSettings() {
@@ -887,7 +1079,7 @@ function closeDrawer() {
   }, 180);
 }
 
-$("#refresh-button").addEventListener("click", () => loadDashboard());
+$("#refresh-button").addEventListener("click", () => state.view === "scheduler" ? loadSchedulers() : loadDashboard());
 $("#batch-select").addEventListener("change", (event) => {
   state.stage = null;
   loadDashboard(event.target.value);
@@ -901,7 +1093,7 @@ $("#filter-tabs").addEventListener("click", (event) => {
   const button = event.target.closest("[data-filter]");
   if (!button) return;
   state.filter = button.dataset.filter;
-  $$(".filter-tab").forEach((item) => item.classList.toggle("active", item === button));
+  $$("#filter-tabs .filter-tab").forEach((item) => item.classList.toggle("active", item === button));
   renderRows();
 });
 $("#pipeline-track").addEventListener("click", (event) => {
@@ -982,6 +1174,15 @@ $(".nav-list").addEventListener("click", (event) => {
   state.view = button.dataset.view;
   state.stage = null;
   if (state.view === "settings" && !state.config) loadConfig();
+  if (state.view === "scheduler") {
+    loadSchedulers();
+    if (!schedulerTimer) schedulerTimer = setInterval(() => loadSchedulers({ quiet: true }), 5000);
+  } else {
+    if (schedulerTimer) clearInterval(schedulerTimer);
+    schedulerTimer = null;
+    if (schedulerEventSource) schedulerEventSource.close();
+    schedulerEventSource = null;
+  }
   renderView();
 });
 $("#settings-form").addEventListener("submit", async (event) => {
@@ -1095,6 +1296,40 @@ $("#vps-form").addEventListener("submit", async (event) => {
     await loadVpsNodes();
   } catch (error) { toast(error.message, true); }
 });
+$("#scheduler-node-strip").addEventListener("click", async (event) => {
+  const button = event.target.closest("[data-scheduler-node]");
+  if (!button) return;
+  state.selectedScheduler = button.dataset.schedulerNode;
+  renderScheduler();
+  await loadSchedulerLogs();
+});
+$("#scheduler-controls").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-scheduler-action]");
+  if (button) controlScheduler(button.dataset.schedulerAction).catch((error) => toast(error.message, true));
+});
+$("#scheduler-refresh").addEventListener("click", () => loadSchedulers());
+$("#scheduler-log-tabs").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-log-mode]");
+  if (!button) return;
+  state.schedulerLogMode = button.dataset.logMode;
+  $$("#scheduler-log-tabs .filter-tab").forEach((item) => item.classList.toggle("active", item === button));
+  loadSchedulerLogs();
+});
+$("#scheduler-log-level").addEventListener("change", loadSchedulerLogs);
+$("#scheduler-log-phase").addEventListener("change", loadSchedulerLogs);
+$("#scheduler-log-search").addEventListener("change", loadSchedulerLogs);
+$("#scheduler-log-download").addEventListener("click", () => {
+  const selected = schedulerSelection();
+  const content = state.schedulerLogMode === "raw"
+    ? state.schedulerRawLogs.map((item) => `[${item.source}] ${item.line}`).join("\n")
+    : state.schedulerEvents.map((event) => JSON.stringify(event)).join("\n");
+  const blob = new Blob([content + "\n"], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = `ccusr-${selected?.name || "scheduler"}-${state.schedulerLogMode}.log`;
+  document.body.append(anchor); anchor.click(); anchor.remove(); URL.revokeObjectURL(url);
+});
 $("#file-list").addEventListener("click", (event) => {
   const button = event.target.closest("[data-file-path]");
   if (button) copyText(button.dataset.filePath, "文件路径已复制");
@@ -1141,6 +1376,7 @@ document.addEventListener("visibilitychange", () => {
   if (!document.hidden) {
     loadPipelineJobs();
     loadAuthorJobs();
+    if (state.view === "scheduler") loadSchedulers({ quiet: true });
   }
 });
 $("#drawer-close").addEventListener("click", closeDrawer);

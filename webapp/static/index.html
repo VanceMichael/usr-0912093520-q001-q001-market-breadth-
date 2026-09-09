@@ -19,6 +19,7 @@
         <button class="nav-item active" data-view="production"><i data-lucide="list-checks"></i><span>生产批次</span></button>
         <button class="nav-item" data-view="records"><i data-lucide="database"></i><span>交付记录</span></button>
         <button class="nav-item" data-view="exports"><i data-lucide="file-spreadsheet"></i><span>导出中心</span></button>
+        <button class="nav-item" data-view="scheduler"><i data-lucide="activity"></i><span>调度器</span></button>
         <button class="nav-item" data-view="vps"><i data-lucide="server"></i><span>VPS 管理</span></button>
         <button class="nav-item" data-view="settings"><i data-lucide="settings-2"></i><span>运行配置</span></button>
       </nav>
@@ -143,7 +144,7 @@
       </section>
 
       <section class="export-view" id="export-view" hidden>
-        <div class="section-heading"><div><h2>交付文件</h2><p>按生成时间查看工作簿和原始轨迹副本。</p><span class="delivery-download-status" id="delivery-download-status"></span></div><button class="button primary" type="button" id="delivery-package-button"><i data-lucide="archive-download"></i>下载交付包</button></div>
+        <div class="section-heading"><div><h2>交付文件</h2><p>按生成时间查看工作簿和原始轨迹副本。</p><span class="delivery-download-status" id="delivery-download-status"></span></div><button class="button primary" type="button" id="delivery-package-button"><i data-lucide="file-archive"></i>下载交付包</button></div>
         <div class="file-list" id="file-list"></div>
       </section>
 
@@ -163,6 +164,53 @@
             <label class="check-label"><input id="vps-enabled" type="checkbox" checked><span>启用节点</span></label>
             <div class="settings-actions"><button class="button primary" type="submit"><i data-lucide="save"></i>保存节点</button><button class="button secondary" type="button" id="vps-new"><i data-lucide="plus"></i>新增节点</button></div>
           </form>
+        </section>
+      </section>
+
+      <section class="scheduler-view" id="scheduler-view" hidden>
+        <div class="scheduler-node-strip" id="scheduler-node-strip" aria-label="调度节点"></div>
+        <div class="scheduler-overview" id="scheduler-overview">
+          <div class="empty-state"><i data-lucide="activity"></i><strong>正在读取调度器</strong></div>
+        </div>
+        <div class="scheduler-controls" id="scheduler-controls" aria-label="调度器控制">
+          <button class="button primary" type="button" data-scheduler-action="start"><i data-lucide="play"></i>开始</button>
+          <button class="button secondary" type="button" data-scheduler-action="pause"><i data-lucide="pause"></i>暂停接单</button>
+          <button class="button secondary" type="button" data-scheduler-action="drain"><i data-lucide="circle-stop"></i>排空后暂停</button>
+          <button class="button danger" type="button" data-scheduler-action="stop"><i data-lucide="square"></i>立即停止</button>
+          <button class="icon-button" type="button" data-scheduler-action="restart" title="重启调度器" aria-label="重启调度器"><i data-lucide="rotate-cw"></i></button>
+          <button class="icon-button" type="button" data-scheduler-action="retry" title="清除错误并重试" aria-label="清除错误并重试"><i data-lucide="refresh-ccw"></i></button>
+        </div>
+        <div class="scheduler-grid">
+          <section class="scheduler-panel" aria-labelledby="scheduler-queue-title">
+            <div class="scheduler-panel-head"><h2 id="scheduler-queue-title">生产队列</h2><span id="scheduler-current-batch"></span></div>
+            <div class="scheduler-stat-grid" id="scheduler-queue"></div>
+          </section>
+          <section class="scheduler-panel" aria-labelledby="scheduler-resource-title">
+            <div class="scheduler-panel-head"><h2 id="scheduler-resource-title">机器资源</h2><span id="scheduler-git"></span></div>
+            <div id="scheduler-resources"></div>
+          </section>
+        </div>
+        <section class="scheduler-panel" aria-labelledby="scheduler-batches-title">
+          <div class="scheduler-panel-head"><h2 id="scheduler-batches-title">批次进度</h2><span>当前节点最近 12 个批次</span></div>
+          <div id="scheduler-batches" class="scheduler-batch-progress"></div>
+        </section>
+        <section class="scheduler-panel scheduler-runtime" aria-labelledby="scheduler-runtime-title">
+          <div class="scheduler-panel-head"><h2 id="scheduler-runtime-title">运行现场</h2><span id="scheduler-config-summary"></span></div>
+          <div class="scheduler-runtime-grid">
+            <div><h3>Docker 容器</h3><div id="scheduler-containers" class="scheduler-container-list"></div></div>
+            <div><h3>最近周期</h3><div id="scheduler-cycles" class="scheduler-cycle-list"></div></div>
+          </div>
+        </section>
+        <section class="scheduler-panel scheduler-log-panel" aria-labelledby="scheduler-log-title">
+          <div class="scheduler-panel-head"><div><h2 id="scheduler-log-title">实时日志</h2><span id="scheduler-log-status">结构化事件</span></div><button class="icon-button" id="scheduler-refresh" type="button" title="刷新调度信息" aria-label="刷新调度信息"><i data-lucide="refresh-cw"></i></button></div>
+          <div class="scheduler-log-tools">
+            <div class="filter-tabs" id="scheduler-log-tabs"><button class="filter-tab active" data-log-mode="events">事件</button><button class="filter-tab" data-log-mode="raw">原始日志</button></div>
+            <select id="scheduler-log-level" aria-label="日志级别"><option value="">全部级别</option><option value="info">信息</option><option value="warning">警告</option><option value="error">错误</option></select>
+            <select id="scheduler-log-phase" aria-label="流水线阶段"><option value="">全部阶段</option><option value="news">抓取新闻</option><option value="author">出题质检</option><option value="model">Claude 跑题</option><option value="delivery">交付生产</option><option value="delivery_qc">交付质检</option><option value="export">导出</option></select>
+            <input id="scheduler-log-search" type="search" placeholder="搜索批次、阶段或日志内容" aria-label="搜索日志">
+            <button class="icon-button" id="scheduler-log-download" type="button" title="下载当前日志" aria-label="下载当前日志"><i data-lucide="download"></i></button>
+          </div>
+          <div id="scheduler-log" class="scheduler-log"><div class="empty-state"><strong>暂无调度事件</strong></div></div>
         </section>
       </section>
 

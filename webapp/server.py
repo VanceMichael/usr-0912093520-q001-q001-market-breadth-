@@ -13,11 +13,13 @@ import os as _os
 import re
 import shutil
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.request
 import webbrowser
@@ -65,6 +67,7 @@ AUTHOR_JOB_STATUSES = {"queued", "running", "completed", "failed", "interrupted"
 sys.path.insert(0, str(PROJECT_ROOT))
 from tools.runtime_environment import docker_info, repair_docker_engine  # noqa: E402
 from tools.batch_pipeline import SCHEMA_VERSION, connect as initialize_database  # noqa: E402
+from tools.scheduler_state import SchedulerStore  # noqa: E402
 
 AUTHOR_JOB_SCHEMA = """
 CREATE TABLE IF NOT EXISTS author_jobs (
@@ -230,6 +233,7 @@ class ConsoleData:
         if self.database.is_file():
             connection = initialize_database(self.database)
             connection.close()
+        self.scheduler_store = SchedulerStore(self.database)
         self._initialize_author_jobs()
         self._initialize_pipeline_jobs()
         self._initialize_vps_nodes()
@@ -365,6 +369,44 @@ class ConsoleData:
         disposition = headers.get("content-disposition", "")
         match = re.search(r'filename="([^"]+)"', disposition)
         return (match.group(1) if match else f"ccusr-delivery-{batch_name}.zip"), payload
+
+    def _vps_node(self, node_id: object) -> dict:
+        try:
+            value = int(node_id)
+        except (TypeError, ValueError):
+            raise ValueError("VPS 节点编号无效") from None
+        node = next((row for row in self._node_rows() if int(row["id"]) == value), None)
+        if node is None:
+            raise ValueError("VPS 节点不存在")
+        return node
+
+    def vps_scheduler(self, node_id: object) -> dict:
+        node = self._vps_node(node_id)
+        payload, _headers = self._vps_request(node, "/api/scheduler")
+        result = json.loads(payload.decode("utf-8"))
+        result["node"] = {
+            "id": node["id"], "name": node["name"], "base_url": node["base_url"], "kind": "remote",
+        }
+        return result
+
+    def vps_scheduler_events(self, node_id: object, query: str) -> dict:
+        node = self._vps_node(node_id)
+        path = "/api/scheduler/events" + (f"?{query}" if query else "")
+        payload, _headers = self._vps_request(node, path)
+        return json.loads(payload.decode("utf-8"))
+
+    def vps_scheduler_logs(self, node_id: object, query: str) -> dict:
+        node = self._vps_node(node_id)
+        path = "/api/scheduler/logs" + (f"?{query}" if query else "")
+        payload, _headers = self._vps_request(node, path)
+        return json.loads(payload.decode("utf-8"))
+
+    def vps_scheduler_control(self, node_id: object, action: object) -> dict:
+        node = self._vps_node(node_id)
+        payload, _headers = self._vps_request(
+            node, "/api/scheduler/control", method="POST", payload={"action": action},
+        )
+        return json.loads(payload.decode("utf-8"))
 
     def _initialize_author_jobs(self) -> None:
         if not self.database.is_file():
@@ -1145,6 +1187,181 @@ class ConsoleData:
                 finished_at=datetime.now().astimezone().isoformat(timespec="seconds"),
                 error=error, last_message=error,
             )
+
+    @staticmethod
+    def _command_text(command: list[str], cwd: Path, timeout: int = 4) -> str:
+        try:
+            result = subprocess.run(
+                command, cwd=cwd, text=True, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, timeout=timeout, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return ""
+        return result.stdout.strip() if result.returncode == 0 else ""
+
+    def _scheduler_resources(self) -> dict:
+        disk = shutil.disk_usage(self.project_root)
+        try:
+            load = [round(value, 2) for value in os.getloadavg()]
+        except (AttributeError, OSError):
+            load = []
+        memory_total = 0
+        memory_available = 0
+        meminfo = Path("/proc/meminfo")
+        if meminfo.is_file():
+            values = {}
+            for line in meminfo.read_text(encoding="ascii", errors="ignore").splitlines():
+                if ":" not in line:
+                    continue
+                key, raw = line.split(":", 1)
+                try:
+                    values[key] = int(raw.strip().split()[0]) * 1024
+                except (ValueError, IndexError):
+                    continue
+            memory_total = values.get("MemTotal", 0)
+            memory_available = values.get("MemAvailable", 0)
+        elif sys.platform == "darwin":
+            raw_total = self._command_text(["sysctl", "-n", "hw.memsize"], self.project_root)
+            memory_total = int(raw_total) if raw_total.isdigit() else 0
+            raw_rss = self._command_text(["ps", "-A", "-o", "rss="], self.project_root)
+            try:
+                used = sum(int(value) for value in raw_rss.split()) * 1024
+            except ValueError:
+                used = 0
+            memory_available = max(0, memory_total - used)
+        return {
+            "cpu_count": os.cpu_count() or 1,
+            "load_average": load,
+            "memory_total": memory_total,
+            "memory_used": max(0, memory_total - memory_available),
+            "memory_percent": round((memory_total - memory_available) * 100 / memory_total, 1) if memory_total else None,
+            "disk_total": disk.total,
+            "disk_used": disk.used,
+            "disk_free": disk.free,
+            "disk_percent": round(disk.used * 100 / disk.total, 1) if disk.total else None,
+        }
+
+    def _scheduler_git(self) -> dict:
+        return {
+            "branch": self._command_text(["git", "branch", "--show-current"], self.project_root),
+            "commit": self._command_text(["git", "rev-parse", "--short", "HEAD"], self.project_root),
+            "dirty": bool(self._command_text(["git", "status", "--porcelain"], self.project_root)),
+        }
+
+    def _scheduler_containers(self) -> list[dict]:
+        raw = self._command_text(
+            ["docker", "ps", "--format", "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}"],
+            self.project_root,
+        )
+        containers = []
+        for line in raw.splitlines():
+            fields = line.split("\t", 3)
+            if len(fields) == 4:
+                containers.append(dict(zip(("id", "name", "image", "status"), fields)))
+        return containers
+
+    def scheduler_snapshot(self) -> dict:
+        state = self.scheduler_store.state()
+        heartbeat_age = None
+        heartbeat = str(state.get("heartbeat_at") or "")
+        if heartbeat:
+            try:
+                heartbeat_age = max(0, int((datetime.now().astimezone() - datetime.fromisoformat(heartbeat)).total_seconds()))
+            except ValueError:
+                pass
+        process_online = heartbeat_age is not None and heartbeat_age <= 15
+        with closing(self.connect()) as connection:
+            queue = {
+                "news_ready": int(connection.execute("SELECT COUNT(*) FROM news_topics WHERE status='new'").fetchone()[0]),
+                "batches_active": int(connection.execute("SELECT COUNT(*) FROM batches WHERE status!='completed'").fetchone()[0]),
+                "questions_ready": int(connection.execute("SELECT COUNT(*) FROM questions WHERE status='approved'").fetchone()[0]),
+                "questions_running": int(connection.execute("SELECT COUNT(*) FROM questions WHERE status='running'").fetchone()[0]),
+                "questions_completed": int(connection.execute("SELECT COUNT(*) FROM questions WHERE status='completed'").fetchone()[0]),
+                "deliveries_passed": int(connection.execute("SELECT COUNT(*) FROM records WHERE delivery_qc_passed=1").fetchone()[0]),
+            }
+            batch_rows = connection.execute(
+                "SELECT b.name,b.status,b.created_at,COUNT(DISTINCT q.id) AS total,"
+                "COUNT(DISTINCT CASE WHEN q.status='completed' THEN q.id END) AS completed,"
+                "COUNT(DISTINCT CASE WHEN x.status='running' THEN q.id END) AS running,"
+                "COUNT(DISTINCT r.question_id) AS records,"
+                "COUNT(DISTINCT CASE WHEN r.delivery_qc_passed=1 THEN r.question_id END) AS qc_passed "
+                "FROM batches b LEFT JOIN questions q ON q.batch_id=b.id "
+                "LEFT JOIN runs x ON x.question_id=q.id "
+                "LEFT JOIN records r ON r.question_id=q.id "
+                "GROUP BY b.id ORDER BY CASE WHEN b.status='completed' THEN 1 ELSE 0 END,b.created_at DESC LIMIT 12"
+            ).fetchall()
+            batches = [dict(row) for row in batch_rows]
+        config = self.env_config()
+        return {
+            "node": {"id": "local", "name": socket.gethostname(), "kind": "local", "base_url": ""},
+            "state": {**state, "process_online": process_online, "heartbeat_age_seconds": heartbeat_age},
+            "queue": queue,
+            "batches": batches,
+            "resources": self._scheduler_resources(),
+            "git": self._scheduler_git(),
+            "containers": self._scheduler_containers(),
+            "cycles": self.scheduler_store.cycles(20),
+            "config": {
+                "batch_size": config["author_batch_size"],
+                "difficulty_weights": config["author_difficulty_weights"],
+                "model_concurrency": config["model_concurrency"],
+                "qc_concurrency": config["qc_concurrency"],
+                "codex_concurrency": config["codex_concurrency"],
+                "news_feeds": config["news_feeds"],
+            },
+            "server_time": datetime.now().astimezone().isoformat(timespec="seconds"),
+        }
+
+    def scheduler_events(self, query: dict[str, list[str]]) -> dict:
+        def first(name: str, default: str = "") -> str:
+            return str(query.get(name, [default])[0])
+
+        try:
+            after_id = max(0, int(first("after", "0")))
+            limit = max(1, min(1000, int(first("limit", "500"))))
+        except ValueError:
+            raise ValueError("日志游标或数量无效") from None
+        events = self.scheduler_store.events(after_id=after_id, limit=limit)
+        level = first("level")
+        phase = first("phase")
+        batch = first("batch")
+        search = first("search").casefold()
+        if level:
+            events = [item for item in events if item["level"] == level]
+        if phase:
+            events = [item for item in events if item["phase"] == phase]
+        if batch:
+            events = [item for item in events if item["batch_name"] == batch]
+        if search:
+            events = [item for item in events if search in json.dumps(item, ensure_ascii=False).casefold()]
+        return {"events": events, "next_after": events[-1]["id"] if events else after_id}
+
+    def scheduler_raw_logs(self, query: dict[str, list[str]]) -> dict:
+        try:
+            limit = max(1, min(2000, int(query.get("limit", ["500"])[0])))
+        except ValueError:
+            raise ValueError("日志数量无效") from None
+        search = str(query.get("search", [""])[0]).casefold()
+        batch = str(query.get("batch", [""])[0])
+        log_root = self.project_root / "runs" / "daemon"
+        paths = sorted(log_root.glob("*.log"), key=lambda path: path.stat().st_mtime, reverse=True) if log_root.is_dir() else []
+        if batch:
+            paths = [path for path in paths if batch in path.name or path.name == "delivery.log"]
+        lines: list[dict] = []
+        for path in paths[:20]:
+            try:
+                content = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                continue
+            for line in content[-limit:]:
+                redacted = self._redact_log(line)
+                if search and search not in redacted.casefold():
+                    continue
+                lines.append({"source": path.name, "line": redacted})
+        return {"lines": lines[-limit:]}
+
+    def scheduler_control(self, action: object) -> dict:
+        return self.scheduler_store.request_control(str(action or ""))
 
     @staticmethod
     def _env_value(raw: str) -> str:
@@ -2073,6 +2290,31 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             raise ValueError("请求格式无效")
         return value
 
+    def send_scheduler_stream(self, query: dict[str, list[str]]) -> None:
+        try:
+            after_id = max(0, int(query.get("after", ["0"])[0]))
+        except ValueError:
+            after_id = 0
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        deadline = time.monotonic() + 25
+        try:
+            while time.monotonic() < deadline:
+                events = self.data.scheduler_store.events(after_id=after_id, limit=100)
+                for event in events:
+                    after_id = int(event["id"])
+                    payload = json.dumps(event, ensure_ascii=False)
+                    self.wfile.write(f"id: {after_id}\nevent: scheduler\ndata: {payload}\n\n".encode("utf-8"))
+                if not events:
+                    self.wfile.write(b": heartbeat\n\n")
+                self.wfile.flush()
+                time.sleep(1)
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
     def post_allowed(self) -> bool:
         origin = self.headers.get("Origin")
         if not origin:
@@ -2101,12 +2343,36 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/pipeline-jobs":
                 self.send_json({"jobs": self.data.pipeline_jobs()})
                 return
+            if parsed.path == "/api/scheduler":
+                self.send_json(self.data.scheduler_snapshot())
+                return
+            if parsed.path == "/api/scheduler/events":
+                self.send_json(self.data.scheduler_events(parse_qs(parsed.query)))
+                return
+            if parsed.path == "/api/scheduler/logs":
+                self.send_json(self.data.scheduler_raw_logs(parse_qs(parsed.query)))
+                return
+            if parsed.path == "/api/scheduler/events/stream":
+                self.send_scheduler_stream(parse_qs(parsed.query))
+                return
             if parsed.path == "/api/vps-nodes":
                 self.send_json({"nodes": self.data.vps_nodes()})
                 return
             match = re.fullmatch(r"/api/vps-nodes/(\d+)/dashboard", parsed.path)
             if match:
                 self.send_json(self.data.vps_dashboard(int(match.group(1))))
+                return
+            match = re.fullmatch(r"/api/vps-nodes/(\d+)/scheduler", parsed.path)
+            if match:
+                self.send_json(self.data.vps_scheduler(int(match.group(1))))
+                return
+            match = re.fullmatch(r"/api/vps-nodes/(\d+)/scheduler/events", parsed.path)
+            if match:
+                self.send_json(self.data.vps_scheduler_events(int(match.group(1)), parsed.query))
+                return
+            match = re.fullmatch(r"/api/vps-nodes/(\d+)/scheduler/logs", parsed.path)
+            if match:
+                self.send_json(self.data.vps_scheduler_logs(int(match.group(1)), parsed.query))
                 return
             match = re.fullmatch(r"/api/vps-nodes/(\d+)/delivery-package", parsed.path)
             if match:
@@ -2148,7 +2414,7 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 self.send_static(unquote(parsed.path[len("/static/"):]))
                 return
             self.send_error_json("页面不存在", HTTPStatus.NOT_FOUND)
-        except (OSError, sqlite3.Error, ValueError) as exc:
+        except (OSError, RuntimeError, sqlite3.Error, ValueError) as exc:
             self.send_error_json(str(exc), HTTPStatus.BAD_REQUEST)
 
     def do_POST(self) -> None:  # noqa: N802
@@ -2162,6 +2428,11 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             elif self.path == "/api/vps-nodes/delete":
                 self.data.delete_vps_node(body.get("id"))
                 result = {"ok": True, "message": "VPS 节点已删除"}
+            elif self.path == "/api/scheduler/control":
+                result = self.data.scheduler_control(body.get("action"))
+            elif re.fullmatch(r"/api/vps-nodes/\d+/scheduler/control", self.path):
+                node_id = int(self.path.split("/")[3])
+                result = self.data.vps_scheduler_control(node_id, body.get("action"))
             elif self.path == "/api/actions/open":
                 target = self.data.resolve_open_target(str(body.get("kind", "")), body.get("id"))
                 open_local_path(target, self.data.project_root)
