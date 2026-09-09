@@ -1424,14 +1424,32 @@ class ConsoleData:
                     return True
             except (OSError, subprocess.TimeoutExpired):
                 pass
+        if sys.platform == "win32" and shutil.which("schtasks"):
+            try:
+                task = subprocess.run(
+                    ["schtasks", "/Run", "/TN", "CCUSR Scheduler"],
+                    cwd=self.project_root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    timeout=15, check=False,
+                )
+                if task.returncode == 0:
+                    return True
+            except (OSError, subprocess.TimeoutExpired):
+                pass
         log_root = self.project_root / "runs" / "daemon"
         log_root.mkdir(parents=True, exist_ok=True)
         log = (log_root / "console-started-pipeline.log").open("a", encoding="utf-8")
         try:
+            process_kwargs = {
+                "creationflags": (
+                    getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                    | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                )
+            } if os.name == "nt" else {"start_new_session": True}
             subprocess.Popen(
                 [sys.executable, str(self.project_root / "tools" / "pipeline_daemon.py"), "--loop"],
                 cwd=self.project_root, stdout=log, stderr=subprocess.STDOUT,
-                start_new_session=True,
+                **process_kwargs,
             )
         except OSError:
             log.close()

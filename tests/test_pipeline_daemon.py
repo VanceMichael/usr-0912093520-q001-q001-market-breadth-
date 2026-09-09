@@ -9,6 +9,7 @@ from tools.pipeline_daemon import (
     active_batches,
     authored_batch_result,
     cleanup_logs,
+    child_process_kwargs,
     cycle,
     create_batch,
     difficulty_distribution,
@@ -32,6 +33,13 @@ def test_runtime_env_loads_escaped_difficulty_weights() -> None:
             plan = difficulty_plan()
         assert plan == {"中等": 50, "困难": 30, "地狱": 20}
         assert difficulty_distribution(10, plan) == "中等 5 道（50%）、困难 3 道（30%）、地狱 2 道（20%）"
+
+
+def test_child_process_kwargs_use_windows_process_group_without_importing_fcntl() -> None:
+    with mock.patch("tools.pipeline_daemon.os.name", "nt"), mock.patch.object(
+        __import__("subprocess"), "CREATE_NEW_PROCESS_GROUP", 512, create=True
+    ), mock.patch.object(__import__("subprocess"), "CREATE_NO_WINDOW", 2048, create=True):
+        assert child_process_kwargs() == {"creationflags": 2560}
 
 
 def test_cleanup_logs_removes_expired_files_only() -> None:

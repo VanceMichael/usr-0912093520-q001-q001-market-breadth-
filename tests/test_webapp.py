@@ -261,6 +261,20 @@ class WebConsoleTests(unittest.TestCase):
             finally:
                 data.shutdown()
 
+    def test_windows_scheduler_start_uses_task_scheduler_when_available(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = ConsoleData(self.make_database(root), root)
+            try:
+                with mock.patch("webapp.server.sys.platform", "win32"), mock.patch(
+                    "webapp.server.shutil.which", return_value="schtasks"
+                ), mock.patch("webapp.server.subprocess.run") as run:
+                    run.return_value.returncode = 0
+                    self.assertTrue(data._start_scheduler_process())
+                self.assertEqual(run.call_args.args[0], ["schtasks", "/Run", "/TN", "CCUSR Scheduler"])
+            finally:
+                data.shutdown()
+
     def test_running_scheduler_blocks_manual_work_on_the_same_machine(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

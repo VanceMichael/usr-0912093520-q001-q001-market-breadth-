@@ -8,7 +8,7 @@ isolated Docker workers managed by ``tools.orchestrator``.
 from __future__ import annotations
 
 import argparse
-import fcntl
+from contextlib import contextmanager
 import json
 import math
 import os
@@ -19,6 +19,9 @@ import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+
+if os.name != "nt":
+    import fcntl
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -40,8 +43,67 @@ class SchedulerInterrupted(RuntimeError):
         self.desired_state = desired_state
 
 
+def child_process_kwargs() -> dict[str, object]:
+    """Start children in a private process group on every supported host."""
+    if os.name == "nt":
+        flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        flags |= getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        return {"creationflags": flags}
+    return {"start_new_session": True}
+
+
+@contextmanager
+def daemon_lock(path: Path):
+    """Hold an exclusive lock for the daemon lifetime without Unix-only imports."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as lock:
+        if os.name == "nt":
+            import msvcrt
+
+            lock.seek(0, 2)
+            if lock.tell() == 0:
+                lock.write(b"0")
+                lock.flush()
+            lock.seek(0)
+            try:
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError as exc:
+                raise BlockingIOError from exc
+        else:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            yield lock
+        finally:
+            if os.name == "nt":
+                import msvcrt
+
+                lock.seek(0)
+                try:
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass
+            else:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
 def _terminate_process(process: subprocess.Popen, grace_seconds: int = 10) -> None:
     if process.poll() is not None:
+        return
+    if os.name == "nt":
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=flags, timeout=15, check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            process.kill()
+        try:
+            process.wait(timeout=grace_seconds)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
         return
     try:
         os.killpg(process.pid, signal.SIGTERM)
@@ -142,7 +204,7 @@ def run_command(
         handle.flush()
         process = subprocess.Popen(
             command, cwd=cwd, stdout=handle, stderr=subprocess.STDOUT,
-            start_new_session=True,
+            **child_process_kwargs(),
         )
         started = time.monotonic()
         while process.poll() is None:
@@ -509,12 +571,13 @@ def main() -> int:
     lock_path = args.log_dir / "daemon.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     store = SchedulerStore(args.db.resolve())
-    with lock_path.open("w", encoding="ascii") as lock:
-        try:
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            print("another pipeline daemon is already running", file=sys.stderr)
-            return 2
+    try:
+        lock_context = daemon_lock(lock_path)
+        lock_context.__enter__()
+    except BlockingIOError:
+        print("another pipeline daemon is already running", file=sys.stderr)
+        return 2
+    try:
         store.startup()
         recovered = recover_interrupted_runs(args.db.resolve())
         if recovered:
@@ -621,6 +684,8 @@ def main() -> int:
             if not args.loop:
                 return code
             wait_with_heartbeat(store, max(1, args.poll_seconds))
+    finally:
+        lock_context.__exit__(None, None, None)
 
 
 if __name__ == "__main__":
