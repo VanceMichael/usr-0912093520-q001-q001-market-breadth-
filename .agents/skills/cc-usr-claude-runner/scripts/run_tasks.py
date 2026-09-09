@@ -237,7 +237,8 @@ def main() -> int:
     print(f"Claude Code: {version}")
     print("配置: 已读取根目录 .env（URL、模型和 Key 不显示）")
     preview_command = (
-        "claude --print --verbose --dangerously-skip-permissions "
+        "claude --print --verbose --output-format stream-json "
+        "--dangerously-skip-permissions "
         "--permission-mode bypassPermissions --permission-prompts none "
         "<SQLite 原始 prompt>"
         if mode in {"server", "iterm-headless"}
