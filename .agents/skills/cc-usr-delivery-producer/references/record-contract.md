@@ -1,6 +1,6 @@
 # SQLite delivery record contract
 
-The database stores the exact 27 Excel fields plus internal linkage and audit fields.
+The database stores the exact 28 Excel fields plus internal linkage and audit fields.
 
 Scored input required for every turn:
 
@@ -15,6 +15,8 @@ other_issues, submitter, turn_completed_at, human_authored
 ```
 
 `session_id` is the exact Claude Code session identifier. `turn_id` stores the project-required `PromptID` from that turn's user message. `trajectory_file` is the matched original JSONL base name, normally `<SessionID>.jsonl`, without a local directory path; a terminal `stream-json` transcript is not a trajectory artifact. The delivery producer extracts all three from the matched Claude Code trajectory and must be able to locate the same user event by the `(session_id, turn_id, user_prompt)` triple. A session keeps one `session_id` and trajectory file across turns, while `turn_id` must be unique for every recorded turn.
+
+`turn_no` is the one-based chronological position of the user turn inside the current `SessionID` and is exported as `当前对话轮次排序`. It is already a required SQLite column, so do not create a duplicate database field. Derive it from the matched original JSONL: the first submitted turn is 1 and later submitted turns are consecutive through at most 10. It is not a question number, tool-call count, record ID suffix, or global batch row number.
 
 For turns after the first, the human also supplies `user_prompt`, `task_type`, `difficulty`, and `languages` because classification is based on that turn's actual intent. The prompt is copied exactly from that user event; if the user typed `继续`, store exactly `继续` and inherit only the classification metadata that the project rules permit.
 
