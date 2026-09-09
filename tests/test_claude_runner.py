@@ -105,6 +105,8 @@ class RunnerTests(unittest.TestCase):
         )
         self.assertEqual(command[-1], prompt)
         self.assertIn("--print", command)
+        self.assertIn("--verbose", command)
+        self.assertEqual(command[command.index("--output-format") + 1], "stream-json")
         self.assertIn("--dangerously-skip-permissions", command)
         self.assertIn("--permission-mode", command)
         self.assertIn("bypassPermissions", command)
@@ -144,11 +146,14 @@ class RunnerTests(unittest.TestCase):
         with mock.patch.object(run_tasks.platform, "system", return_value="Linux"):
             self.assertEqual(run_tasks.select_launch_mode("auto"), "server")
 
-    def test_auto_mode_remains_unattended_on_macos_with_iterm(self):
+    def test_auto_mode_uses_visible_headless_iterm_on_macos(self):
         with mock.patch.object(
             run_tasks.platform, "system", return_value="Darwin"
         ), mock.patch.object(run_tasks, "iterm_available", return_value=True):
-            self.assertEqual(run_tasks.select_launch_mode("auto"), "server")
+            self.assertEqual(run_tasks.select_launch_mode("auto"), "iterm-headless")
+
+    def test_explicit_iterm_mode_remains_interactive(self):
+        self.assertEqual(run_tasks.select_launch_mode("iterm"), "iterm")
 
     def test_launch_helper_uses_question_directory_and_exact_command(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -193,13 +198,58 @@ class RunnerTests(unittest.TestCase):
             output = stdout.getvalue()
             self.assertIn(f"cd {shlex.quote(str(row['folder_path']))}", output)
             self.assertIn(
-                "claude --print --dangerously-skip-permissions "
+                "claude --print --verbose --output-format stream-json "
+                "--dangerously-skip-permissions "
                 "--permission-mode bypassPermissions --permission-prompts none "
                 "<SQLite 原始 prompt>",
                 output,
             )
             for secret in ("preview-secret", "relay.example.com", "claude-test", row["prompt"]):
                 self.assertNotIn(secret, output)
+
+    def test_stream_display_shows_tool_activity_and_results(self):
+        display = launch_task.StreamDisplay()
+        assistant = json.dumps({
+            "type": "assistant",
+            "message": {"content": [{
+                "type": "tool_use", "id": "tool-1", "name": "Bash",
+                "input": {"command": "python3 -m unittest"},
+            }]},
+        })
+        result = json.dumps({
+            "type": "user",
+            "message": {"content": [{
+                "type": "tool_result", "tool_use_id": "tool-1",
+                "content": "Ran 12 tests\nOK",
+            }]},
+        })
+        self.assertEqual(display.render(assistant), ["\n▶ Bash  python3 -m unittest"])
+        rendered = display.render(result)
+        self.assertIn("完成 Bash", rendered[0])
+        self.assertIn("Ran 12 tests", rendered[0])
+
+    def test_stream_display_keeps_non_json_diagnostics_visible(self):
+        display = launch_task.StreamDisplay(("secret-token",))
+        self.assertEqual(
+            display.render("model warning secret-token\n"),
+            ["model warning [已隐藏]"],
+        )
+
+    def test_headless_stream_wraps_windows_command_shims(self):
+        process = mock.Mock()
+        process.stdout = []
+        process.wait.return_value = 0
+        command = ["C:/npm/claude.cmd", "--print", "prompt"]
+        environment = {"COMSPEC": "C:/Windows/System32/cmd.exe"}
+        with mock.patch.object(launch_task.sys, "platform", "win32"), mock.patch.object(
+            launch_task.subprocess, "Popen", return_value=process
+        ) as popen_mock:
+            self.assertEqual(launch_task.run_headless_stream(command, environment), 0)
+        launched = popen_mock.call_args.args[0]
+        self.assertEqual(launched[:4], [
+            "C:/Windows/System32/cmd.exe", "/d", "/s", "/c",
+        ])
+        self.assertIn("claude.cmd", launched[4])
 
     def test_mocked_macos_launch_registers_claude_run_without_config_or_prompt(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shlex
@@ -111,6 +112,9 @@ def build_claude_command(claude: str, prompt: str, *, headless: bool = False) ->
         return [
             claude,
             "--print",
+            "--verbose",
+            "--output-format",
+            "stream-json",
             "--dangerously-skip-permissions",
             "--permission-mode",
             "bypassPermissions",
@@ -136,6 +140,122 @@ def run_claude_on_windows(command: list[str], environment: dict[str, str]) -> in
     """Run Windows command shims while preserving the exact Claude argv."""
     completed = subprocess.run(command, env=environment, check=False)
     return completed.returncode
+
+
+def _shorten(value: object, limit: int = 1200) -> str:
+    if isinstance(value, str):
+        text = value
+    else:
+        text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    text = text.strip()
+    return text if len(text) <= limit else text[:limit] + "\n...（输出已截断）"
+
+
+class StreamDisplay:
+    """Render Claude stream-json events as concise, readable terminal progress."""
+
+    def __init__(self, redactions: tuple[str, ...] = ()) -> None:
+        self.tools: dict[str, str] = {}
+        self.redactions = tuple(value for value in redactions if value)
+
+    def _safe(self, value: object, limit: int = 1200) -> str:
+        text = _shorten(value, limit)
+        for secret in self.redactions:
+            text = text.replace(secret, "[已隐藏]")
+        return text
+
+    def _tool_summary(self, name: str, tool_input: object) -> str:
+        if not isinstance(tool_input, dict):
+            return ""
+        if name in {"Read", "Write", "Edit", "NotebookEdit"}:
+            return self._safe(
+                tool_input.get("file_path") or tool_input.get("notebook_path") or "", 500
+            )
+        if name == "Bash":
+            return self._safe(tool_input.get("command", ""), 500)
+        if name in {"Glob", "Grep"}:
+            pattern = tool_input.get("pattern", "")
+            path = tool_input.get("path", "")
+            return self._safe(f"{pattern} {path}".strip(), 500)
+        if name in {"WebFetch", "WebSearch"}:
+            return self._safe(tool_input.get("url") or tool_input.get("query") or "", 500)
+        return ""
+
+    def render(self, raw_line: str) -> list[str]:
+        line = raw_line.rstrip("\r\n")
+        if not line:
+            return []
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            return [self._safe(line)]
+        event_type = event.get("type")
+        if event_type == "system" and event.get("subtype") == "init":
+            return [f"Claude Code 已启动，会话 {event.get('session_id', '未知')}"]
+        if event_type == "assistant":
+            output: list[str] = []
+            message = event.get("message") or {}
+            for block in message.get("content") or []:
+                if block.get("type") == "text" and block.get("text", "").strip():
+                    output.append(self._safe(block["text"]))
+                elif block.get("type") == "tool_use":
+                    tool_id = str(block.get("id", ""))
+                    name = str(block.get("name", "工具"))
+                    self.tools[tool_id] = name
+                    summary = self._tool_summary(name, block.get("input") or {})
+                    output.append(f"\n▶ {name}" + (f"  {summary}" if summary else ""))
+            return output
+        if event_type == "user":
+            output = []
+            message = event.get("message") or {}
+            for block in message.get("content") or []:
+                if block.get("type") != "tool_result":
+                    continue
+                name = self.tools.get(str(block.get("tool_use_id", "")), "工具")
+                marker = "失败" if block.get("is_error") else "完成"
+                content = block.get("content", "")
+                detail = self._safe(content) if content else ""
+                output.append(f"  {marker} {name}" + (f"\n{detail}" if detail else ""))
+            return output
+        if event_type == "result":
+            if event.get("is_error"):
+                return ["\nClaude Code 运行失败：" + self._safe(event.get("result") or event)]
+            return ["\nClaude Code 运行完成"]
+        return []
+
+
+def run_headless_stream(command: list[str], environment: dict[str, str]) -> int:
+    """Run headless Claude while displaying its structured events live."""
+    process_command = command
+    if sys.platform == "win32" and Path(command[0]).suffix.lower() in {".cmd", ".bat"}:
+        process_command = [
+            environment.get("COMSPEC", "cmd.exe"),
+            "/d",
+            "/s",
+            "/c",
+            subprocess.list2cmdline(command),
+        ]
+    process = subprocess.Popen(
+        process_command,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+    )
+    display = StreamDisplay((
+        environment.get("ANTHROPIC_AUTH_TOKEN", ""),
+        environment.get("ANTHROPIC_BASE_URL", ""),
+        environment.get("ANTHROPIC_MODEL", ""),
+        command[-1] if command else "",
+    ))
+    assert process.stdout is not None
+    for line in process.stdout:
+        for rendered in display.render(line):
+            print(rendered, flush=True)
+    return process.wait()
 
 
 def main() -> int:
@@ -179,6 +299,8 @@ def main() -> int:
     os.chdir(folder)
     command = build_claude_command(args.claude, prompt, headless=args.headless)
     environment = build_claude_environment(config, headless=args.headless)
+    if args.headless:
+        return run_headless_stream(command, environment)
     if sys.platform == "win32" and Path(args.claude).suffix.lower() in {".cmd", ".bat"}:
         return run_claude_on_windows(command, environment)
     os.execvpe(args.claude, command, environment)

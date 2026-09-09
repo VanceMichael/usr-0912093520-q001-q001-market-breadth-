@@ -73,19 +73,22 @@ def validate_question(row: sqlite3.Row) -> Path:
     return folder
 
 
-def open_iterm(launcher: Path) -> subprocess.CompletedProcess[str]:
+def open_iterm(launcher: Path, *, headless: bool = False) -> subprocess.CompletedProcess[str]:
     script = """
 on run argv
     set launcherPath to item 1 of argv
+    set launchMode to item 2 of argv
+    set launchCommand to quoted form of launcherPath
+    if launchMode is "headless" then set launchCommand to launchCommand & " --headless"
     tell application "iTerm"
         activate
         set newWindow to (create window with default profile)
-        tell current session of newWindow to write text (quoted form of launcherPath)
+        tell current session of newWindow to write text launchCommand
     end tell
 end run
 """
     return subprocess.run(
-        ["osascript", "-e", script, str(launcher)],
+        ["osascript", "-e", script, str(launcher), "headless" if headless else "interactive"],
         text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
     )
 
@@ -145,10 +148,13 @@ def open_windows(launcher: Path) -> subprocess.Popen[str]:
 
 
 def select_launch_mode(requested: str) -> str:
-    """Resolve launch mode; auto is always unattended, with explicit overrides."""
+    """Resolve launch mode; auto stays unattended and is visible on macOS when possible."""
     if requested in {"iterm", "server"}:
         return requested
-    # Auto launches must not stop on Claude Code's workspace-trust prompt.
+    # Keep the run visible on macOS without entering Claude Code's trust UI.
+    if platform.system() == "Darwin" and iterm_available():
+        return "iterm-headless"
+    # Other auto launches remain detached and unattended.
     return "server"
 
 
@@ -231,10 +237,11 @@ def main() -> int:
     print(f"Claude Code: {version}")
     print("配置: 已读取根目录 .env（URL、模型和 Key 不显示）")
     preview_command = (
-        "claude --print --dangerously-skip-permissions "
+        "claude --print --verbose --output-format stream-json "
+        "--dangerously-skip-permissions "
         "--permission-mode bypassPermissions --permission-prompts none "
         "<SQLite 原始 prompt>"
-        if mode == "server"
+        if mode in {"server", "iterm-headless"}
         else "claude --dangerously-skip-permissions <SQLite 原始 prompt>"
     )
     for row, folder in prepared:
@@ -280,8 +287,8 @@ def main() -> int:
             encoding="utf-8",
         )
         launcher.chmod(0o700)
-        if mode == "iterm":
-            result = open_iterm(launcher)
+        if mode in {"iterm", "iterm-headless"}:
+            result = open_iterm(launcher, headless=mode == "iterm-headless")
             if result.returncode:
                 print(
                     f"Failed to open iTerm2 for {row['task_id']}: {result.stdout.strip()}",
