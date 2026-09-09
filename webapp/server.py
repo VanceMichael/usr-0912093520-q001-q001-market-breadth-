@@ -49,6 +49,7 @@ SNAPSHOT_RE = re.compile(r"^https://github\.com/[^/]+/[^/]+/commit/[0-9a-fA-F]{4
 ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 ENV_KEYS = (
     "CC_SWITCH_BASE_URL", "CC_SWITCH_MODEL", "CC_SWITCH_API_KEY", "CC_USR_SUBMITTER",
+    "CC_GITHUB_TOKEN", "CC_AUTHOR_DIFFICULTY",
 )
 PIPELINE_ENV_KEYS = (
     "CC_CLAUDE_DOCKER_IMAGE", "CC_CLAUDE_DOCKER_COMMAND",
@@ -57,6 +58,7 @@ PIPELINE_ENV_KEYS = (
     "CC_PIPELINE_CODEX_CONCURRENCY",
 )
 NEWS_URL_MAX = 20
+AUTHOR_DIFFICULTIES = ("中等", "困难", "地狱")
 AUTHOR_JOB_OUTPUT_LIMIT = 200_000
 AUTHOR_JOB_STATUSES = {"queued", "running", "completed", "failed", "interrupted"}
 
@@ -435,7 +437,7 @@ class ConsoleData:
     @staticmethod
     def author_prompt(batch: str, count: int, business: str, technology: str, notes: str,
                       mode: str = "0-1", task_type: str = "0-1 代码生成", mother: dict | None = None,
-                      derived_notes: str = "", defect_tolerance: str = "") -> str:
+                      derived_notes: str = "", defect_tolerance: str = "", difficulty: str = "中等") -> str:
         technology_label = "Docker 要求" if technology in {"需要 Docker", "不需要 Docker"} else "技术关键词"
         requirements = "；".join(filter(None, (
             f"业务关键词：{business}" if business else "",
@@ -454,7 +456,7 @@ class ConsoleData:
                 "在项目根目录执行派生出题任务。先读取项目规范和 cc-usr-question-author 的全部引用，"
                 "使用母库中的 0-1 母项目生成独立的非 0-1 题目批次。\n"
                 f"批次名：{batch}\n题目数量：{count}\n题型：{task_type}\n"
-                f"母库信息：{mother_text}\n出题要求：{requirements or '根据母项目代码、已登记快照和《项目规范.md》自动生成，不需要额外填写关键词。'}\n"
+                f"母库信息：{mother_text}\n目标难度：{difficulty}。所有题目的 difficulty 字段必须填写为“{difficulty}”。\n出题要求：{requirements or '根据母项目代码、已登记快照和《项目规范.md》自动生成，不需要额外填写关键词。'}\n"
                 f"派生方向：{derived_notes or '围绕母项目已有业务设计真实的后续工作'}\n"
                 f"可接受的小瑕疵：{defect_tolerance or '允许不影响构建和主要流程的小问题，并将其记录为可迭代方向'}\n"
                 "保留母项目路径、Git 地址、初始快照和派生使用关系；每道题使用独立工作区和独立 Prompt，"
@@ -466,7 +468,7 @@ class ConsoleData:
             ".agents/skills/cc-usr-question-author/references/task-contract.md、"
             ".agents/skills/cc-usr-question-author/references/content-quality.md，"
             "然后严格使用 cc-usr-question-author 的现有 SQLite 出题流程。\n"
-            f"批次名：{batch}\n题目数量：{count}\n出题要求：{requirements}\n"
+            f"批次名：{batch}\n题目数量：{count}\n目标难度：{difficulty}。所有题目的 difficulty 字段必须填写为“{difficulty}”。\n出题要求：{requirements}\n"
             "创建完整批次和独立题目工作区，准备并提交干净 baseline，创建并推送可访问的 "
             "GitHub 仓库，登记精确的 40 位 SHA 快照，完成机械质检和重复题质检。"
             "每个 User Prompt 都要写成自然、具体的中文书面需求，不用标题、清单、固定开头或可换名复用的句式。"
@@ -786,7 +788,7 @@ class ConsoleData:
     def _run_pipeline_process(self, job_id: int, batch: str, image: str, command: str, qc_concurrency: int, model_concurrency: int, codex_concurrency: int, model_mode: str, script: Path) -> None:
         flags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if os.name == "nt" else 0
         try:
-            pipeline_env = os.environ.copy()
+            pipeline_env = self._subprocess_env()
             pipeline_env.update({"PYTHONIOENCODING": "utf-8", "PYTHONUTF8": "1"})
             process = subprocess.Popen(
                 [
@@ -936,7 +938,10 @@ class ConsoleData:
                 if task_type == "Feature 迭代" and not row["iteration_ready"]:
                     raise ValueError("该母项目暂不适合生成 Feature 迭代题")
                 mother = dict(row)
-        prompt = self.author_prompt(batch, count, business, technology, notes, mode, task_type, mother, derived_notes, defect_tolerance)
+        difficulty = self.read_env().get("CC_AUTHOR_DIFFICULTY", "中等").strip() or "中等"
+        if difficulty not in AUTHOR_DIFFICULTIES:
+            difficulty = "中等"
+        prompt = self.author_prompt(batch, count, business, technology, notes, mode, task_type, mother, derived_notes, defect_tolerance, difficulty)
         timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
         with closing(self._write_connection()) as connection:
             existing = connection.execute("SELECT 1 FROM batches WHERE name=?", (batch,)).fetchone()
@@ -984,7 +989,16 @@ class ConsoleData:
     @staticmethod
     def _redact_log(value: str) -> str:
         value = re.sub(r"\bsk-[A-Za-z0-9_-]{12,}\b", "[REDACTED]", value)
+        value = re.sub(r"(?i)(?:gh[pousr]_\w+|github_pat_\w+)", "[REDACTED]", value)
         return re.sub(r"(?i)(api[_ -]?key\s*[:=]\s*)\S+", r"\1[REDACTED]", value)
+
+    def _subprocess_env(self) -> dict[str, str]:
+        environment = os.environ.copy()
+        github_token = self.read_env().get("CC_GITHUB_TOKEN", "").strip()
+        if github_token:
+            environment["GH_TOKEN"] = github_token
+            environment["GITHUB_TOKEN"] = github_token
+        return environment
 
     def _update_author_job(self, job_id: int, **values: object) -> None:
         if not values:
@@ -1074,10 +1088,11 @@ class ConsoleData:
         ]
         try:
             flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+            author_env = self._subprocess_env()
             process = subprocess.Popen(
                 command, cwd=self.project_root, text=True, encoding="utf-8", errors="replace",
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                bufsize=1, creationflags=flags,
+                bufsize=1, creationflags=flags, env=author_env,
             )
             self._update_author_job(
                 job_id, status="running", pid=process.pid, started_at=timestamp,
@@ -1148,6 +1163,7 @@ class ConsoleData:
     def env_config(self) -> dict[str, object]:
         values = self.read_env()
         key = values["CC_SWITCH_API_KEY"]
+        github_token = values.get("CC_GITHUB_TOKEN", "")
         def env_int(name: str, default: int) -> int:
             try:
                 return max(1, min(int(values.get(name, str(default))), 8))
@@ -1166,6 +1182,9 @@ class ConsoleData:
             "submitter": values["CC_USR_SUBMITTER"],
             "api_key_configured": bool(key),
             "api_key_hint": f"已配置（末尾 {key[-4:]}）" if len(key) >= 4 else ("已配置" if key else "未配置"),
+            "github_token_configured": bool(github_token),
+            "github_token_hint": f"已配置（末尾 {github_token[-4:]}）" if len(github_token) >= 4 else ("已配置" if github_token else "未配置"),
+            "author_difficulty": values.get("CC_AUTHOR_DIFFICULTY", "中等").strip() or "中等",
             **runtime_info(),
             "docker_image": values.get("CC_CLAUDE_DOCKER_IMAGE", "").strip() or "claude-cli:latest",
             "docker_command": values.get("CC_CLAUDE_DOCKER_COMMAND", "").strip() or "claude",
@@ -1376,12 +1395,21 @@ class ConsoleData:
             "base_url": body.get("base_url", current["CC_SWITCH_BASE_URL"]),
             "model": body.get("model", current["CC_SWITCH_MODEL"]),
             "api_key": body.get("api_key", ""),
+            "github_token": body.get("github_token", ""),
+            "author_difficulty": body.get("author_difficulty", current.get("CC_AUTHOR_DIFFICULTY", "中等")),
             "submitter": body.get("submitter", current["CC_USR_SUBMITTER"]),
             "docker_image": body.get("docker_image", current.get("CC_CLAUDE_DOCKER_IMAGE", "claude-cli:latest")),
             "docker_command": body.get("docker_command", current.get("CC_CLAUDE_DOCKER_COMMAND", "claude")),
             "model_mode": body.get("model_mode", current.get("CC_PIPELINE_MODEL_MODE", "local")) or "local",
         }
         values = self._validate_env_input(incoming)
+        github_token = incoming["github_token"]
+        if not isinstance(github_token, str) or "\x00" in github_token or "\n" in github_token or "\r" in github_token:
+            raise ValueError("github_token 配置无效")
+        github_token = github_token.strip() or current.get("CC_GITHUB_TOKEN", "")
+        author_difficulty = str(incoming["author_difficulty"] or "中等").strip()
+        if author_difficulty not in AUTHOR_DIFFICULTIES:
+            raise ValueError("出题难度必须是中等、困难或地狱")
         news_feeds = body.get("news_feeds")
         if news_feeds is not None:
             self.update_news_feeds(news_feeds)
@@ -1412,6 +1440,8 @@ class ConsoleData:
             "CC_SWITCH_MODEL": values["model"],
             "CC_SWITCH_API_KEY": values["api_key"],
             "CC_USR_SUBMITTER": values["submitter"],
+            "CC_GITHUB_TOKEN": github_token,
+            "CC_AUTHOR_DIFFICULTY": author_difficulty,
             "CC_CLAUDE_DOCKER_IMAGE": values["docker_image"],
             "CC_CLAUDE_DOCKER_COMMAND": values["docker_command"],
             "CC_PIPELINE_MODEL_MODE": values["model_mode"],

@@ -231,6 +231,27 @@ class WebConsoleTests(unittest.TestCase):
             data.update_env({"base_url": "https://relay.example.com/v2", "model": "claude-v2", "api_key": "", "submitter": "提交人"})
             self.assertIn('CC_SWITCH_API_KEY="keep-secret"', (root / ".env").read_text(encoding="utf-8"))
 
+    def test_runtime_config_stores_github_token_and_author_difficulty_safely(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = ConsoleData(self.make_database(root), root)
+            token = "ghp_example_token_1234567890"
+            result = data.update_env({
+                "base_url": "https://relay.example.com/v1",
+                "model": "claude-test",
+                "api_key": "api-secret",
+                "submitter": "提交人",
+                "github_token": token,
+                "author_difficulty": "中等",
+            })
+            self.assertEqual(result["config"]["author_difficulty"], "中等")
+            self.assertEqual(result["config"]["github_token_hint"], "已配置（末尾 7890）")
+            self.assertNotIn(token, json.dumps(result["config"], ensure_ascii=False))
+            content = (root / ".env").read_text(encoding="utf-8")
+            self.assertIn(f'CC_GITHUB_TOKEN="{token}"', content)
+            prompt = ConsoleData.author_prompt("batch", 2, "新闻", "", "", difficulty="中等")
+            self.assertIn("目标难度：中等", prompt)
+
     def test_empty_dashboard_includes_zero_summary(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

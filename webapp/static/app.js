@@ -267,6 +267,9 @@ function renderSettings() {
   $("#config-submitter").value = state.config.submitter || "";
   $("#config-api-key").value = "";
   $("#config-key-hint").textContent = state.config.api_key_hint || "";
+  $("#config-github-token").value = "";
+  $("#config-github-token-hint").textContent = state.config.github_token_hint || "";
+  $("#config-author-difficulty").value = state.config.author_difficulty || "中等";
   $("#config-model-mode").value = state.config.model_mode || "local";
   $("#config-docker-image").value = state.config.docker_image || "claude-cli:latest";
   $("#config-docker-command").value = state.config.docker_command || "claude";
@@ -720,20 +723,21 @@ function authorPrompt() {
   const business = $("#author-business").value.trim().replace(/\s+/g, " ");
   const technology = $("#author-technology").value.trim().replace(/\s+/g, " ");
   const notes = $("#author-notes").value.trim().replace(/\s+/g, " ");
+  const difficulty = state.config?.author_difficulty || "中等";
   const mode = selectedAuthorMode();
   if (mode === "derived") {
     const mother = state.mothers.find((item) => String(item.id) === $("#author-mother").value);
     const taskType = $("#author-task-type").value;
     const derivedNotes = $("#author-derived-notes")?.value.trim().replace(/\s+/g, " ") || "";
     const tolerance = $("#author-defect-tolerance")?.value.trim().replace(/\s+/g, " ") || "";
-    return `使用 $cc-usr-question-author 基于母库生成派生题目。\n批次名：${batch}\n题目数量：${count}\n题型：${taskType}\n母库项目：${mother ? `${mother.title}（ID ${mother.id}，代码路径 ${mother.workspace_path}，Git ${mother.repo_url || "待登记"}，已用 ${mother.use_count} 次）` : "系统自动选择符合规范的母库项目"}\n派生方向：${derivedNotes || "围绕母项目已有业务设计真实的后续工作"}\n可接受的小瑕疵：${tolerance || "允许不影响构建和主要流程的小问题，并记录为可迭代方向"}\n出题要求：根据母项目代码、已登记快照和《项目规范.md》自动生成，不需要额外填写关键词。\n严格遵守项目规范和母库引用规则，保留母题关系并完成独立快照与质检，不要启动目标模型。`;
+    return `使用 $cc-usr-question-author 基于母库生成派生题目。\n批次名：${batch}\n题目数量：${count}\n题型：${taskType}\n目标难度：${difficulty}\n母库项目：${mother ? `${mother.title}（ID ${mother.id}，代码路径 ${mother.workspace_path}，Git ${mother.repo_url || "待登记"}，已用 ${mother.use_count} 次）` : "系统自动选择符合规范的母库项目"}\n派生方向：${derivedNotes || "围绕母项目已有业务设计真实的后续工作"}\n可接受的小瑕疵：${tolerance || "允许不影响构建和主要流程的小问题，并记录为可迭代方向"}\n出题要求：根据母项目代码、已登记快照和《项目规范.md》自动生成，不需要额外填写关键词。每道题的 difficulty 字段必须填写为“${difficulty}”。\n严格遵守项目规范和母库引用规则，保留母题关系并完成独立快照与质检，不要启动目标模型。`;
   }
   const requirements = [
     business && `业务关键词：${business}`,
     technology && `技术关键词：${technology}`,
     notes && `补充要求：${notes}`,
   ].filter(Boolean).join("；") || "<填写出题关键词>";
-  return `使用 $cc-usr-question-author 创建批次。\n批次名：${batch}\n题目数量：${count}\n出题要求：${requirements}\n严格遵守 项目规范.md。创建完成后运行出题机械质检，不要启动目标模型。`;
+  return `使用 $cc-usr-question-author 创建批次。\n批次名：${batch}\n题目数量：${count}\n目标难度：${difficulty}\n出题要求：${requirements}\n所有题目的 difficulty 字段必须填写为“${difficulty}”。严格遵守 项目规范.md。创建完成后运行出题机械质检，不要启动目标模型。`;
 }
 
 function renderAuthorCommand() {
@@ -947,6 +951,8 @@ $("#settings-form").addEventListener("submit", async (event) => {
         model: $("#config-model").value,
         api_key: $("#config-api-key").value,
         submitter: $("#config-submitter").value,
+        github_token: $("#config-github-token").value,
+        author_difficulty: $("#config-author-difficulty").value,
         model_mode: $("#config-model-mode").value,
         docker_image: $("#config-docker-image").value,
         docker_command: $("#config-docker-command").value,
@@ -975,6 +981,15 @@ $("#toggle-api-key").addEventListener("click", () => {
   $("#toggle-api-key").title = showing ? "显示 API Key" : "隐藏 API Key";
   $("#toggle-api-key").setAttribute("aria-label", showing ? "显示 API Key" : "隐藏 API Key");
   $("#toggle-api-key").innerHTML = `<i data-lucide="${showing ? "eye" : "eye-off"}"></i>`;
+  refreshIcons();
+});
+$("#toggle-github-token").addEventListener("click", () => {
+  const input = $("#config-github-token");
+  const showing = input.type === "text";
+  input.type = showing ? "password" : "text";
+  $("#toggle-github-token").title = showing ? "显示 GitHub Token" : "隐藏 GitHub Token";
+  $("#toggle-github-token").setAttribute("aria-label", showing ? "显示 GitHub Token" : "隐藏 GitHub Token");
+  $("#toggle-github-token").innerHTML = `<i data-lucide="${showing ? "eye" : "eye-off"}"></i>`;
   refreshIcons();
 });
 $("#add-news-feed").addEventListener("click", () => {

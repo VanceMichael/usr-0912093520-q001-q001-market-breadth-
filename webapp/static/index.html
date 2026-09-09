@@ -173,6 +173,8 @@
           <label class="settings-field"><span>模型名称</span><input id="config-model" name="model" required placeholder="claude-sonnet"></label>
           <label class="settings-field"><span>API Key <small id="config-key-hint"></small></span><span class="password-field"><input id="config-api-key" name="api_key" type="password" placeholder="留空表示保留现有 Key"><button class="field-icon" id="toggle-api-key" type="button" title="显示 API Key" aria-label="显示 API Key"><i data-lucide="eye"></i></button></span></label>
           <label class="settings-field"><span>提交人</span><input id="config-submitter" name="submitter" required placeholder="真实姓名"></label>
+          <label class="settings-field"><span>GitHub / gh Token <small id="config-github-token-hint"></small></span><span class="password-field"><input id="config-github-token" name="github_token" type="password" placeholder="留空表示保留现有 Token"><button class="field-icon" id="toggle-github-token" type="button" title="显示 GitHub Token" aria-label="显示 GitHub Token"><i data-lucide="eye"></i></button></span></label>
+          <label class="settings-field"><span>自动出题难度</span><select id="config-author-difficulty" name="author_difficulty"><option value="中等">中等</option><option value="困难">困难</option><option value="地狱">地狱</option></select></label>
           <label class="settings-field"><span>模型运行方式</span><select id="config-model-mode" name="model_mode"><option value="local">本地 Claude CLI</option><option value="docker">Docker Claude CLI</option></select></label>
           <div class="pipeline-config-fields" aria-label="Claude 流水线配置">
             <label class="settings-field"><span>Claude Docker 镜像</span><input id="config-docker-image" placeholder="claude-cli:latest"></label>
@@ -188,7 +190,7 @@
             <div class="section-heading compact-heading"><div><h3>新闻出题来源</h3><p>守护进程每轮从启用的来源抓取主题，保存后立即生效。</p></div><button class="button secondary compact" type="button" id="add-news-feed"><i data-lucide="plus"></i>添加来源</button></div>
             <div id="news-feed-list" class="news-feed-list"></div>
           </div>
-          <div class="settings-actions"><span class="settings-note">配置文件权限会自动设置为仅当前用户可读写。</span><button class="button primary" type="submit" id="save-config"><i data-lucide="save"></i>保存配置</button></div>
+          <div class="settings-actions"><span class="settings-note">GitHub Token 仅写入本机 .env，并以 GH_TOKEN 注入 Codex/gh；配置文件权限会自动设置为仅当前用户可读写。</span><button class="button primary" type="submit" id="save-config"><i data-lucide="save"></i>保存配置</button></div>
         </form>
         <section class="environment-panel" aria-labelledby="environment-title">
           <div class="section-heading"><div><h3 id="environment-title">运行环境</h3><p>启动自动流水线前检查 Codex 和当前选择的 Claude CLI 运行环境。</p></div><button class="button secondary" type="button" id="environment-repair"><i data-lucide="wrench"></i>检测并修复</button></div>
