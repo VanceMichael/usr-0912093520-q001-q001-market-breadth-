@@ -14,6 +14,10 @@
     <string>--worker-timeout</string><string>3600</string>
     <string>--agent-timeout</string><string>3600</string>
     <string>--poll-seconds</string><string>60</string>
+    <string>--failure-threshold</string><string>3</string>
+    <string>--min-free-gb</string><string>15</string>
+    <string>--log-retention-days</string><string>30</string>
+    <string>--max-log-gb</string><string>2</string>
   </array>
   <key>WorkingDirectory</key>
   <string>__PROJECT_ROOT__</string>

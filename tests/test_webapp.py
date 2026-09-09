@@ -245,6 +245,18 @@ class WebConsoleTests(unittest.TestCase):
             finally:
                 data.shutdown()
 
+    def test_start_control_launches_scheduler_when_heartbeat_is_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = ConsoleData(self.make_database(root), root)
+            try:
+                with mock.patch.object(data, "_start_scheduler_process", return_value=True) as start:
+                    result = data.scheduler_control("start")
+                start.assert_called_once_with()
+                self.assertTrue(result["started_process"])
+            finally:
+                data.shutdown()
+
     def test_remote_scheduler_control_is_proxied_to_selected_vps(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

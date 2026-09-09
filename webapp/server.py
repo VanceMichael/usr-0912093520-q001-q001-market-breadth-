@@ -1361,7 +1361,58 @@ class ConsoleData:
         return {"lines": lines[-limit:]}
 
     def scheduler_control(self, action: object) -> dict:
-        return self.scheduler_store.request_control(str(action or ""))
+        normalized = str(action or "").strip().lower()
+        result = self.scheduler_store.request_control(normalized)
+        state = self.scheduler_store.state()
+        heartbeat = str(state.get("heartbeat_at") or "")
+        online = False
+        if heartbeat:
+            try:
+                online = (datetime.now().astimezone() - datetime.fromisoformat(heartbeat)).total_seconds() <= 15
+            except ValueError:
+                pass
+        if normalized in {"start", "resume", "retry", "restart"} and not online:
+            result["started_process"] = self._start_scheduler_process()
+            result["message"] = "调度器启动指令已发送"
+        return result
+
+    def _start_scheduler_process(self) -> bool:
+        if sys.platform.startswith("linux") and shutil.which("systemctl"):
+            try:
+                service = subprocess.run(
+                    ["sudo", "-n", "systemctl", "start", "ccusr-pipeline.service"],
+                    cwd=self.project_root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=15, check=False,
+                )
+                if service.returncode == 0:
+                    return True
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        if sys.platform == "darwin" and shutil.which("launchctl"):
+            try:
+                service = subprocess.run(
+                    ["launchctl", "kickstart", f"gui/{os.getuid()}/com.ccusr.pipeline"],
+                    cwd=self.project_root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=15, check=False,
+                )
+                if service.returncode == 0:
+                    return True
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        log_root = self.project_root / "runs" / "daemon"
+        log_root.mkdir(parents=True, exist_ok=True)
+        log = (log_root / "console-started-pipeline.log").open("a", encoding="utf-8")
+        try:
+            subprocess.Popen(
+                [sys.executable, str(self.project_root / "tools" / "pipeline_daemon.py"), "--loop"],
+                cwd=self.project_root, stdout=log, stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        except OSError:
+            log.close()
+            return False
+        log.close()
+        return True
 
     @staticmethod
     def _env_value(raw: str) -> str:

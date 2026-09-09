@@ -178,7 +178,16 @@ class SchedulerStore:
             values["batch_name"] = batch
         if detail is not None:
             values["detail"] = detail
-        return self.update(**values)
+        updated = self.update(**values)
+        if batch:
+            with closing(self.connect()) as connection:
+                connection.execute(
+                    "UPDATE scheduler_cycles SET batch_name=? WHERE id=("
+                    "SELECT id FROM scheduler_cycles WHERE status='running' ORDER BY id DESC LIMIT 1)",
+                    (batch,),
+                )
+                connection.commit()
+        return updated
 
     def request_control(self, action: str) -> dict:
         action = str(action).strip().lower()

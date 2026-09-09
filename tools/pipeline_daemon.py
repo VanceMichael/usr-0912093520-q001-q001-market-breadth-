@@ -16,7 +16,7 @@ import shutil
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -53,6 +53,81 @@ def _terminate_process(process: subprocess.Popen, grace_seconds: int = 10) -> No
         except (AttributeError, ProcessLookupError):
             process.kill()
         process.wait()
+
+
+def recover_interrupted_runs(database: Path) -> int:
+    """Stop orphaned workers and make their questions eligible for a clean retry."""
+    with connect(database.resolve()) as connection:
+        rows = connection.execute(
+            "SELECT r.id,r.question_id,r.container_id FROM runs r WHERE r.status='running'"
+        ).fetchall()
+        if not rows:
+            return 0
+        for row in rows:
+            container = str(row["container_id"] or "").strip()
+            if container:
+                try:
+                    subprocess.run(
+                        ["docker", "rm", "-f", container], stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL, timeout=20, check=False,
+                    )
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+            connection.execute(
+                "UPDATE runs SET status='interrupted',finished_at=?,error_message=?,heartbeat_at=? WHERE id=?",
+                (now(), "调度器重启或立即停止，任务已回收到待运行队列", now(), row["id"]),
+            )
+            connection.execute(
+                "UPDATE questions SET status='approved',updated_at=? WHERE id=? AND status='running'",
+                (now(), row["question_id"]),
+            )
+        connection.commit()
+    return len(rows)
+
+
+def wait_with_heartbeat(store: SchedulerStore, seconds: int) -> None:
+    deadline = time.monotonic() + max(1, seconds)
+    while time.monotonic() < deadline:
+        store.heartbeat()
+        time.sleep(min(2, max(0, deadline - time.monotonic())))
+
+
+def cleanup_logs(log_dir: Path, retention_days: int, max_log_gb: float) -> tuple[int, int]:
+    if not log_dir.is_dir():
+        return 0, 0
+    paths = sorted(
+        (path for path in log_dir.rglob("*.log") if path.is_file()),
+        key=lambda path: path.stat().st_mtime,
+    )
+    cutoff = datetime.now().timestamp() - timedelta(days=max(1, retention_days)).total_seconds()
+    removed = 0
+    reclaimed = 0
+    kept = []
+    for path in paths:
+        try:
+            stat = path.stat()
+            if stat.st_mtime < cutoff:
+                size = stat.st_size
+                path.unlink()
+                removed += 1
+                reclaimed += size
+            else:
+                kept.append((path, stat.st_size))
+        except OSError:
+            continue
+    maximum = int(max(0.1, max_log_gb) * 1024 ** 3)
+    total = sum(size for _path, size in kept)
+    for path, size in kept:
+        if total <= maximum:
+            break
+        try:
+            path.unlink()
+        except OSError:
+            continue
+        total -= size
+        removed += 1
+        reclaimed += size
+    return removed, reclaimed
 
 
 def run_command(
@@ -364,6 +439,8 @@ def main() -> int:
     parser.add_argument("--poll-seconds", type=int, default=60)
     parser.add_argument("--failure-threshold", type=int, default=3)
     parser.add_argument("--min-free-gb", type=float, default=15.0)
+    parser.add_argument("--log-retention-days", type=int, default=30)
+    parser.add_argument("--max-log-gb", type=float, default=2.0)
     args = parser.parse_args()
     load_runtime_env(args.env_file.resolve())
     args.codex = resolve_codex(args.codex)
@@ -383,6 +460,18 @@ def main() -> int:
             print("another pipeline daemon is already running", file=sys.stderr)
             return 2
         store.startup()
+        recovered = recover_interrupted_runs(args.db.resolve())
+        if recovered:
+            store.event(
+                "runs_recovered", f"已回收 {recovered} 个中断的 Claude 任务",
+                level="warning", details={"count": recovered},
+            )
+        cleaned, reclaimed = cleanup_logs(args.log_dir.resolve(), args.log_retention_days, args.max_log_gb)
+        if cleaned:
+            store.event(
+                "logs_cleaned", f"已清理 {cleaned} 个过期日志文件",
+                details={"count": cleaned, "reclaimed_bytes": reclaimed},
+            )
         while True:
             state = store.state()
             desired = str(state.get("desired_state") or "running")
@@ -392,7 +481,7 @@ def main() -> int:
                 store.update(actual_state=actual, phase="idle", batch_name="", detail="等待开始指令", heartbeat_at=now())
                 if not args.loop:
                     return 0
-                time.sleep(min(args.poll_seconds, 2))
+                wait_with_heartbeat(store, min(args.poll_seconds, 2))
                 continue
             if desired == "draining":
                 store.apply_controls("paused", "当前没有运行中的周期，已排空")
@@ -416,7 +505,7 @@ def main() -> int:
                 store.event("disk_guard", detail, level="error")
                 if not args.loop:
                     return 1
-                time.sleep(min(args.poll_seconds, 5))
+                wait_with_heartbeat(store, min(args.poll_seconds, 5))
                 continue
 
             cycle_id = store.begin_cycle()
@@ -424,7 +513,13 @@ def main() -> int:
             try:
                 code, batch = cycle(args, store)
             except SchedulerInterrupted as exc:
+                recovered = recover_interrupted_runs(args.db.resolve())
                 store.finish_cycle(cycle_id, status="interrupted", batch=batch)
+                if recovered:
+                    store.event(
+                        "runs_recovered", f"已回收 {recovered} 个中断的 Claude 任务",
+                        level="warning", batch=batch, details={"count": recovered},
+                    )
                 if exc.desired_state == "restarting":
                     store.apply_controls("running", "运行中任务已终止，逻辑重启完成")
                     current = store.state()
@@ -469,7 +564,7 @@ def main() -> int:
                 store.event("scheduler_drained", "当前周期完成，调度器已排空并暂停")
             if not args.loop:
                 return code
-            time.sleep(max(1, args.poll_seconds))
+            wait_with_heartbeat(store, max(1, args.poll_seconds))
 
 
 if __name__ == "__main__":
