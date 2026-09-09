@@ -32,6 +32,13 @@ def test_scheduler_control_and_cycle_state_are_persistent() -> None:
         result = store.request_control("drain")
         assert result["desired_state"] == "draining"
         assert SchedulerStore(store.database).state()["desired_state"] == "draining"
+        store.request_control("pause")
+        store.apply_controls("paused", "done")
+        with store.connect() as connection:
+            controls = connection.execute(
+                "SELECT status FROM scheduler_controls ORDER BY id"
+            ).fetchall()
+        assert [row["status"] for row in controls] == ["superseded", "applied"]
 
 
 def test_scheduler_failure_and_retry_clear_circuit_state() -> None:

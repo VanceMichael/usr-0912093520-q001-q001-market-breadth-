@@ -205,12 +205,19 @@ class SchedulerStore:
     def apply_controls(self, desired_state: str, message: str = "") -> None:
         timestamp = now()
         with closing(self.connect()) as connection:
-            connection.execute(
-                "UPDATE scheduler_controls SET status='applied',applied_at=?,message=? "
-                "WHERE status='pending' AND action IN ("
-                "SELECT action FROM scheduler_controls WHERE status='pending' ORDER BY id DESC LIMIT 1)",
-                (timestamp, message),
-            )
+            latest = connection.execute(
+                "SELECT id FROM scheduler_controls WHERE status='pending' ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if latest:
+                connection.execute(
+                    "UPDATE scheduler_controls SET status='superseded',applied_at=?,message=? "
+                    "WHERE status='pending' AND id<?",
+                    (timestamp, "已被更新的控制指令覆盖", latest["id"]),
+                )
+                connection.execute(
+                    "UPDATE scheduler_controls SET status='applied',applied_at=?,message=? WHERE id=?",
+                    (timestamp, message, latest["id"]),
+                )
             connection.execute(
                 "UPDATE scheduler_state SET desired_state=?,updated_at=? WHERE id=1",
                 (desired_state, timestamp),

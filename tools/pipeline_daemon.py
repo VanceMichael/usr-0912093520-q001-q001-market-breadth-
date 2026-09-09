@@ -388,6 +388,7 @@ def main() -> int:
             desired = str(state.get("desired_state") or "running")
             if desired in {"paused", "stopped"}:
                 actual = "paused" if desired == "paused" else "stopped"
+                store.apply_controls(desired, "控制指令已生效")
                 store.update(actual_state=actual, phase="idle", batch_name="", detail="等待开始指令", heartbeat_at=now())
                 if not args.loop:
                     return 0
@@ -405,6 +406,8 @@ def main() -> int:
                     heartbeat_at=now(), restart_count=int(state.get("restart_count") or 0) + 1,
                 )
                 store.event("scheduler_restarted", "调度器逻辑重启完成")
+            else:
+                store.apply_controls("running", "控制指令已生效")
 
             free_gb = shutil.disk_usage(PROJECT_ROOT).free / (1024 ** 3)
             if free_gb < max(0, args.min_free_gb):
