@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import platform
 import re
 import shlex
@@ -11,6 +13,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 from datetime import datetime
 from pathlib import Path
 
@@ -73,13 +76,61 @@ def validate_question(row: sqlite3.Row) -> Path:
     return folder
 
 
-def open_iterm(launcher: Path, *, headless: bool = False) -> subprocess.CompletedProcess[str]:
+def trust_claude_workspaces(
+    folders: list[Path], config_path: Path | None = None
+) -> Path:
+    """Pre-accept Claude Code's trust dialog for exact workspace paths."""
+    config_path = (config_path or Path.home() / ".claude.json").resolve()
+    try:
+        if config_path.exists():
+            original_mode = config_path.stat().st_mode & 0o777
+            document = json.loads(config_path.read_text(encoding="utf-8"))
+            if not isinstance(document, dict):
+                raise ValueError("Claude config root must be a JSON object")
+        else:
+            original_mode = 0o600
+            document = {}
+        projects = document.setdefault("projects", {})
+        if not isinstance(projects, dict):
+            raise ValueError("Claude config projects field must be a JSON object")
+        for folder in folders:
+            workspace = str(folder.resolve(strict=True))
+            project = projects.setdefault(workspace, {})
+            if not isinstance(project, dict):
+                raise ValueError(f"Claude project config is invalid for {workspace}")
+            project["hasTrustDialogAccepted"] = True
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot update Claude workspace trust: {exc}") from exc
+
+    temporary_path: Path | None = None
+    try:
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=config_path.parent,
+            prefix=f".{config_path.name}.",
+            delete=False,
+        ) as temporary:
+            temporary_path = Path(temporary.name)
+            json.dump(document, temporary, ensure_ascii=False, indent=2)
+            temporary.write("\n")
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        temporary_path.chmod(original_mode)
+        os.replace(temporary_path, config_path)
+    except OSError as exc:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+        raise ValueError(f"cannot update Claude workspace trust: {exc}") from exc
+    return config_path
+
+
+def open_iterm(launcher: Path) -> subprocess.CompletedProcess[str]:
     script = """
 on run argv
     set launcherPath to item 1 of argv
-    set launchMode to item 2 of argv
     set launchCommand to quoted form of launcherPath
-    if launchMode is "headless" then set launchCommand to launchCommand & " --headless"
     tell application "iTerm"
         activate
         set newWindow to (create window with default profile)
@@ -88,7 +139,7 @@ on run argv
 end run
 """
     return subprocess.run(
-        ["osascript", "-e", script, str(launcher), "headless" if headless else "interactive"],
+        ["osascript", "-e", script, str(launcher)],
         text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
     )
 
@@ -148,13 +199,11 @@ def open_windows(launcher: Path) -> subprocess.Popen[str]:
 
 
 def select_launch_mode(requested: str) -> str:
-    """Resolve launch mode; auto stays unattended and is visible on macOS when possible."""
+    """Resolve launch mode; macOS auto uses a trusted native iTerm session."""
     if requested in {"iterm", "server"}:
         return requested
-    # Keep the run visible on macOS without entering Claude Code's trust UI.
     if platform.system() == "Darwin" and iterm_available():
-        return "iterm-headless"
-    # Other auto launches remain detached and unattended.
+        return "iterm-trusted"
     return "server"
 
 
@@ -186,7 +235,7 @@ def main() -> int:
         "--mode",
         choices=("auto", "iterm", "server"),
         default="auto",
-        help="use unattended mode by default; choose iterm only for a local interactive window",
+        help="use trusted interactive iTerm on macOS, otherwise unattended server mode",
     )
     args = parser.parse_args()
 
@@ -241,7 +290,7 @@ def main() -> int:
         "--dangerously-skip-permissions "
         "--permission-mode bypassPermissions --permission-prompts none "
         "<SQLite 原始 prompt>"
-        if mode in {"server", "iterm-headless"}
+        if mode == "server"
         else "claude --dangerously-skip-permissions <SQLite 原始 prompt>"
     )
     for row, folder in prepared:
@@ -263,6 +312,14 @@ def main() -> int:
         print("PowerShell is not available.", file=sys.stderr)
         connection.close()
         return 1
+    if mode in {"iterm", "iterm-trusted"}:
+        try:
+            trust_path = trust_claude_workspaces([folder for _row, folder in prepared])
+        except ValueError as exc:
+            print(f"Cannot prepare Claude workspace trust: {exc}", file=sys.stderr)
+            connection.close()
+            return 1
+        print(f"工作区信任: 已为 {len(prepared)} 个题目目录预先设置（{trust_path}）")
 
     batch_run_id = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
     batch_folder = Path(prepared[0][0]["folder_path"]).parent
@@ -281,14 +338,18 @@ def main() -> int:
             "--claude", claude,
         ]
         launcher.write_text(
-            ("#!/bin/zsh\nset -eu\n" if mode == "iterm" else "#!/usr/bin/env sh\nset -eu\n")
+            (
+                "#!/bin/zsh\nset -eu\n"
+                if mode in {"iterm", "iterm-trusted"}
+                else "#!/usr/bin/env sh\nset -eu\n"
+            )
             + f"echo {shlex.quote('Task: ' + row['task_id'])}\n"
             + f"exec {shlex.join(command)} \"$@\"\n",
             encoding="utf-8",
         )
         launcher.chmod(0o700)
-        if mode in {"iterm", "iterm-headless"}:
-            result = open_iterm(launcher, headless=mode == "iterm-headless")
+        if mode in {"iterm", "iterm-trusted"}:
+            result = open_iterm(launcher)
             if result.returncode:
                 print(
                     f"Failed to open iTerm2 for {row['task_id']}: {result.stdout.strip()}",

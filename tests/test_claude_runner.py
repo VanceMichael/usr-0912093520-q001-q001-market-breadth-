@@ -146,14 +146,61 @@ class RunnerTests(unittest.TestCase):
         with mock.patch.object(run_tasks.platform, "system", return_value="Linux"):
             self.assertEqual(run_tasks.select_launch_mode("auto"), "server")
 
-    def test_auto_mode_uses_visible_headless_iterm_on_macos(self):
+    def test_auto_mode_uses_trusted_interactive_iterm_on_macos(self):
         with mock.patch.object(
             run_tasks.platform, "system", return_value="Darwin"
         ), mock.patch.object(run_tasks, "iterm_available", return_value=True):
-            self.assertEqual(run_tasks.select_launch_mode("auto"), "iterm-headless")
+            self.assertEqual(run_tasks.select_launch_mode("auto"), "iterm-trusted")
 
     def test_explicit_iterm_mode_remains_interactive(self):
         self.assertEqual(run_tasks.select_launch_mode("iterm"), "iterm")
+
+    def test_workspace_trust_preserves_config_and_project_fields(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / ".claude.json"
+            first = root / "q001"
+            second = root / "q002"
+            first.mkdir()
+            second.mkdir()
+            config_path.write_text(json.dumps({
+                "machineID": "keep-me",
+                "projects": {
+                    str(first.resolve()): {"allowedTools": ["Read"], "custom": 7},
+                },
+            }), encoding="utf-8")
+            config_path.chmod(0o640)
+
+            result = run_tasks.trust_claude_workspaces(
+                [first, second], config_path=config_path
+            )
+
+            self.assertEqual(result, config_path.resolve())
+            saved = json.loads(config_path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["machineID"], "keep-me")
+            first_key = str(first.resolve())
+            second_key = str(second.resolve())
+            self.assertEqual(saved["projects"][first_key]["allowedTools"], ["Read"])
+            self.assertEqual(saved["projects"][first_key]["custom"], 7)
+            self.assertIs(saved["projects"][first_key]["hasTrustDialogAccepted"], True)
+            self.assertIs(saved["projects"][second_key]["hasTrustDialogAccepted"], True)
+            self.assertEqual(config_path.stat().st_mode & 0o777, 0o640)
+            self.assertEqual(list(root.glob("..claude.json.*")), [])
+
+    def test_workspace_trust_creates_private_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            workspace = root / "q001"
+            workspace.mkdir()
+            config_path = root / "config" / ".claude.json"
+
+            run_tasks.trust_claude_workspaces([workspace], config_path=config_path)
+
+            saved = json.loads(config_path.read_text(encoding="utf-8"))
+            self.assertIs(
+                saved["projects"][str(workspace.resolve())]["hasTrustDialogAccepted"], True
+            )
+            self.assertEqual(config_path.stat().st_mode & 0o777, 0o600)
 
     def test_launch_helper_uses_question_directory_and_exact_command(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -251,14 +298,14 @@ class RunnerTests(unittest.TestCase):
         ])
         self.assertIn("claude.cmd", launched[4])
 
-    def test_mocked_macos_launch_registers_claude_run_without_config_or_prompt(self):
+    def test_mocked_macos_auto_launch_is_trusted_interactive(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             database, row = self.make_batch(root)
             env_file = self.write_env(root, "generated-file-secret")
             argv = [
                 "run_tasks.py", "--db", str(database), "--batch", "0911",
-                "--env-file", str(env_file), "--select", "1", "--launch", "--mode", "iterm",
+                "--env-file", str(env_file), "--select", "1", "--launch",
             ]
             completed = subprocess.CompletedProcess([], 0, "", "")
             with mock.patch.object(sys, "argv", argv), mock.patch.object(
@@ -270,11 +317,14 @@ class RunnerTests(unittest.TestCase):
             ), mock.patch.object(
                 run_tasks, "open_iterm", return_value=completed
             ) as open_mock, mock.patch.object(
+                run_tasks, "trust_claude_workspaces", return_value=root / ".claude.json"
+            ) as trust_mock, mock.patch.object(
                 run_tasks.platform, "system", return_value="Darwin"
             ):
                 self.assertEqual(run_tasks.main(), 0)
-            open_mock.assert_called_once()
+            trust_mock.assert_called_once_with([Path(row["folder_path"])])
             launcher = next((root / "0911/.runs").glob("**/launch.command"))
+            open_mock.assert_called_once_with(launcher)
             self.assertTrue(
                 launcher.read_text(encoding="utf-8").startswith("#!/bin/zsh\nset -eu\n")
             )
