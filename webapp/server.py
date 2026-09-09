@@ -6,14 +6,12 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
-import hmac
 import io
 import json
 import mimetypes
 import os as _os
 import re
 import shutil
-import secrets
 import signal
 import sqlite3
 import subprocess
@@ -25,7 +23,7 @@ import urllib.request
 import webbrowser
 import zipfile
 from contextlib import closing
-from datetime import datetime, timedelta
+from datetime import datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -51,7 +49,6 @@ SNAPSHOT_RE = re.compile(r"^https://github\.com/[^/]+/[^/]+/commit/[0-9a-fA-F]{4
 ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 ENV_KEYS = (
     "CC_SWITCH_BASE_URL", "CC_SWITCH_MODEL", "CC_SWITCH_API_KEY", "CC_USR_SUBMITTER",
-    "CC_CONSOLE_PASSWORD",
 )
 PIPELINE_ENV_KEYS = (
     "CC_CLAUDE_DOCKER_IMAGE", "CC_CLAUDE_DOCKER_COMMAND",
@@ -60,12 +57,6 @@ PIPELINE_ENV_KEYS = (
     "CC_PIPELINE_CODEX_CONCURRENCY",
 )
 NEWS_URL_MAX = 20
-SESSION_TTL = timedelta(hours=12)
-USERS = {
-    "zhanglei": {"role": "admin", "label": "zhanglei", "permissions": {"view", "operate", "admin"}},
-    "renhuangding": {"role": "operator", "label": "renhuangding", "permissions": {"view", "operate"}},
-    "gaoyong": {"role": "operator", "label": "gaoyong", "permissions": {"view", "operate"}},
-}
 AUTHOR_JOB_OUTPUT_LIMIT = 200_000
 AUTHOR_JOB_STATUSES = {"queued", "running", "completed", "failed", "interrupted"}
 
@@ -134,19 +125,6 @@ CREATE TABLE IF NOT EXISTS pipeline_items (
 );
 CREATE INDEX IF NOT EXISTS idx_pipeline_jobs_created ON pipeline_jobs(created_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_pipeline_items_job ON pipeline_items(pipeline_job_id, question_no);
-
-CREATE TABLE IF NOT EXISTS console_audit_logs (
-    id INTEGER PRIMARY KEY,
-    username TEXT NOT NULL,
-    role TEXT NOT NULL,
-    action TEXT NOT NULL,
-    target TEXT NOT NULL DEFAULT '',
-    outcome TEXT NOT NULL,
-    detail TEXT NOT NULL DEFAULT '',
-    remote_addr TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_console_audit_created ON console_audit_logs(created_at DESC, id DESC);
 
 CREATE TABLE IF NOT EXISTS vps_nodes (
     id INTEGER PRIMARY KEY,
@@ -241,23 +219,12 @@ class ConsoleData:
         self.pipeline_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pipeline")
         self._pipeline_processes: dict[int, subprocess.Popen[str]] = {}
         self._pipeline_process_lock = threading.Lock()
-        self._sessions: dict[str, tuple[dict[str, object], datetime]] = {}
-        self._session_lock = threading.Lock()
-        self._vps_sessions: dict[int, str] = {}
         if self.database.is_file():
             connection = initialize_database(self.database)
             connection.close()
         self._initialize_author_jobs()
         self._initialize_pipeline_jobs()
-        self._initialize_audit_logs()
         self._initialize_vps_nodes()
-
-    def _initialize_audit_logs(self) -> None:
-        if not self.database.is_file():
-            return
-        with closing(self._write_connection()) as connection:
-            connection.executescript(AUTHOR_JOB_SCHEMA)
-            connection.commit()
 
     def _initialize_vps_nodes(self) -> None:
         if not self.database.is_file():
@@ -281,71 +248,6 @@ class ConsoleData:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA busy_timeout=30000")
         return connection
-
-    def _console_password(self) -> str:
-        password = self.read_env().get("CC_CONSOLE_PASSWORD", "")
-        if not password:
-            raise RuntimeError("未配置 CC_CONSOLE_PASSWORD，请在 .env 中设置控制台密码")
-        return password
-
-    def _audit(self, username: str, action: str, *, target: str = "", outcome: str = "success",
-               detail: str = "", remote_addr: str = "") -> None:
-        user = USERS.get(username, {"role": "unknown"})
-        with closing(self._write_connection()) as connection:
-            connection.execute(
-                "INSERT INTO console_audit_logs(username,role,action,target,outcome,detail,remote_addr,created_at) "
-                "VALUES(?,?,?,?,?,?,?,?)",
-                (username, user["role"], action, target[:500], outcome, detail[:2000], remote_addr[:100],
-                 datetime.now().astimezone().isoformat(timespec="seconds")),
-            )
-            connection.commit()
-
-    def login(self, username: object, password: object, remote_addr: str = "") -> tuple[str, dict[str, object]]:
-        name = str(username or "").strip().lower()
-        supplied = password if isinstance(password, str) else ""
-        user = USERS.get(name)
-        valid = bool(user and hmac.compare_digest(supplied, self._console_password()))
-        if not valid:
-            self._audit(name or "unknown", "login", outcome="failed", detail="用户名或密码错误", remote_addr=remote_addr)
-            raise ValueError("用户名或密码错误")
-        profile = {"username": name, **user, "permissions": sorted(user["permissions"])}
-        token = secrets.token_urlsafe(32)
-        with self._session_lock:
-            self._sessions[token] = (profile, datetime.now().astimezone() + SESSION_TTL)
-        self._audit(name, "login", remote_addr=remote_addr)
-        return token, profile
-
-    def session_user(self, token: str | None) -> dict[str, object] | None:
-        if not token:
-            return None
-        with self._session_lock:
-            session = self._sessions.get(token)
-            if session is None:
-                return None
-            profile, expires_at = session
-            if expires_at <= datetime.now().astimezone():
-                self._sessions.pop(token, None)
-                return None
-            self._sessions[token] = (profile, datetime.now().astimezone() + SESSION_TTL)
-            return dict(profile)
-
-    def logout(self, token: str | None, remote_addr: str = "") -> None:
-        profile = None
-        if token:
-            with self._session_lock:
-                session = self._sessions.pop(token, None)
-                profile = session[0] if session else None
-        if profile:
-            self._audit(str(profile["username"]), "logout", remote_addr=remote_addr)
-
-    def audit_logs(self, limit: int = 200) -> list[dict]:
-        with closing(self.connect()) as connection:
-            rows = connection.execute(
-                "SELECT id,username,role,action,target,outcome,detail,remote_addr,created_at "
-                "FROM console_audit_logs ORDER BY id DESC LIMIT ?",
-                (max(1, min(limit, 500)),),
-            ).fetchall()
-        return [dict(row) for row in rows]
 
     @staticmethod
     def _validate_vps_node(body: dict[str, object]) -> tuple[int | None, str, str, str, int]:
@@ -398,26 +300,10 @@ class ConsoleData:
             if result.rowcount != 1:
                 raise ValueError("VPS 节点不存在")
             connection.commit()
-        self._vps_sessions.pop(value, None)
 
-    def _vps_request(self, node: dict, user: dict[str, object], path: str, *, method: str = "GET", payload: object = None) -> tuple[bytes, dict[str, str]]:
-        node_id = int(node["id"])
+    def _vps_request(self, node: dict, path: str, *, method: str = "GET", payload: object = None) -> tuple[bytes, dict[str, str]]:
         base_url = str(node["base_url"]).rstrip("/") + "/"
         headers = {"Accept": "application/json"}
-        cookie = self._vps_sessions.get(node_id, "")
-        if not cookie:
-            login_body = json.dumps({"username": user["username"], "password": self._console_password()}).encode("utf-8")
-            login_request = urllib.request.Request(urljoin(base_url, "api/auth/login"), data=login_body, method="POST", headers={"Content-Type": "application/json", "Accept": "application/json"})
-            try:
-                with urllib.request.urlopen(login_request, timeout=8) as response:
-                    cookie_header = response.headers.get("Set-Cookie", "")
-                    cookie = cookie_header.split(";", 1)[0]
-            except (OSError, urllib.error.HTTPError) as exc:
-                raise RuntimeError(f"{node['name']} 登录失败：{exc}") from exc
-            if not cookie:
-                raise RuntimeError(f"{node['name']} 未返回登录会话")
-            self._vps_sessions[node_id] = cookie
-        headers["Cookie"] = cookie
         data = None
         if payload is not None:
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -427,8 +313,6 @@ class ConsoleData:
             with urllib.request.urlopen(request, timeout=10) as response:
                 return response.read(), {key.lower(): value for key, value in response.headers.items()}
         except urllib.error.HTTPError as exc:
-            if exc.code == 401:
-                self._vps_sessions.pop(node_id, None)
             detail = exc.read().decode("utf-8", errors="replace")[:300]
             raise RuntimeError(f"{node['name']} 请求失败（{exc.code}）：{detail}") from exc
         except OSError as exc:
@@ -441,13 +325,13 @@ class ConsoleData:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def vps_nodes(self, user: dict[str, object]) -> list[dict]:
+    def vps_nodes(self) -> list[dict]:
         result = []
         for node in self._node_rows():
             item = {**node, "enabled": bool(node["enabled"]), "status": "disabled" if not node["enabled"] else "offline", "error": ""}
             if node["enabled"]:
                 try:
-                    payload, _headers = self._vps_request(node, user, "/api/dashboard")
+                    payload, _headers = self._vps_request(node, "/api/dashboard")
                     item["status"] = "online"
                     item["dashboard"] = json.loads(payload.decode("utf-8"))
                 except (OSError, RuntimeError, ValueError) as exc:
@@ -455,21 +339,21 @@ class ConsoleData:
             result.append(item)
         return result
 
-    def vps_dashboard(self, node_id: object, user: dict[str, object]) -> dict:
+    def vps_dashboard(self, node_id: object) -> dict:
         node = next((row for row in self._node_rows() if int(row["id"]) == int(node_id)), None)
         if node is None:
             raise ValueError("VPS 节点不存在")
-        payload, _headers = self._vps_request(node, user, "/api/dashboard")
+        payload, _headers = self._vps_request(node, "/api/dashboard")
         return json.loads(payload.decode("utf-8"))
 
-    def vps_delivery_package(self, node_id: object, batch: object, user: dict[str, object]) -> tuple[str, bytes]:
+    def vps_delivery_package(self, node_id: object, batch: object) -> tuple[str, bytes]:
         node = next((row for row in self._node_rows() if int(row["id"]) == int(node_id)), None)
         if node is None:
             raise ValueError("VPS 节点不存在")
         batch_name = str(batch or "")
         if not BATCH_RE.fullmatch(batch_name):
             raise ValueError("批次名无效")
-        payload, headers = self._vps_request(node, user, "/api/delivery-package?batch=" + quote(batch_name))
+        payload, headers = self._vps_request(node, "/api/delivery-package?batch=" + quote(batch_name))
         disposition = headers.get("content-disposition", "")
         match = re.search(r'filename="([^"]+)"', disposition)
         return (match.group(1) if match else f"ccusr-delivery-{batch_name}.zip"), payload
@@ -1528,7 +1412,6 @@ class ConsoleData:
             "CC_SWITCH_MODEL": values["model"],
             "CC_SWITCH_API_KEY": values["api_key"],
             "CC_USR_SUBMITTER": values["submitter"],
-            "CC_CONSOLE_PASSWORD": current["CC_CONSOLE_PASSWORD"],
             "CC_CLAUDE_DOCKER_IMAGE": values["docker_image"],
             "CC_CLAUDE_DOCKER_COMMAND": values["docker_command"],
             "CC_PIPELINE_MODEL_MODE": values["model_mode"],
@@ -2009,41 +1892,6 @@ class ConsoleHandler(BaseHTTPRequestHandler):
     def send_error_json(self, message: str, status: HTTPStatus) -> None:
         self.send_json({"ok": False, "error": message}, status)
 
-    def _cookie(self, name: str) -> str:
-        raw = self.headers.get("Cookie", "")
-        for item in raw.split(";"):
-            key, separator, value = item.strip().partition("=")
-            if separator and key == name:
-                return value
-        return ""
-
-    def current_user(self) -> dict[str, object] | None:
-        return self.data.session_user(self._cookie("ccusr_session"))
-
-    def require_user(self, *, permission: str = "view", redirect: bool = False) -> dict[str, object] | None:
-        user = self.current_user()
-        if user is None:
-            if redirect:
-                self.send_response(HTTPStatus.FOUND)
-                self.send_header("Location", "/login.html")
-                self.end_headers()
-            else:
-                self.send_error_json("请先登录", HTTPStatus.UNAUTHORIZED)
-            return None
-        if permission not in user.get("permissions", []):
-            self.send_error_json("当前账号没有执行此操作的权限", HTTPStatus.FORBIDDEN)
-            return None
-        return user
-
-    def remote_addr(self) -> str:
-        return str(self.client_address[0]) if self.client_address else ""
-
-    def auth_cookie(self, token: str) -> str:
-        return f"ccusr_session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={int(SESSION_TTL.total_seconds())}"
-
-    def clear_auth_cookie(self) -> None:
-        self.send_header("Set-Cookie", "ccusr_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
-
     def send_static(self, relative: str) -> None:
         target = (STATIC_ROOT / relative).resolve()
         if STATIC_ROOT.resolve() not in target.parents and target != STATIC_ROOT.resolve():
@@ -2081,35 +1929,11 @@ class ConsoleHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         try:
-            if parsed.path in {"/login.html", "/static/login.css", "/static/login.js"}:
-                self.send_static("login.html" if parsed.path == "/login.html" else parsed.path[len("/static/"):])
-                return
-            if parsed.path == "/api/auth/me":
-                user = self.current_user()
-                if user is None:
-                    self.send_error_json("未登录", HTTPStatus.UNAUTHORIZED)
-                else:
-                    self.send_json({"authenticated": True, "user": user})
-                return
-            if parsed.path == "/api/auth/logout":
-                user = self.require_user()
-                if user is None:
-                    return
-                token = self._cookie("ccusr_session")
-                self.data.logout(token, self.remote_addr())
-                self.send_response(HTTPStatus.NO_CONTENT)
-                self.clear_auth_cookie()
-                self.end_headers()
-                return
-            if self.require_user(redirect=parsed.path in {"/", "/index.html"}) is None:
-                return
             if parsed.path == "/api/dashboard":
                 batch = parse_qs(parsed.query).get("batch", [None])[0]
                 self.send_json(self.data.dashboard(batch))
                 return
             if parsed.path == "/api/config":
-                if self.require_user(permission="admin") is None:
-                    return
                 self.send_json(self.data.env_config())
                 return
             if parsed.path == "/api/environment":
@@ -2124,25 +1948,17 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/pipeline-jobs":
                 self.send_json({"jobs": self.data.pipeline_jobs()})
                 return
-            if parsed.path == "/api/audit-logs":
-                if self.require_user(permission="admin") is None:
-                    return
-                self.send_json({"logs": self.data.audit_logs()})
-                return
             if parsed.path == "/api/vps-nodes":
-                user = self.current_user()
-                self.send_json({"nodes": self.data.vps_nodes(user)})
+                self.send_json({"nodes": self.data.vps_nodes()})
                 return
             match = re.fullmatch(r"/api/vps-nodes/(\d+)/dashboard", parsed.path)
             if match:
-                user = self.current_user()
-                self.send_json(self.data.vps_dashboard(int(match.group(1)), user))
+                self.send_json(self.data.vps_dashboard(int(match.group(1))))
                 return
             match = re.fullmatch(r"/api/vps-nodes/(\d+)/delivery-package", parsed.path)
             if match:
-                user = self.current_user()
                 batch = parse_qs(parsed.query).get("batch", [None])[0]
-                filename, payload = self.data.vps_delivery_package(int(match.group(1)), batch, user)
+                filename, payload = self.data.vps_delivery_package(int(match.group(1)), batch)
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "application/zip")
                 self.send_header("Content-Length", str(len(payload)))
@@ -2150,12 +1966,10 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 self.wfile.write(payload)
-                self.data._audit(str(user["username"]), "download_vps_delivery_package", target=f"{match.group(1)}:{batch or ''}", remote_addr=self.remote_addr())
                 return
             if parsed.path == "/api/delivery-package":
                 batch = parse_qs(parsed.query).get("batch", [None])[0]
                 filename, payload = self.data.delivery_package(batch)
-                user = self.current_user()
                 self.send_response(HTTPStatus.OK)
                 self.send_header("Content-Type", "application/zip")
                 self.send_header("Content-Length", str(len(payload)))
@@ -2167,8 +1981,6 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 self.send_header("X-Content-Type-Options", "nosniff")
                 self.end_headers()
                 self.wfile.write(payload)
-                if user is not None:
-                    self.data._audit(str(user["username"]), "download_delivery_package", target=str(batch or ""), remote_addr=self.remote_addr())
                 return
             if parsed.path.startswith("/api/questions/"):
                 raw_id = parsed.path.rsplit("/", 1)[-1]
@@ -2192,23 +2004,6 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             return
         try:
             body = self.read_json()
-            if self.path == "/api/auth/login":
-                token, user = self.data.login(body.get("username"), body.get("password"), self.remote_addr())
-                self.send_json({"ok": True, "user": user}, cookie=self.auth_cookie(token))
-                return
-            if self.path == "/api/auth/logout":
-                user = self.require_user()
-                if user is None:
-                    return
-                self.data.logout(self._cookie("ccusr_session"), self.remote_addr())
-                self.send_json({"ok": True}, cookie="ccusr_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
-                return
-            permission = "admin" if self.path in {"/api/config", "/api/actions/environment-repair"} else "operate"
-            if self.path in {"/api/vps-nodes", "/api/vps-nodes/delete"}:
-                permission = "admin"
-            user = self.require_user(permission=permission)
-            if user is None:
-                return
             if self.path == "/api/vps-nodes":
                 result = self.data.save_vps_node(body)
             elif self.path == "/api/vps-nodes/delete":
@@ -2240,16 +2035,12 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             else:
                 self.send_error_json("操作不存在", HTTPStatus.NOT_FOUND)
                 return
-            self.data._audit(str(user["username"]), self.path, target=str(body.get("batch", body.get("job_id", ""))), remote_addr=self.remote_addr())
             self.send_json(result)
         except json.JSONDecodeError:
             self.send_error_json("请求不是有效 JSON", HTTPStatus.BAD_REQUEST)
         except subprocess.TimeoutExpired:
             self.send_error_json("操作超时，请检查终端状态", HTTPStatus.REQUEST_TIMEOUT)
         except (OSError, RuntimeError, sqlite3.Error, ValueError) as exc:
-            user = self.current_user()
-            if user is not None and not self.path.startswith("/api/auth/"):
-                self.data._audit(str(user["username"]), self.path, outcome="failed", detail=str(exc), remote_addr=self.remote_addr())
             self.send_error_json(str(exc), HTTPStatus.BAD_REQUEST)
 
     def log_message(self, format: str, *args: object) -> None:

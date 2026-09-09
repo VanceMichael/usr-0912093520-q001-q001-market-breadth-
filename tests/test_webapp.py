@@ -200,33 +200,15 @@ class WebConsoleTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "至少启用"):
                 data.update_news_feeds([{"url": "https://news.example.com/a", "enabled": False}])
 
-    def test_fixed_console_users_login_and_audit(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            database = self.make_database(root)
-            (root / ".env").write_text("CC_CONSOLE_PASSWORD=ldy888!\n", encoding="utf-8")
-            data = ConsoleData(database, root)
-            token, profile = data.login("renhuangding", "ldy888!", "127.0.0.1")
-            self.assertEqual(profile["role"], "operator")
-            self.assertEqual(data.session_user(token)["username"], "renhuangding")
-            with self.assertRaisesRegex(ValueError, "用户名或密码错误"):
-                data.login("unknown", "ldy888!", "127.0.0.1")
-            data.logout(token, "127.0.0.1")
-            logs = data.audit_logs()
-            self.assertEqual([log["action"] for log in logs[:3]], ["logout", "login", "login"])
-            self.assertEqual(logs[0]["username"], "renhuangding")
-
     def test_vps_node_registry_and_remote_dashboard_shape(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             database = self.make_database(root)
-            (root / ".env").write_text("CC_CONSOLE_PASSWORD=ldy888!\n", encoding="utf-8")
             data = ConsoleData(database, root)
-            _token, user = data.login("zhanglei", "ldy888!")
             with mock.patch.object(
                 data, "_vps_request", return_value=(json.dumps({"summary": {"total": 1}}).encode(), {})
             ):
-                nodes = data.vps_nodes(user)
+                nodes = data.vps_nodes()
             self.assertEqual(nodes[0]["status"], "online")
             self.assertEqual(nodes[0]["dashboard"]["summary"]["total"], 1)
             saved = data.save_vps_node({

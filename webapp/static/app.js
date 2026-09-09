@@ -1,7 +1,5 @@
 const state = {
   data: null,
-  user: null,
-  auditLogs: [],
   vpsNodes: [],
   selectedVpsId: null,
   batch: null,
@@ -162,17 +160,15 @@ function renderView() {
   const exportsView = state.view === "exports";
   const settingsView = state.view === "settings";
   const authorView = state.view === "author";
-  const auditView = state.view === "audit";
   const vpsView = state.view === "vps";
-  const nonProductionView = exportsView || settingsView || authorView || auditView || vpsView;
-  $(".batch-toolbar").hidden = settingsView || authorView || auditView || vpsView;
+  const nonProductionView = exportsView || settingsView || authorView || vpsView;
+  $(".batch-toolbar").hidden = settingsView || authorView || vpsView;
   $(".pipeline-band").hidden = nonProductionView;
   $(".list-controls").hidden = nonProductionView;
   $(".table-panel").hidden = nonProductionView;
   $("#export-view").hidden = !exportsView;
   $("#settings-view").hidden = !settingsView;
   $("#author-view").hidden = !authorView;
-  $("#audit-view").hidden = !auditView;
   $("#vps-view").hidden = !vpsView;
   $("#pipeline-jobs-panel").hidden = nonProductionView;
   const titles = {
@@ -181,7 +177,6 @@ function renderView() {
     records: ["交付记录", "查看已经生成评分记录的题目及交付质检状态。"],
     exports: ["导出中心", "集中查看当前批次的工作簿和原始 JSONL 轨迹。"],
     settings: ["运行配置", "修改下一次 Claude Code 启动使用的中转地址、模型和提交人。"],
-    audit: ["审计日志", "查看登录和控制台操作记录。"],
     vps: ["VPS 管理", "统一查看远程 VPS 节点状态、批次进度和交付物。"],
   };
   $("#page-title").textContent = titles[state.view][0];
@@ -189,25 +184,8 @@ function renderView() {
   $$(".nav-item").forEach((button) => button.classList.toggle("active", button.dataset.view === state.view));
   if (exportsView) renderFiles();
   else if (settingsView) renderSettings();
-  else if (auditView) renderAuditLogs();
   else if (vpsView) renderVps();
   else if (!authorView) renderRows();
-}
-
-function renderUser() {
-  const user = state.user;
-  $("#user-pill").textContent = user ? `${user.username} · ${user.role === "admin" ? "管理员" : "操作员"}` : "";
-  $("#audit-view").hidden = true;
-  $$(".admin-only").forEach((item) => { item.hidden = user?.role !== "admin"; });
-  $("#settings-view").hidden = user?.role !== "admin" && state.view === "settings";
-  $("#vps-admin-panel").hidden = user?.role !== "admin";
-}
-
-function renderAuditLogs() {
-  const rows = $("#audit-rows");
-  if (!rows) return;
-  rows.innerHTML = state.auditLogs.length ? state.auditLogs.map((log) => `
-    <tr><td>${escapeHtml(formatDate(log.created_at))}</td><td>${escapeHtml(log.username)}</td><td>${escapeHtml(log.action)}</td><td>${escapeHtml(log.target || "-")}</td><td class="audit-${log.outcome === "success" ? "success" : "failed"}">${escapeHtml(log.outcome === "success" ? "成功" : "失败")}</td><td>${escapeHtml(log.remote_addr || "-")}</td></tr>`).join("") : `<tr><td colspan="6">暂无审计记录</td></tr>`;
 }
 
 function selectedVps() {
@@ -229,7 +207,7 @@ function renderVps() {
       <span>${escapeHtml(node.base_url)}</span>
     </button>`).join("");
   const selected = selectedVps();
-  if (state.user?.role === "admin" && selected) {
+  if (selected) {
     $("#vps-id").value = selected.id;
     $("#vps-name").value = selected.name;
     $("#vps-base-url").value = selected.base_url;
@@ -642,7 +620,6 @@ async function startCodexAuthorJob() {
 }
 
 function render() {
-  renderUser();
   renderBatchOptions();
   renderSummary();
   renderPipeline();
@@ -664,25 +641,6 @@ async function loadDashboard(batch = state.batch) {
   } finally {
     $("#refresh-button").disabled = false;
   }
-}
-
-async function loadAuth() {
-  try {
-    const result = await api("/api/auth/me");
-    state.user = result.user;
-    renderUser();
-  } catch {
-    window.location.href = "/login.html";
-    throw new Error("未登录");
-  }
-}
-
-async function loadAuditLogs() {
-  try {
-    const result = await api("/api/audit-logs");
-    state.auditLogs = result.logs || [];
-    renderAuditLogs();
-  } catch (error) { toast(error.message, true); }
 }
 
 async function loadConfig() {
@@ -973,7 +931,6 @@ $(".nav-list").addEventListener("click", (event) => {
   state.view = button.dataset.view;
   state.stage = null;
   if (state.view === "settings" && !state.config) loadConfig();
-  if (state.view === "audit") loadAuditLogs();
   renderView();
 });
 $("#settings-form").addEventListener("submit", async (event) => {
@@ -1034,11 +991,6 @@ $("#news-feed-list").addEventListener("click", (event) => {
   const row = button.closest(".news-feed-row");
   row?.remove();
 });
-$("#logout-button").addEventListener("click", async () => {
-  await fetch("/api/auth/logout");
-  window.location.href = "/login.html";
-});
-$("#audit-refresh").addEventListener("click", loadAuditLogs);
 $("#vps-refresh").addEventListener("click", loadVpsNodes);
 $("#vps-node-list").addEventListener("click", (event) => {
   const button = event.target.closest("[data-vps-id]");
@@ -1132,12 +1084,10 @@ document.addEventListener("keydown", (event) => {
 
 refreshIcons();
 renderAuthorCommand();
-loadAuth().then(() => {
-  loadDashboard();
-  loadEnvironment();
-  loadAuthorJobs();
-  loadMothers();
-  loadPipelineJobs();
-  loadVpsNodes();
-  if (state.user?.role === "admin") loadConfig();
-}).catch(() => {});
+loadDashboard();
+loadConfig();
+loadEnvironment();
+loadAuthorJobs();
+loadMothers();
+loadPipelineJobs();
+loadVpsNodes();
