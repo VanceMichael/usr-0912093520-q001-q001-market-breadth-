@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CC USR 控制台登录</title>
+  <link rel="stylesheet" href="/static/login.css">
+</head>
+<body>
+  <main class="login-shell">
+    <section class="login-panel" aria-labelledby="login-title">
+      <div class="brand-mark">CC</div>
+      <p class="eyebrow">CC USR Console</p>
+      <h1 id="login-title">登录生产控制台</h1>
+      <p class="login-subtitle">请输入固定账号和控制台密码。</p>
+      <form id="login-form" autocomplete="on">
+        <label>账号<select id="username" name="username" required>
+          <option value="zhanglei">zhanglei</option>
+          <option value="renhuangding">renhuangding</option>
+          <option value="gaoyong">gaoyong</option>
+        </select></label>
+        <label>密码<input id="password" name="password" type="password" required autocomplete="current-password"></label>
+        <p id="login-error" class="login-error" role="alert" hidden></p>
+        <button type="submit">登录</button>
+      </form>
+    </section>
+  </main>
+  <script src="/static/login.js"></script>
+</body>
+</html>
