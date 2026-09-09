@@ -144,11 +144,14 @@ class RunnerTests(unittest.TestCase):
         with mock.patch.object(run_tasks.platform, "system", return_value="Linux"):
             self.assertEqual(run_tasks.select_launch_mode("auto"), "server")
 
-    def test_auto_mode_remains_unattended_on_macos_with_iterm(self):
+    def test_auto_mode_uses_visible_headless_iterm_on_macos(self):
         with mock.patch.object(
             run_tasks.platform, "system", return_value="Darwin"
         ), mock.patch.object(run_tasks, "iterm_available", return_value=True):
-            self.assertEqual(run_tasks.select_launch_mode("auto"), "server")
+            self.assertEqual(run_tasks.select_launch_mode("auto"), "iterm-headless")
+
+    def test_explicit_iterm_mode_remains_interactive(self):
+        self.assertEqual(run_tasks.select_launch_mode("iterm"), "iterm")
 
     def test_launch_helper_uses_question_directory_and_exact_command(self):
         with tempfile.TemporaryDirectory() as directory:
