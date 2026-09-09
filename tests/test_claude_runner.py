@@ -1,6 +1,7 @@
 import importlib.util
 import io
 import json
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -190,7 +191,7 @@ class RunnerTests(unittest.TestCase):
             ), redirect_stdout(stdout):
                 self.assertEqual(run_tasks.main(), 0)
             output = stdout.getvalue()
-            self.assertIn(f"cd {row['folder_path']}", output)
+            self.assertIn(f"cd {shlex.quote(str(row['folder_path']))}", output)
             self.assertIn(
                 "claude --print --dangerously-skip-permissions "
                 "--permission-mode bypassPermissions --permission-prompts none "
@@ -200,7 +201,7 @@ class RunnerTests(unittest.TestCase):
             for secret in ("preview-secret", "relay.example.com", "claude-test", row["prompt"]):
                 self.assertNotIn(secret, output)
 
-    def test_mocked_launch_registers_claude_run_without_config_or_prompt(self):
+    def test_mocked_macos_launch_registers_claude_run_without_config_or_prompt(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             database, row = self.make_batch(root)
@@ -223,6 +224,10 @@ class RunnerTests(unittest.TestCase):
             ):
                 self.assertEqual(run_tasks.main(), 0)
             open_mock.assert_called_once()
+            launcher = next((root / "0911/.runs").glob("**/launch.command"))
+            self.assertTrue(
+                launcher.read_text(encoding="utf-8").startswith("#!/bin/zsh\nset -eu\n")
+            )
             generated = "\n".join(
                 path.read_text(encoding="utf-8")
                 for path in (root / "0911/.runs").glob("**/*") if path.is_file()
@@ -243,6 +248,56 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(run["harness_version"], "2.1.259")
             self.assertEqual(status, "running")
 
+    def test_mocked_windows_launch_uses_powershell_without_config_or_prompt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database, row = self.make_batch(root)
+            env_file = self.write_env(root, "windows-file-secret")
+            argv = [
+                "run_tasks.py", "--db", str(database), "--batch", "0911",
+                "--env-file", str(env_file), "--select", "1", "--launch",
+            ]
+            with mock.patch.object(sys, "argv", argv), mock.patch.object(
+                run_tasks, "find_claude", return_value="C:/npm/claude.cmd"
+            ), mock.patch.object(
+                run_tasks, "claude_version", return_value="2.1.259"
+            ), mock.patch.object(
+                run_tasks, "powershell_executable", return_value="powershell.exe"
+            ), mock.patch.object(
+                run_tasks, "open_windows"
+            ) as open_mock, mock.patch.object(
+                run_tasks.platform, "system", return_value="Windows"
+            ):
+                self.assertEqual(run_tasks.main(), 0)
+            launcher = next((root / "0911/.runs").glob("**/launch.ps1"))
+            generated = launcher.read_text(encoding="utf-8-sig")
+            open_mock.assert_called_once_with(launcher)
+            for forbidden in (
+                "windows-file-secret", "relay.example.com", "claude-test", row["prompt"]
+            ):
+                self.assertNotIn(forbidden, generated)
+            self.assertIn("--question-id", generated)
+            self.assertIn("C:/npm/claude.cmd", generated)
+            connection = connect(database)
+            run = connection.execute("SELECT * FROM runs").fetchone()
+            status = connection.execute(
+                "SELECT status FROM questions WHERE id=?", (row["id"],)
+            ).fetchone()[0]
+            connection.close()
+            self.assertEqual(run["harness"], "Claude Code")
+            self.assertEqual(status, "running")
+
+    def test_windows_command_shim_runs_without_changing_claude_arguments(self):
+        command = ["claude.cmd", "--dangerously-skip-permissions", "原始 prompt"]
+        environment = {"ANTHROPIC_MODEL": "claude-test"}
+        completed = subprocess.CompletedProcess(command, 7)
+        with mock.patch.object(
+            launch_task.subprocess, "run", return_value=completed
+        ) as run_mock:
+            self.assertEqual(
+                launch_task.run_claude_on_windows(command, environment), 7
+            )
+        run_mock.assert_called_once_with(command, env=environment, check=False)
     def test_mocked_server_launch_is_detached_and_records_pid(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

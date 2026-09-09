@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import difflib
 import hashlib
 import json
@@ -16,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 11
 TASK_TYPES = {
     "0-1 代码生成", "Feature 迭代", "Bug 修复", "代码理解",
     "代码重构", "工程化", "代码测试",
@@ -44,6 +45,29 @@ BANNED_TERMS = {
     "记账", "健康健身", "菜谱", "天气", "番茄钟", "习惯打卡", "音乐播放器",
     "旅行日记", "观影记录",
 }
+DOCUMENT_SUFFIXES = {".md", ".rst"}
+DOCUMENT_TEXT_NAMES = {"readme", "readme.txt"}
+SNAPSHOT_META_PATTERNS = (
+    ("评测或标注语境", re.compile(r"评测|测评|标注任务|满意度数据|目标模型|答题模型|出题|质检")),
+    ("工具或模型名称", re.compile(r"\b(?:coding agent|claude|codex|user prompt)\b", re.IGNORECASE)),
+    ("英文评测术语", re.compile(r"\b(?:benchmark|evaluation)\b", re.IGNORECASE)),
+    ("脚手架或答题说明", re.compile(
+        r"起始工作区|初始脚手架|任务执行者|本题|题目要求|"
+        r"starting workspace|starter (?:workspace|repository)|task owner|"
+        r"implementation is intentionally left",
+        re.IGNORECASE,
+    )),
+)
+SNAPSHOT_META_FILENAME_RE = re.compile(
+    r"(?:^|[/\\])(?:prompt|evaluation|benchmark|rubric|题目说明|评测说明|质检报告)(?:[._-]|$)",
+    re.IGNORECASE,
+)
+PROMPT_LABEL_RE = re.compile(
+    r"(?:^|[；;。])\s*(?:背景|目标|功能|技术|要求|验收|注意事项)\s*[:：]"
+)
+PROMPT_CANNED_OPENING_RE = re.compile(
+    r"^\s*(?:请(?:你)?\s*)?从零(?:开始)?(?:构建|实现|开发|搭建|创建)一套"
+)
 
 
 SCHEMA = """
@@ -68,7 +92,8 @@ CREATE TABLE IF NOT EXISTS news_topics (
     updated_at TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_news_topics_status ON news_topics(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_news_topics_status
+    ON news_topics(status, created_at);
 
 CREATE TABLE IF NOT EXISTS batches (
     id INTEGER PRIMARY KEY,
@@ -77,6 +102,9 @@ CREATE TABLE IF NOT EXISTS batches (
     markdown_path TEXT NOT NULL,
     brief TEXT NOT NULL DEFAULT '',
     question_count INTEGER NOT NULL CHECK (question_count > 0),
+    author_mode TEXT NOT NULL DEFAULT '0-1',
+    mother_id INTEGER,
+    task_types TEXT NOT NULL DEFAULT '0-1 代码生成',
     status TEXT NOT NULL DEFAULT 'draft',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -93,6 +121,8 @@ CREATE TABLE IF NOT EXISTS questions (
     prompt TEXT NOT NULL,
     prompt_sha256 TEXT NOT NULL,
     task_type TEXT NOT NULL,
+    author_mode TEXT NOT NULL DEFAULT '0-1',
+    mother_id INTEGER,
     difficulty TEXT NOT NULL,
     languages TEXT NOT NULL,
     repo_url TEXT NOT NULL DEFAULT '',
@@ -129,6 +159,9 @@ CREATE TABLE IF NOT EXISTS runs (
     harness TEXT NOT NULL DEFAULT 'Claude Code',
     harness_version TEXT NOT NULL DEFAULT '',
     session_id TEXT NOT NULL DEFAULT '',
+    container_cwd TEXT NOT NULL DEFAULT '',
+    trajectory_root TEXT NOT NULL DEFAULT '',
+    operating_system TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'registered',
     started_at TEXT NOT NULL DEFAULT '',
     finished_at TEXT NOT NULL DEFAULT '',
@@ -136,7 +169,6 @@ CREATE TABLE IF NOT EXISTS runs (
     error_message TEXT NOT NULL DEFAULT '',
     container_id TEXT NOT NULL DEFAULT '',
     log_path TEXT NOT NULL DEFAULT '',
-    trajectory_root TEXT NOT NULL DEFAULT '',
     retry_count INTEGER NOT NULL DEFAULT 0,
     heartbeat_at TEXT NOT NULL DEFAULT '',
     UNIQUE (question_id, batch_run_id)
@@ -189,6 +221,100 @@ CREATE TABLE IF NOT EXISTS records (
 
 CREATE INDEX IF NOT EXISTS idx_questions_batch ON questions(batch_id, question_no);
 CREATE INDEX IF NOT EXISTS idx_records_question ON records(question_id, turn_no);
+
+CREATE TABLE IF NOT EXISTS mother_library (
+    id INTEGER PRIMARY KEY,
+    source_question_id INTEGER NOT NULL UNIQUE REFERENCES questions(id) ON DELETE RESTRICT,
+    source_batch TEXT NOT NULL,
+    source_task_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    workspace_path TEXT NOT NULL,
+    repo_url TEXT NOT NULL DEFAULT '',
+    initial_snapshot TEXT NOT NULL DEFAULT '',
+    local_initial_sha TEXT NOT NULL DEFAULT '',
+    use_count INTEGER NOT NULL DEFAULT 0 CHECK (use_count >= 0),
+    last_used_at TEXT NOT NULL DEFAULT '',
+    bugfix_ready INTEGER NOT NULL DEFAULT 1 CHECK (bugfix_ready IN (0, 1)),
+    iteration_ready INTEGER NOT NULL DEFAULT 1 CHECK (iteration_ready IN (0, 1)),
+    defect_note TEXT NOT NULL DEFAULT '',
+    notes TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS mother_usages (
+    id INTEGER PRIMARY KEY,
+    mother_id INTEGER NOT NULL REFERENCES mother_library(id) ON DELETE RESTRICT,
+    derived_question_id INTEGER NOT NULL UNIQUE REFERENCES questions(id) ON DELETE RESTRICT,
+    derived_task_type TEXT NOT NULL,
+    used_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_mother_library_ready ON mother_library(bugfix_ready, iteration_ready, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_mother_usages_mother ON mother_usages(mother_id, used_at DESC);
+
+CREATE TABLE IF NOT EXISTS author_jobs (
+    id INTEGER PRIMARY KEY,
+    batch_name TEXT NOT NULL,
+    question_count INTEGER NOT NULL CHECK (question_count > 0),
+    business TEXT NOT NULL DEFAULT '',
+    technology TEXT NOT NULL DEFAULT '',
+    notes TEXT NOT NULL DEFAULT '',
+    author_mode TEXT NOT NULL DEFAULT '0-1',
+    task_type TEXT NOT NULL DEFAULT '0-1 代码生成',
+    mother_id INTEGER,
+    prompt TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued',
+    output TEXT NOT NULL DEFAULT '',
+    last_message TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT '',
+    pid INTEGER,
+    created_at TEXT NOT NULL,
+    started_at TEXT NOT NULL DEFAULT '',
+    finished_at TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_author_jobs_created ON author_jobs(created_at DESC, id DESC);
+
+CREATE TABLE IF NOT EXISTS pipeline_jobs (
+    id INTEGER PRIMARY KEY,
+    batch_name TEXT NOT NULL,
+    question_count INTEGER NOT NULL CHECK (question_count > 0),
+    qc_concurrency INTEGER NOT NULL DEFAULT 2,
+    model_concurrency INTEGER NOT NULL DEFAULT 2,
+    codex_concurrency INTEGER NOT NULL DEFAULT 2,
+    docker_image TEXT NOT NULL,
+    docker_command TEXT NOT NULL DEFAULT 'claude',
+    status TEXT NOT NULL DEFAULT 'queued',
+    output TEXT NOT NULL DEFAULT '',
+    last_message TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT '',
+    pid INTEGER,
+    retry_of_job_id INTEGER REFERENCES pipeline_jobs(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL,
+    started_at TEXT NOT NULL DEFAULT '',
+    finished_at TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS pipeline_items (
+    id INTEGER PRIMARY KEY,
+    pipeline_job_id INTEGER NOT NULL REFERENCES pipeline_jobs(id) ON DELETE CASCADE,
+    question_id INTEGER NOT NULL REFERENCES questions(id) ON DELETE RESTRICT,
+    question_no INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued',
+    output TEXT NOT NULL DEFAULT '',
+    error TEXT NOT NULL DEFAULT '',
+    heartbeat_at TEXT NOT NULL DEFAULT '',
+    activity_at TEXT NOT NULL DEFAULT '',
+    health_status TEXT NOT NULL DEFAULT '',
+    health_detail TEXT NOT NULL DEFAULT '',
+    started_at TEXT NOT NULL DEFAULT '',
+    finished_at TEXT NOT NULL DEFAULT '',
+    UNIQUE (pipeline_job_id, question_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_pipeline_jobs_created ON pipeline_jobs(created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_pipeline_items_job ON pipeline_items(pipeline_job_id, question_no);
 """
 
 
@@ -200,10 +326,35 @@ def connect(database: Path) -> sqlite3.Connection:
     database.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(database)
     connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA busy_timeout=10000")
-    connection.execute("PRAGMA journal_mode=WAL")
-    connection.execute("PRAGMA synchronous=NORMAL")
     connection.executescript(SCHEMA)
+    batch_columns = {row["name"] for row in connection.execute("PRAGMA table_info(batches)")}
+    if "author_mode" not in batch_columns:
+        connection.execute("ALTER TABLE batches ADD COLUMN author_mode TEXT NOT NULL DEFAULT '0-1'")
+    if "mother_id" not in batch_columns:
+        connection.execute("ALTER TABLE batches ADD COLUMN mother_id INTEGER")
+    if "task_types" not in batch_columns:
+        connection.execute("ALTER TABLE batches ADD COLUMN task_types TEXT NOT NULL DEFAULT '0-1 代码生成'")
+    question_columns = {row["name"] for row in connection.execute("PRAGMA table_info(questions)")}
+    if "author_mode" not in question_columns:
+        connection.execute("ALTER TABLE questions ADD COLUMN author_mode TEXT NOT NULL DEFAULT '0-1'")
+    if "mother_id" not in question_columns:
+        connection.execute("ALTER TABLE questions ADD COLUMN mother_id INTEGER")
+    # Backfill the mother catalog for databases created before the catalog existed.
+    connection.execute(
+        "INSERT OR IGNORE INTO mother_library(source_question_id, source_batch, source_task_id, title, prompt, workspace_path, "
+        "repo_url, initial_snapshot, local_initial_sha, created_at, updated_at) "
+        "SELECT q.id, b.name, q.task_id, q.title, q.prompt, q.folder_path, q.repo_url, q.initial_snapshot, q.local_initial_sha, "
+        "q.created_at, q.updated_at FROM questions q JOIN batches b ON b.id=q.batch_id "
+        "WHERE q.author_mode='0-1' AND q.task_type=?",
+        (FIRST_TURN_TASK_TYPE,),
+    )
+    author_columns = {row["name"] for row in connection.execute("PRAGMA table_info(author_jobs)")}
+    if "author_mode" not in author_columns:
+        connection.execute("ALTER TABLE author_jobs ADD COLUMN author_mode TEXT NOT NULL DEFAULT '0-1'")
+    if "task_type" not in author_columns:
+        connection.execute("ALTER TABLE author_jobs ADD COLUMN task_type TEXT NOT NULL DEFAULT '0-1 代码生成'")
+    if "mother_id" not in author_columns:
+        connection.execute("ALTER TABLE author_jobs ADD COLUMN mother_id INTEGER")
     record_columns = {
         row["name"] for row in connection.execute("PRAGMA table_info(records)")
     }
@@ -250,6 +401,18 @@ def connect(database: Path) -> sqlite3.Connection:
         connection.execute(
             "UPDATE runs SET harness_version=codex_version WHERE harness_version=''"
         )
+    if "container_cwd" not in run_columns:
+        connection.execute(
+            "ALTER TABLE runs ADD COLUMN container_cwd TEXT NOT NULL DEFAULT ''"
+        )
+    if "trajectory_root" not in run_columns:
+        connection.execute(
+            "ALTER TABLE runs ADD COLUMN trajectory_root TEXT NOT NULL DEFAULT ''"
+        )
+    if "operating_system" not in run_columns:
+        connection.execute(
+            "ALTER TABLE runs ADD COLUMN operating_system TEXT NOT NULL DEFAULT ''"
+        )
     run_migrations = {
         "status": "TEXT NOT NULL DEFAULT 'registered'",
         "started_at": "TEXT NOT NULL DEFAULT ''",
@@ -258,13 +421,29 @@ def connect(database: Path) -> sqlite3.Connection:
         "error_message": "TEXT NOT NULL DEFAULT ''",
         "container_id": "TEXT NOT NULL DEFAULT ''",
         "log_path": "TEXT NOT NULL DEFAULT ''",
-        "trajectory_root": "TEXT NOT NULL DEFAULT ''",
         "retry_count": "INTEGER NOT NULL DEFAULT 0",
         "heartbeat_at": "TEXT NOT NULL DEFAULT ''",
     }
     for name, definition in run_migrations.items():
         if name not in run_columns:
             connection.execute(f"ALTER TABLE runs ADD COLUMN {name} {definition}")
+    pipeline_job_columns = {
+        row["name"] for row in connection.execute("PRAGMA table_info(pipeline_jobs)")
+    }
+    if "pid" not in pipeline_job_columns:
+        connection.execute("ALTER TABLE pipeline_jobs ADD COLUMN pid INTEGER")
+    if "retry_of_job_id" not in pipeline_job_columns:
+        connection.execute(
+            "ALTER TABLE pipeline_jobs ADD COLUMN retry_of_job_id INTEGER REFERENCES pipeline_jobs(id) ON DELETE SET NULL"
+        )
+    pipeline_item_columns = {
+        row["name"] for row in connection.execute("PRAGMA table_info(pipeline_items)")
+    }
+    for name in ("heartbeat_at", "activity_at", "health_status", "health_detail"):
+        if name not in pipeline_item_columns:
+            connection.execute(
+                f"ALTER TABLE pipeline_items ADD COLUMN {name} TEXT NOT NULL DEFAULT ''"
+            )
     connection.execute(
         "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "
         "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -280,6 +459,97 @@ def prompt_hash(prompt: str) -> str:
 
 def normalize(text: str) -> str:
     return " ".join(text.lower().split())
+
+
+def chinese_character_count(text: str) -> int:
+    return len(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]", text))
+
+
+def prompt_style_issues(prompt: str) -> list[str]:
+    """Return objective style failures; semantic naturalness remains a QC judgment."""
+    issues: list[str] = []
+    stripped = prompt.strip()
+    if chinese_character_count(stripped) < 20:
+        issues.append("User Prompt 必须以中文书面语为主")
+    if PROMPT_CANNED_OPENING_RE.search(stripped):
+        issues.append("User Prompt 使用了“从零构建一套”式固定开头")
+    if re.match(r"^(?:#{1,6}\s|[-*+]\s|\d+[.、)]\s*)", stripped):
+        issues.append("User Prompt 不能使用标题或清单格式")
+    if len(PROMPT_LABEL_RE.findall(stripped)) >= 2:
+        issues.append("User Prompt 不能把背景、功能、技术、验收等标签串成模板")
+    if re.search(r"评测模型|测试模型能力|用于评测|用于测评|标注数据", stripped):
+        issues.append("User Prompt 不能暴露评测或标注用途")
+    return issues
+
+
+def tracked_workspace_files(folder: Path) -> list[Path]:
+    result = subprocess.run(
+        ["git", "-C", str(folder), "ls-files", "-z"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+    )
+    if result.returncode:
+        return []
+    return [folder / raw.decode("utf-8", errors="surrogateescape") for raw in result.stdout.split(b"\0") if raw]
+
+
+def snapshot_content_issues(folder: Path) -> list[str]:
+    """Check tracked project documents for language and evaluation leakage."""
+    issues: list[str] = []
+    for path in tracked_workspace_files(folder):
+        relative = path.relative_to(folder).as_posix()
+        if SNAPSHOT_META_FILENAME_RE.search(relative):
+            issues.append(f"快照包含与项目无关的内部文件：{relative}")
+        is_document = (
+            path.suffix.lower() in DOCUMENT_SUFFIXES
+            or path.name.casefold() in DOCUMENT_TEXT_NAMES
+            or (path.suffix.lower() == ".txt" and "docs" in {part.casefold() for part in path.parts})
+        )
+        if not path.is_file():
+            continue
+        try:
+            content = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            issues.append(f"项目文档不是有效的 UTF-8 文本：{relative}")
+            continue
+        if path.suffix.lower() == ".py":
+            try:
+                tree = ast.parse(content, filename=str(path))
+            except SyntaxError:
+                tree = None
+            if tree is not None:
+                docstrings: list[str] = []
+                module_doc = ast.get_docstring(tree, clean=False)
+                if module_doc:
+                    docstrings.append(module_doc)
+                for node in ast.walk(tree):
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                        doc = ast.get_docstring(node, clean=False)
+                        if doc:
+                            docstrings.append(doc)
+                for docstring in docstrings:
+                    if chinese_character_count(docstring) < 4 and len(re.findall(r"\b[A-Za-z]{2,}\b", docstring)) >= 3:
+                        issues.append(f"Python 文档字符串应使用中文书面语：{relative}")
+                    for label, pattern in SNAPSHOT_META_PATTERNS:
+                        match = pattern.search(docstring)
+                        if match:
+                            issues.append(f"Python 文档字符串包含{label}：{relative}（{match.group(0)}）")
+        if not is_document:
+            for label, pattern in SNAPSHOT_META_PATTERNS:
+                match = pattern.search(content)
+                if match:
+                    issues.append(f"项目源码包含{label}：{relative}（{match.group(0)}）")
+            continue
+        prose = re.sub(r"```.*?```", "", content, flags=re.DOTALL)
+        prose = re.sub(r"`[^`]+`|https?://\S+", "", prose)
+        chinese_count = chinese_character_count(prose)
+        latin_words = len(re.findall(r"\b[A-Za-z]{2,}\b", prose))
+        if chinese_count < 8 or chinese_count < latin_words // 2:
+            issues.append(f"项目文档应以中文书面语为主：{relative}")
+        for label, pattern in SNAPSHOT_META_PATTERNS:
+            match = pattern.search(content)
+            if match:
+                issues.append(f"项目文档包含{label}：{relative}（{match.group(0)}）")
+    return list(dict.fromkeys(issues))
 
 
 def trigrams(text: str) -> set[str]:
@@ -370,9 +640,9 @@ __pycache__/
     subprocess.run(["git", "-C", str(folder), "add", ".gitignore"], check=True)
     result = subprocess.run(
         [
-            "git", "-C", str(folder), "-c", "user.name=CC Dataset",
-            "-c", "user.email=cc-dataset@local.invalid", "commit", "-q",
-            "-m", "Initial workspace snapshot",
+            "git", "-C", str(folder), "-c", "user.name=项目维护者",
+            "-c", "user.email=project-maintainer@local.invalid", "commit", "-q",
+            "-m", "初始化项目",
         ],
         text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
     )
@@ -430,7 +700,7 @@ def render_batch(connection: sqlite3.Connection, batch: str) -> Path:
             f"- 语言/框架：{row['languages']}",
             f"- 机械质检：{row['mechanical_qc']}",
             f"- 出题质检：{row['qc_decision']}",
-            f"- 启动状态：{'READY' if ready else 'BLOCKED'}", "", "### User Prompt", "", row["prompt"], "", "---", "",
+            f"- 启动状态：{'可运行' if ready else '已阻塞'}", "", "### 用户需求", "", row["prompt"], "", "---", "",
         ])
     path = Path(batch_data["markdown_path"])
     path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
@@ -447,13 +717,25 @@ def create_batch(connection: sqlite3.Connection, workspace: Path, spec_path: Pat
     questions = spec["questions"]
     if not questions:
         raise ValueError("questions array is empty")
-    batch_dir = (workspace / name).resolve()
+    batch_dir = (workspace / name).absolute()
     try:
-        batch_dir.relative_to(workspace.resolve())
+        batch_dir.relative_to(workspace.absolute())
     except ValueError as exc:
         raise ValueError("batch directory must stay inside the workspace") from exc
     if batch_dir.exists():
         raise FileExistsError(f"batch directory already exists: {batch_dir}")
+    author_mode = str(spec.get("author_mode", "0-1")).strip() or "0-1"
+    if author_mode not in {"0-1", "derived"}:
+        raise ValueError("author_mode must be 0-1 or derived")
+    mother_id = spec.get("mother_id")
+    if author_mode == "derived":
+        if isinstance(mother_id, bool) or not isinstance(mother_id, int) or mother_id <= 0:
+            raise ValueError("derived batches require a valid mother_id")
+        mother = connection.execute("SELECT * FROM mother_library WHERE id=?", (mother_id,)).fetchone()
+        if mother is None:
+            raise ValueError("mother_id does not exist")
+    else:
+        mother_id = None
 
     seen_folders: set[str] = set()
     prepared = []
@@ -476,10 +758,16 @@ def create_batch(connection: sqlite3.Connection, workspace: Path, spec_path: Pat
             raise ValueError(f"question {index} first-turn prompt must be one paragraph")
         if task_type not in TASK_TYPES:
             raise ValueError(f"question {index} has invalid task_type")
-        if task_type != FIRST_TURN_TASK_TYPE:
+        if author_mode == "0-1" and task_type != FIRST_TURN_TASK_TYPE:
             raise ValueError(
                 f"question {index} first-turn task_type must be {FIRST_TURN_TASK_TYPE}"
             )
+        if author_mode == "derived" and task_type == FIRST_TURN_TASK_TYPE:
+            raise ValueError(f"question {index} derived task_type cannot be {FIRST_TURN_TASK_TYPE}")
+        if author_mode == "derived" and task_type == "Bug 修复" and not mother["bugfix_ready"]:
+            raise ValueError("selected mother is not ready for Bug 修复")
+        if author_mode == "derived" and task_type == "Feature 迭代" and not mother["iteration_ready"]:
+            raise ValueError("selected mother is not ready for Feature 迭代")
         if difficulty not in DIFFICULTIES or difficulty == "简单":
             raise ValueError(f"question {index} first-turn difficulty must be 中等/困难/地狱")
         if not isinstance(languages, list) or not languages or not all(
@@ -495,9 +783,10 @@ def create_batch(connection: sqlite3.Connection, workspace: Path, spec_path: Pat
     markdown_path = batch_dir / f"题目_{name}.md"
     try:
         cursor = connection.execute(
-            "INSERT INTO batches(name, folder_path, markdown_path, brief, question_count, created_at, updated_at) "
-            "VALUES(?, ?, ?, ?, ?, ?, ?)",
-            (name, str(batch_dir), str(markdown_path), str(spec.get("brief", "")).strip(), len(prepared), timestamp, timestamp),
+            "INSERT INTO batches(name, folder_path, markdown_path, brief, question_count, author_mode, mother_id, task_types, created_at, updated_at) "
+            "VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (name, str(batch_dir), str(markdown_path), str(spec.get("brief", "")).strip(), len(prepared), author_mode, mother_id,
+             ", ".join(sorted({item[5] for item in prepared})), timestamp, timestamp),
         )
         batch_id = cursor.lastrowid
         for index, item, folder_name, title, prompt, task_type, difficulty, languages, reproducibility in prepared:
@@ -508,13 +797,13 @@ def create_batch(connection: sqlite3.Connection, workspace: Path, spec_path: Pat
             connection.execute(
                 """INSERT INTO questions(
                     batch_id, question_no, task_id, folder_name, folder_path, title, prompt,
-                    prompt_sha256, task_type, difficulty, languages, repo_url, initial_snapshot,
+                    prompt_sha256, task_type, author_mode, mother_id, difficulty, languages, repo_url, initial_snapshot,
                     local_initial_sha, reproducibility, expected_areas, difficulty_evidence,
                     similarity_tags, created_at, updated_at
-                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     batch_id, index, task_id, folder_name, str(folder), title, prompt,
-                    prompt_hash(prompt), task_type, difficulty, ", ".join(languages),
+                    prompt_hash(prompt), task_type, author_mode, mother_id, difficulty, ", ".join(languages),
                     str(item.get("repo_url", "")).strip(),
                     str(item.get("initial_snapshot", "")).strip(), local_sha, reproducibility,
                     json.dumps(item.get("expected_areas", []), ensure_ascii=False),
@@ -522,6 +811,26 @@ def create_batch(connection: sqlite3.Connection, workspace: Path, spec_path: Pat
                     json.dumps(item.get("similarity_tags", []), ensure_ascii=False),
                     timestamp, timestamp,
                 ),
+            )
+            if author_mode == "0-1":
+                connection.execute(
+                    "INSERT INTO mother_library(source_question_id, source_batch, source_task_id, title, prompt, workspace_path, created_at, updated_at) "
+                    "SELECT id, ?, task_id, title, prompt, folder_path, ?, ? FROM questions WHERE batch_id=? AND question_no=?",
+                    (name, timestamp, timestamp, batch_id, index),
+                )
+        if author_mode == "derived":
+            question_ids = connection.execute(
+                "SELECT id FROM questions WHERE batch_id=? ORDER BY question_no", (batch_id,)
+            ).fetchall()
+            for row in question_ids:
+                connection.execute(
+                    "INSERT INTO mother_usages(mother_id, derived_question_id, derived_task_type, used_at) "
+                    "SELECT ?, ?, task_type, ? FROM questions WHERE id=?",
+                    (mother_id, row["id"], timestamp, row["id"]),
+                )
+            connection.execute(
+                "UPDATE mother_library SET use_count=use_count+?, last_used_at=?, updated_at=? WHERE id=?",
+                (len(question_ids), timestamp, timestamp, mother_id),
             )
         connection.commit()
         render_batch(connection, name)
@@ -542,6 +851,7 @@ def check_question(connection: sqlite3.Connection, row: sqlite3.Row) -> dict:
     combined = normalize(row["title"] + "\n" + prompt)
     if "\n" in prompt or "\r" in prompt:
         errors.append("首轮 User Prompt 必须是一个自然语言段落")
+    errors.extend(prompt_style_issues(prompt))
     if row["difficulty"] == "简单":
         errors.append("首轮题目不能是简单")
     banned = sorted(term for term in BANNED_TERMS if term in combined)
@@ -557,6 +867,8 @@ def check_question(connection: sqlite3.Connection, row: sqlite3.Row) -> dict:
         text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
     ).stdout.strip():
         errors.append("题目工作目录不是干净快照")
+    elif folder.is_dir() and (folder / ".git").is_dir():
+        errors.extend(snapshot_content_issues(folder))
     if not SNAPSHOT_RE.fullmatch(row["initial_snapshot"]):
         errors.append("缺少可访问的 GitHub 40 位初始快照链接")
     elif folder.is_dir() and (folder / ".git").is_dir():
@@ -761,6 +1073,11 @@ def set_repository(
         "qc_decision='pending', qc_prompt_sha256='', human_approved=0, status='draft', updated_at=? WHERE id=?",
         (normalized_repo, snapshot, local_sha, now(), row["id"]),
     )
+    connection.execute(
+        "UPDATE mother_library SET repo_url=?, initial_snapshot=?, local_initial_sha=?, updated_at=? "
+        "WHERE source_question_id=?",
+        (normalized_repo, snapshot, local_sha, now(), row["id"]),
+    )
     connection.commit()
     render_batch(connection, batch)
 
@@ -780,6 +1097,14 @@ def list_batches(connection: sqlite3.Connection) -> None:
         print(f"{row['name']:<12} {ready}/{row['question_count']} READY  {row['folder_path']}")
 
 
+def list_mothers(connection: sqlite3.Connection) -> None:
+    rows = connection.execute(
+        "SELECT id, source_batch, source_task_id, title, workspace_path, repo_url, initial_snapshot, "
+        "use_count, last_used_at, bugfix_ready, iteration_ready FROM mother_library ORDER BY updated_at DESC, id DESC"
+    ).fetchall()
+    print(json.dumps([dict(row) for row in rows], ensure_ascii=False, indent=2))
+
+
 def list_questions(connection: sqlite3.Connection, batch: str) -> None:
     for row in question_rows(connection, batch):
         current = row["qc_prompt_sha256"] == prompt_hash(row["prompt"])
@@ -794,7 +1119,7 @@ def list_questions(connection: sqlite3.Connection, batch: str) -> None:
 def relocate_paths(
     connection: sqlite3.Connection, workspace: Path, batch_name: str | None = None
 ) -> int:
-    """Rebind stored absolute paths after the project is copied to another host."""
+    """Rebind stored absolute paths after copying the project to another host."""
     workspace = workspace.resolve(strict=True)
     if batch_name:
         batches = connection.execute(
@@ -820,7 +1145,9 @@ def relocate_paths(
         for question in questions:
             question_folder = folder / question["folder_name"]
             if not question_folder.is_dir():
-                raise ValueError(f"question folder does not exist under new workspace: {question_folder}")
+                raise ValueError(
+                    f"question folder does not exist under new workspace: {question_folder}"
+                )
             connection.execute(
                 "UPDATE questions SET folder_path=?,updated_at=? WHERE id=?",
                 (str(question_folder), now(), question["id"]),
@@ -841,6 +1168,7 @@ def main() -> int:
     create_parser.add_argument("--workspace", type=Path, default=Path.cwd())
     list_parser = subparsers.add_parser("list")
     list_parser.add_argument("--batch")
+    subparsers.add_parser("mother-list")
     qc_parser = subparsers.add_parser("qc-check")
     qc_parser.add_argument("--batch", required=True)
     qc_parser.add_argument("--select")
@@ -876,6 +1204,8 @@ def main() -> int:
             create_batch(connection, args.workspace.resolve(), args.spec.resolve())
         elif args.command == "list":
             list_questions(connection, args.batch) if args.batch else list_batches(connection)
+        elif args.command == "mother-list":
+            list_mothers(connection)
         elif args.command == "qc-check":
             return run_mechanical_qc(connection, args.batch, args.select)
         elif args.command == "duplicate-check":

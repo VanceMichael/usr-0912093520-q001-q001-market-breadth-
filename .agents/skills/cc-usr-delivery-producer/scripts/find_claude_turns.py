@@ -59,9 +59,11 @@ def read_events(path: Path) -> list[dict]:
     return events
 
 
-def same_folder(raw: object, folder: Path, aliases: tuple[Path, ...] = ()) -> bool:
+def same_folder(raw: object, folder: Path, aliases: tuple[Path, ...] | str = ()) -> bool:
     if not isinstance(raw, str) or not raw:
         return False
+    if isinstance(aliases, str):
+        aliases = (Path(aliases),)
     try:
         resolved = Path(raw).resolve()
         return resolved == folder.resolve() or any(resolved == alias.resolve() for alias in aliases)
@@ -164,7 +166,12 @@ def main() -> int:
             claude_root = Path(run["trajectory_root"]).resolve()
         else:
             claude_root = (Path.home() / ".claude/projects").resolve()
-        folder_aliases = (Path("/workspace"),) if str(run["batch_run_id"]).startswith("docker-") else ()
+        folder_aliases: tuple[Path, ...] = ()
+        if str(run["batch_run_id"]).startswith("docker-"):
+            aliases = [Path("/workspace")]
+            if run["container_cwd"]:
+                aliases.append(Path(str(run["container_cwd"])))
+            folder_aliases = tuple(aliases)
         result = locate(
             claude_root, Path(question["folder_path"]), question["prompt"],
             launched_at, folder_aliases,

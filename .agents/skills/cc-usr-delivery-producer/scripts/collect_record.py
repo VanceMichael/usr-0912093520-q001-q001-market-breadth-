@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import platform
 import sqlite3
 import sys
 from datetime import datetime
@@ -25,6 +26,10 @@ from tools.delivery_records import (  # noqa: E402
 
 def now() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def operating_system_label() -> str:
+    return "Windows" if platform.system() == "Windows" else "MacOS/Linux"
 
 
 def ask(label: str, *, allow_blank: bool = False) -> str:
@@ -165,7 +170,7 @@ def build_record(
         "reproducibility": question["reproducibility"],
         "harness": run["harness"],
         "harness_version": run["harness_version"],
-        "operating_system": "MacOS/Linux",
+        "operating_system": str(run["operating_system"] or operating_system_label()),
         "task_type": question["task_type"] if turn_no == 1 else supplied["task_type"],
         "difficulty": question["difficulty"] if turn_no == 1 else supplied["difficulty"],
         "languages": question["languages"] if turn_no == 1 else supplied["languages"],

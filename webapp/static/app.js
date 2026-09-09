@@ -8,8 +8,15 @@ const state = {
   view: "production",
   pendingAction: null,
   config: null,
+  environment: null,
+  authorJobs: [],
+  mothers: [],
+  pipelineJobs: [],
 };
 let drawerCloseTimer = null;
+let authorJobsTimer = null;
+let authorJobsSignature = "";
+let pipelineJobsSignature = "";
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
@@ -124,6 +131,7 @@ function renderRows() {
         <button class="icon-button" data-action="detail" title="查看详情" aria-label="查看详情"><i data-lucide="eye"></i></button>
         <button class="icon-button" data-action="copy" title="复制 Prompt" aria-label="复制 Prompt"><i data-lucide="copy"></i></button>
         <button class="icon-button" data-action="folder" title="打开题目目录" aria-label="打开题目目录"><i data-lucide="folder-open"></i></button>
+        ${question.run_count === 0 ? `<button class="icon-button" data-action="single-pipeline" title="单题跑全流程" aria-label="单题跑全流程"><i data-lucide="play-circle"></i></button>` : ""}
       </div></td>
     </tr>`;
   }).join("");
@@ -158,6 +166,7 @@ function renderView() {
   $("#export-view").hidden = !exportsView;
   $("#settings-view").hidden = !settingsView;
   $("#author-view").hidden = !authorView;
+  $("#pipeline-jobs-panel").hidden = nonProductionView;
   const titles = {
     author: ["生成题目", "填写批次信息和关键词，生成可复制的标准出题命令。"],
     production: ["生产批次", "从题目质检到 Excel 交付，状态直接来自本地生产库。"],
@@ -180,6 +189,334 @@ function renderSettings() {
   $("#config-submitter").value = state.config.submitter || "";
   $("#config-api-key").value = "";
   $("#config-key-hint").textContent = state.config.api_key_hint || "";
+  $("#config-docker-image").value = state.config.docker_image || "claude-cli:latest";
+  $("#config-docker-command").value = state.config.docker_command || "claude";
+  $("#config-qc-concurrency").value = state.config.qc_concurrency || 2;
+  $("#config-model-concurrency").value = state.config.model_concurrency || 2;
+  $("#config-codex-concurrency").value = state.config.codex_concurrency || 2;
+}
+
+function renderEnvironment() {
+  const container = $("#environment-status");
+  if (!container || !state.environment) return;
+  const status = state.environment;
+  const summary = "<div class=\"environment-summary " + (status.ok ? "ok" : "failed") + "\"><span class=\"status-dot\"></span><strong>" + (status.ok ? "环境可用" : "环境不可用") + "</strong><small>检测于 " + escapeHtml(formatDate(status.checked_at)) + "</small></div>";
+  const checks = (status.checks || []).map((check) =>
+    "<div class=\"environment-check " + (check.ok ? "ok" : "failed") + "\"><i data-lucide=\"" + (check.ok ? "check-circle-2" : "x-circle") + "\"></i><div><strong>" + escapeHtml(check.name) + "</strong><span>" + escapeHtml(check.detail) + "</span></div></div>"
+  ).join("");
+  const messages = (status.repair_messages || []).map((message) =>
+    "<p class=\"environment-message\">" + escapeHtml(message) + "</p>"
+  ).join("");
+  container.innerHTML = summary + "<div class=\"environment-checks\">" + checks + "</div>" + messages;
+  refreshIcons();
+}
+
+async function loadEnvironment(repair = false) {
+  const button = $("#environment-repair");
+  if (button) button.disabled = true;
+  try {
+    state.environment = await api(repair ? "/api/actions/environment-repair" : "/api/environment", repair ? { method: "POST", body: "{}" } : {});
+    renderEnvironment();
+    if (!state.environment.ok) toast("运行环境不可用，请先修复", true);
+    else if (repair) toast("运行环境已通过检测");
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    if (button) button.disabled = false;
+  }
+}
+
+function pipelineStatus(status) {
+  return ({
+    queued: "排队中",
+    running: "执行中",
+    qc_running: "题目质检中",
+    qc_passed: "题目质检通过",
+    model_running: "模型跑题中",
+    model_completed: "模型跑题完成",
+    producing: "交付生产中",
+    produced: "交付已生产",
+    finalizing: "交付质检与导出中",
+    completed: "已完成",
+    failed: "失败",
+    interrupted: "已中断",
+  })[status] || status;
+}
+
+function pipelineItemLabel(item) {
+  if (item.status !== "model_running") return pipelineStatus(item.status);
+  return ({
+    starting: "模型容器启动中",
+    healthy: "模型运行正常",
+    idle: "模型运行中，暂时无新轨迹",
+    unavailable: "模型容器状态异常",
+    stalled: "模型运行已停滞",
+  })[item.health_status] || "模型运行中，等待健康确认";
+}
+
+function scrollJobLogsToLatest() {
+  document.querySelectorAll(".author-job-output").forEach((output) => {
+    output.scrollTop = output.scrollHeight;
+  });
+}
+
+function renderPipelineJobs() {
+  const list = $("#pipeline-job-list");
+  if (!list) return;
+  if (!state.pipelineJobs.length) {
+    list.innerHTML = '<div class="empty-state"><strong>暂无自动流水线任务</strong><span>点击“ 一键全流程 ”后，状态和日志会保存在这里。</span></div>';
+    return;
+  }
+  list.innerHTML = state.pipelineJobs.map((job) => `
+    <article class="pipeline-job status-${escapeHtml(job.status)}">
+      <div class="pipeline-job-head"><div><strong>#${job.id} · ${escapeHtml(job.batch_name)}</strong><span>${job.question_count} 题 · Docker ${escapeHtml(job.docker_image)}</span></div><div class="job-actions">${job.can_retry ? `<button class="button secondary compact" type="button" data-pipeline-retry="${job.id}"><i data-lucide="rotate-ccw"></i>从失败处重试</button>` : ""}<span class="job-status">${escapeHtml(pipelineStatus(job.status))}</span></div></div>
+      <div class="pipeline-job-meta"><span>质检并发 ${job.qc_concurrency}</span><span>模型并发 ${job.model_concurrency}</span><span>交付并发 ${job.codex_concurrency}</span>${job.retry_of_job_id ? `<span>重试自 #${job.retry_of_job_id}</span>` : ""}<span>${escapeHtml(formatDate(job.created_at))}</span></div>
+      <div class="pipeline-item-grid">${(job.items || []).map((item) => `<span class="pipeline-item status-${escapeHtml(item.status.replaceAll("_", "-"))} health-${escapeHtml(item.health_status || "unknown")}"${item.error ? ` title="${escapeHtml(item.error)}"` : ""}><span>第 ${item.question_no} 题：${escapeHtml(pipelineItemLabel(item))}</span>${item.status === "model_running" && item.health_detail ? `<small>${escapeHtml(item.health_detail)} · 最近活动 ${escapeHtml(formatDate(item.activity_at || item.heartbeat_at))}</small>` : ""}</span>`).join("")}</div>
+      ${job.can_retry ? `<div class="job-actions"><button class="button secondary compact" type="button" data-author-retry="${job.id}"><i data-lucide="rotate-ccw"></i>从失败处重试</button></div>` : ""}
+      ${job.error ? `<div class="author-job-error">${escapeHtml(job.error)}</div>` : ""}
+      <pre class="author-job-output">${escapeHtml(job.output || job.last_message || "等待流水线启动...")}</pre>
+    </article>`).join("");
+  scrollJobLogsToLatest();
+  refreshIcons();
+}
+
+function retryPipelineJob(jobId) {
+  openModal("从失败处重试", `将保留任务 #${jobId} 的日志和原始轨迹，跳过已有有效结果，从首个失败阶段继续。`, "开始重试", async () => {
+    closeModal();
+    const button = document.querySelector(`[data-pipeline-retry="${jobId}"]`);
+    if (button) button.disabled = true;
+    try {
+      const result = await api("/api/actions/auto-pipeline-retry", {
+        method: "POST", body: JSON.stringify({ job_id: jobId }),
+      });
+      toast(result.message || "重试任务已启动");
+      await loadPipelineJobs();
+    } catch (error) {
+      toast(error.message, true);
+      if (button) button.disabled = false;
+    }
+  });
+}
+
+let pipelineJobsTimer = null;
+async function loadPipelineJobs() {
+  if (document.hidden) return;
+  try {
+    const result = await api("/api/pipeline-jobs");
+    const seenBatches = new Set();
+    state.pipelineJobs = (result.jobs || []).filter((job) => {
+      if (seenBatches.has(job.batch_name)) return false;
+      seenBatches.add(job.batch_name);
+      return true;
+    }).map((job) => ({ ...job, output: (job.output || "").slice(-30000) }));
+    const signature = JSON.stringify(state.pipelineJobs.map((job) => ({
+      id: job.id, status: job.status, outputLength: job.output_length,
+      lastMessage: job.last_message, error: job.error,
+      items: (job.items || []).map((item) => [
+        item.id, item.status, item.heartbeat_at, item.activity_at,
+        item.health_status, item.health_detail, item.error,
+      ]),
+    })));
+    if (signature !== pipelineJobsSignature) {
+      pipelineJobsSignature = signature;
+      renderPipelineJobs();
+    }
+    const active = state.pipelineJobs.some((job) => job.status === "queued" || job.status === "running");
+    if (active && !pipelineJobsTimer) pipelineJobsTimer = setInterval(loadPipelineJobs, 6000);
+    if (!active && pipelineJobsTimer) { clearInterval(pipelineJobsTimer); pipelineJobsTimer = null; }
+  } catch (error) { toast(error.message, true); }
+}
+
+async function startAutoPipeline() {
+  const button = $("#auto-pipeline-button");
+  if (!state.batch) return;
+  const numbers = state.selected.size ? selectedNumbers() : [];
+  const scope = numbers.length ? `第 ${numbers.join("、")} 题` : "全部题目";
+  openModal("一键全流程", `将对批次 ${state.batch} 的${scope}执行 Codex 题目质检、Claude 并行跑题、Codex 交付生产、交付质检和 Excel 导出。`, "开始执行", async () => {
+    closeModal();
+    const original = button.innerHTML;
+    button.disabled = true;
+    button.textContent = "启动中...";
+    try {
+      const payload = { batch: state.batch };
+      if (numbers.length) payload.numbers = numbers;
+      const result = await api("/api/actions/auto-pipeline", { method: "POST", body: JSON.stringify(payload) });
+      toast(result.message || "自动流水线已启动");
+      await loadPipelineJobs();
+    } catch (error) { toast(error.message, true); }
+    finally { button.innerHTML = original; button.disabled = false; refreshIcons(); }
+  });
+}
+
+function authorJobStatus(job) {
+  const labels = { queued: "排队中", running: "执行中", completed: "已完成", failed: "失败", interrupted: "已中断" };
+  return labels[job.status] || job.status;
+}
+
+function renderAuthorJobs() {
+  const list = $("#author-job-list");
+  if (!list) return;
+  if (!state.authorJobs.length) {
+    list.innerHTML = '<div class="empty-state"><strong>暂无 Codex 出题任务</strong><span>提交任务后，过程日志会显示在这里。</span></div>';
+    return;
+  }
+  list.innerHTML = state.authorJobs.map((job) => `
+    <article class="author-job status-${escapeHtml(job.status)}">
+      <div class="author-job-head"><div><strong>#${job.id} · ${escapeHtml(job.batch_name)}</strong><span>${job.question_count} 题 · 创建于 ${escapeHtml(formatDate(job.created_at))}</span></div><span class="job-status">${escapeHtml(authorJobStatus(job))}</span></div>
+      <div class="author-job-meta"><span>${job.author_mode === "derived" ? `派生 · ${escapeHtml(job.task_type || "非 0-1")}` : "0-1 新建母题"}</span><span>开始：${escapeHtml(formatDate(job.started_at))}</span><span>结束：${escapeHtml(formatDate(job.finished_at))}</span><span>PID：${escapeHtml(job.pid || "-")}</span></div>
+      ${job.error ? `<div class="author-job-error">${escapeHtml(job.error)}</div>` : ""}
+      <pre class="author-job-output">${escapeHtml(job.output || job.last_message || "等待 Codex CLI 启动...")}</pre>
+    </article>`).join("");
+  scrollJobLogsToLatest();
+  refreshIcons();
+}
+
+function startSinglePipeline(question, button) {
+  openModal("单题跑全流程", `将只对 ${question.task_id} 执行题目质检、Claude 跑题、交付生产、交付质检和 Excel 导出。`, "开始执行", async () => {
+    closeModal();
+    const original = button.innerHTML;
+    button.disabled = true;
+    button.innerHTML = '<i data-lucide="loader-circle"></i>';
+    refreshIcons();
+    try {
+      const result = await api("/api/actions/auto-pipeline", {
+        method: "POST",
+        body: JSON.stringify({ batch: state.batch, numbers: [question.question_no] }),
+      });
+      toast(result.message || "单题流水线已启动");
+      await loadPipelineJobs();
+      await loadDashboard();
+    } catch (error) {
+      toast(error.message, true);
+    } finally {
+      button.innerHTML = original;
+      button.disabled = false;
+      refreshIcons();
+    }
+  });
+}
+
+function selectedAuthorMode() {
+  return document.querySelector('input[name="author-mode"]:checked')?.value || "0-1";
+}
+
+function renderMotherLibrary() {
+  const select = $("#author-mother");
+  if (!select) return;
+  const selected = select.value;
+  select.innerHTML = '<option value="">请选择已通过基础检查的母项目</option>' + state.mothers.map((mother) =>
+    `<option value="${mother.id}">${escapeHtml(mother.title)} · ${escapeHtml(mother.source_task_id)} · 已用 ${mother.use_count} 次</option>`
+  ).join("");
+  select.value = state.mothers.some((mother) => String(mother.id) === selected)
+    ? selected
+    : (state.mothers[0] ? String(state.mothers[0].id) : "");
+  const mother = state.mothers.find((item) => String(item.id) === select.value);
+  const taskType = $("#author-task-type");
+  if (mother && !mother.bugfix_ready && mother.iteration_ready) taskType.value = "Feature 迭代";
+  else if (mother && mother.bugfix_ready) taskType.value = "Bug 修复";
+  $("#mother-summary").textContent = mother
+    ? `代码路径：${mother.workspace_path}\nGit 地址：${mother.repo_url || "尚未登记"}\n初始快照：${mother.initial_snapshot || "尚未登记"}\n已派生使用：${mother.use_count} 次 · Bug 修复${mother.bugfix_ready ? "可用" : "不可用"} · Feature 迭代${mother.iteration_ready ? "可用" : "不可用"}`
+    : "选择母库项目后显示代码路径、Git 地址、初始快照和使用次数。";
+}
+
+function renderAuthorMode() {
+  const derived = selectedAuthorMode() === "derived";
+  $("#derived-author-fields").hidden = !derived;
+  $("#author-common-fields").hidden = derived;
+  $("#author-notes-field").hidden = derived;
+  $("#author-business").required = !derived;
+  renderMotherLibrary();
+  renderAuthorCommand();
+}
+
+function renderMotherModeAndCommand() {
+  renderMotherLibrary();
+  renderAuthorMode();
+  renderAuthorCommand();
+}
+
+function retryAuthorJob(jobId) {
+  openModal("从失败处重试", `将继续执行出题任务 #${jobId}。若批次已部分创建，将在现有批次基础上补齐。`, "开始重试", async () => {
+    closeModal();
+    const button = document.querySelector(`[data-author-retry="${jobId}"]`);
+    if (button) button.disabled = true;
+    try {
+      const result = await api("/api/actions/codex-author-retry", {
+        method: "POST", body: JSON.stringify({ job_id: jobId }),
+      });
+      toast(result.message || "重试出题任务已启动");
+      await loadAuthorJobs();
+    } catch (error) {
+      toast(error.message, true);
+      if (button) button.disabled = false;
+    }
+  });
+}
+
+async function loadAuthorJobs() {
+  if (document.hidden) return;
+  try {
+    const result = await api("/api/author-jobs");
+    state.authorJobs = (result.jobs || []).slice(0, 20).map((job) => ({
+      ...job, output: (job.output || "").slice(-30000),
+    }));
+    const signature = JSON.stringify(state.authorJobs.map((job) => [
+      job.id, job.status, job.output_length, job.last_message, job.error, job.can_retry,
+    ]));
+    if (signature !== authorJobsSignature) {
+      authorJobsSignature = signature;
+      renderAuthorJobs();
+    }
+    const active = state.authorJobs.some((job) => job.status === "queued" || job.status === "running");
+    if (active && !authorJobsTimer) {
+      authorJobsTimer = setInterval(loadAuthorJobs, 6000);
+    } else if (!active && authorJobsTimer) {
+      clearInterval(authorJobsTimer);
+      authorJobsTimer = null;
+    }
+  } catch (error) {
+    toast(error.message, true);
+  }
+}
+
+async function loadMothers() {
+  try {
+    const result = await api("/api/mother-library");
+    state.mothers = result.mothers || [];
+    renderMotherLibrary();
+    renderAuthorMode();
+    renderAuthorCommand();
+  } catch (error) { toast(error.message, true); }
+}
+
+async function startCodexAuthorJob() {
+  const button = $("#codex-author-button");
+  const body = {
+    batch: $("#author-batch").value.trim(),
+    count: Number($("#author-count").value),
+    business: $("#author-business").value.trim(),
+    technology: $("#author-technology").value.trim(),
+    notes: $("#author-notes").value.trim(),
+    mode: selectedAuthorMode(),
+    task_type: $("#author-task-type").value,
+    mother_id: $("#author-mother").value ? Number($("#author-mother").value) : null,
+    derived_notes: $("#author-derived-notes")?.value.trim() || "",
+    defect_tolerance: $("#author-defect-tolerance")?.value.trim() || "",
+  };
+  button.disabled = true;
+  const original = button.innerHTML;
+  button.textContent = "提交中...";
+  try {
+    const result = await api("/api/actions/codex-author", { method: "POST", body: JSON.stringify(body) });
+    toast(result.message || "Codex 出题任务已启动");
+    await loadAuthorJobs();
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    button.innerHTML = original;
+    button.disabled = false;
+    refreshIcons();
+  }
 }
 
 function render() {
@@ -283,6 +620,14 @@ function authorPrompt() {
   const business = $("#author-business").value.trim().replace(/\s+/g, " ");
   const technology = $("#author-technology").value.trim().replace(/\s+/g, " ");
   const notes = $("#author-notes").value.trim().replace(/\s+/g, " ");
+  const mode = selectedAuthorMode();
+  if (mode === "derived") {
+    const mother = state.mothers.find((item) => String(item.id) === $("#author-mother").value);
+    const taskType = $("#author-task-type").value;
+    const derivedNotes = $("#author-derived-notes")?.value.trim().replace(/\s+/g, " ") || "";
+    const tolerance = $("#author-defect-tolerance")?.value.trim().replace(/\s+/g, " ") || "";
+    return `使用 $cc-usr-question-author 基于母库生成派生题目。\n批次名：${batch}\n题目数量：${count}\n题型：${taskType}\n母库项目：${mother ? `${mother.title}（ID ${mother.id}，代码路径 ${mother.workspace_path}，Git ${mother.repo_url || "待登记"}，已用 ${mother.use_count} 次）` : "系统自动选择符合规范的母库项目"}\n派生方向：${derivedNotes || "围绕母项目已有业务设计真实的后续工作"}\n可接受的小瑕疵：${tolerance || "允许不影响构建和主要流程的小问题，并记录为可迭代方向"}\n出题要求：根据母项目代码、已登记快照和《项目规范.md》自动生成，不需要额外填写关键词。\n严格遵守项目规范和母库引用规则，保留母题关系并完成独立快照与质检，不要启动目标模型。`;
+  }
   const requirements = [
     business && `业务关键词：${business}`,
     technology && `技术关键词：${technology}`,
@@ -436,6 +781,7 @@ $("#question-rows").addEventListener("click", async (event) => {
   if (button.dataset.action === "folder") {
     executeAction("/api/actions/open", { kind: "question", id }, button, `已打开 ${question.task_id} 目录`).catch(() => {});
   }
+  if (button.dataset.action === "single-pipeline") startSinglePipeline(question, button);
 });
 $("#open-batch").addEventListener("click", () => executeAction("/api/actions/open", { kind: "batch", id: state.batch }, $("#open-batch"), "批次目录已打开").catch(() => {}));
 $("#qc-check").addEventListener("click", async () => {
@@ -447,12 +793,16 @@ $("#qc-check").addEventListener("click", async () => {
 $("#workflow-button").addEventListener("click", () => copyText(workflowPrompt(), "当前阶段指令已复制"));
 $("#launch-button").addEventListener("click", () => {
   const numbers = selectedNumbers();
-  openModal("启动 Claude Code", `将为第 ${numbers.join("、")} 题启动模型；Mac 自动使用 iTerm2，服务器自动使用无终端后台模式，最多同时启动 4 道题。`, "确认启动", async () => {
+  const terminal = state.config?.terminal || "终端";
+  openModal("启动 Claude Code", `将为第 ${numbers.join("、")} 题分别打开新的 ${terminal} 会话，最多同时启动 4 道题。`, "确认启动", async () => {
     closeModal();
     await executeAction("/api/actions/launch", { batch: state.batch, numbers }, $("#launch-button"), "Claude Code 会话已启动");
   });
 });
 $("#author-form").addEventListener("input", renderAuthorCommand);
+document.querySelectorAll('input[name="author-mode"]').forEach((input) => input.addEventListener("change", renderAuthorMode));
+$("#author-mother").addEventListener("change", renderMotherModeAndCommand);
+$("#author-task-type").addEventListener("change", renderAuthorCommand);
 $("#author-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   await copyText(authorPrompt(), "出题命令已复制", false);
@@ -460,6 +810,12 @@ $("#author-form").addEventListener("submit", async (event) => {
   status.querySelector("span").textContent = "出题命令已复制";
   status.hidden = false;
   refreshIcons();
+});
+$("#codex-author-button").addEventListener("click", startCodexAuthorJob);
+$("#author-jobs-refresh").addEventListener("click", loadAuthorJobs);
+$("#author-job-list").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-author-retry]");
+  if (button) retryAuthorJob(Number(button.dataset.authorRetry));
 });
 $("#export-button").addEventListener("click", () => {
   const numbers = state.selected.size ? selectedNumbers() : [];
@@ -491,6 +847,11 @@ $("#settings-form").addEventListener("submit", async (event) => {
         model: $("#config-model").value,
         api_key: $("#config-api-key").value,
         submitter: $("#config-submitter").value,
+        docker_image: $("#config-docker-image").value,
+        docker_command: $("#config-docker-command").value,
+        qc_concurrency: Number($("#config-qc-concurrency").value),
+        model_concurrency: Number($("#config-model-concurrency").value),
+        codex_concurrency: Number($("#config-codex-concurrency").value),
       }),
     });
     state.config = result.config;
@@ -504,6 +865,7 @@ $("#settings-form").addEventListener("submit", async (event) => {
     refreshIcons();
   }
 });
+$("#environment-repair").addEventListener("click", () => loadEnvironment(true));
 $("#toggle-api-key").addEventListener("click", () => {
   const input = $("#config-api-key");
   const showing = input.type === "text";
@@ -516,6 +878,49 @@ $("#toggle-api-key").addEventListener("click", () => {
 $("#file-list").addEventListener("click", (event) => {
   const button = event.target.closest("[data-file-path]");
   if (button) copyText(button.dataset.filePath, "文件路径已复制");
+});
+$("#delivery-package-button").addEventListener("click", async () => {
+  if (!state.batch) return;
+  const button = $("#delivery-package-button");
+  const original = button.innerHTML;
+  button.disabled = true;
+  button.textContent = "打包中...";
+  try {
+    const response = await fetch(`/api/delivery-package?batch=${encodeURIComponent(state.batch)}`);
+    if (!response.ok) {
+      let message = "交付包下载失败";
+      try { message = (await response.json()).error || message; } catch {}
+      throw new Error(message);
+    }
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = `ccusr-delivery-${state.batch}.zip`;
+    document.body.append(anchor);
+    anchor.click();
+    anchor.remove();
+    URL.revokeObjectURL(url);
+    toast("交付包已开始下载");
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    button.innerHTML = original;
+    button.disabled = false;
+    refreshIcons();
+  }
+});
+$("#auto-pipeline-button").addEventListener("click", startAutoPipeline);
+$("#pipeline-jobs-refresh").addEventListener("click", loadPipelineJobs);
+$("#pipeline-job-list").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-pipeline-retry]");
+  if (button) retryPipelineJob(Number(button.dataset.pipelineRetry));
+});
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) {
+    loadPipelineJobs();
+    loadAuthorJobs();
+  }
 });
 $("#drawer-close").addEventListener("click", closeDrawer);
 $("#drawer-backdrop").addEventListener("click", closeDrawer);
@@ -536,3 +941,7 @@ refreshIcons();
 renderAuthorCommand();
 loadDashboard();
 loadConfig();
+loadEnvironment();
+loadAuthorJobs();
+loadMothers();
+loadPipelineJobs();

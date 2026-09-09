@@ -56,6 +56,7 @@
       <section class="pipeline-band" aria-label="生产阶段">
         <div class="pipeline-track" id="pipeline-track"></div>
         <div class="selection-bar">
+          <button class="button danger" id="auto-pipeline-button"><i data-lucide="play-circle"></i>一键全流程</button>
           <div class="selection-tools" id="selection-tools" hidden>
             <label class="check-label"><input type="checkbox" id="select-all"><span>全选</span></label>
             <span class="selected-count" id="selected-count">已选 0 道</span>
@@ -101,26 +102,47 @@
         </div>
       </section>
 
+      <section class="pipeline-jobs-panel" id="pipeline-jobs-panel" aria-labelledby="pipeline-jobs-title">
+        <div class="section-heading"><div><h2 id="pipeline-jobs-title">自动流水线</h2><p>按配置并行执行 Codex 质检、Claude 跑题、交付生产、交付质检和 Excel 导出。</p></div><button class="button secondary" type="button" id="pipeline-jobs-refresh"><i data-lucide="refresh-cw"></i>刷新任务</button></div>
+        <div id="pipeline-job-list" class="pipeline-job-list"><div class="empty-state"><strong>暂无自动流水线任务</strong></div></div>
+      </section>
+
       <section class="author-view" id="author-view" hidden>
-        <div class="section-heading"><div><h2>出题指令</h2><p>组合批次信息与关键词，生成可直接使用的标准出题命令。</p></div></div>
+        <div class="section-heading"><div><h2>出题指令</h2><p>填写批次和数量；派生题会根据母项目与《项目规范.md》自动生成。</p></div></div>
         <form class="settings-card author-card" id="author-form" autocomplete="off">
           <div class="author-basics">
             <label class="settings-field"><span>批次名</span><input id="author-batch" name="batch" required minlength="2" maxlength="32" pattern="[A-Za-z0-9][A-Za-z0-9_-]{1,31}" placeholder="例如 0911"></label>
             <label class="settings-field"><span>题目数量</span><input id="author-count" name="count" type="number" required min="1" max="20" value="10"></label>
           </div>
-          <div class="author-keywords">
-            <label class="settings-field"><span>业务关键词</span><input id="author-business" name="business" required maxlength="500" placeholder="例如 本地新闻、城市服务、空间租赁"></label>
-            <label class="settings-field"><span>技术关键词</span><input id="author-technology" name="technology" maxlength="500" placeholder="例如 Go、React、SQLite、Docker"></label>
+          <fieldset class="author-mode"><legend>出题模式（系统按项目规范自动判断）</legend><label><input type="radio" name="author-mode" value="0-1" checked><span>0-1 新建母题</span></label><label><input type="radio" name="author-mode" value="derived"><span>基于母库生成其他题型</span></label></fieldset>
+          <div id="derived-author-fields" hidden>
+            <div class="author-keywords">
+              <label class="settings-field"><span>自动选择的母库项目</span><select id="author-mother" name="mother_id" disabled><option value="">正在按规范选择母项目…</option></select></label>
+              <label class="settings-field"><span>自动选择的派生题型</span><select id="author-task-type" name="task_type" disabled><option>Bug 修复</option><option>Feature 迭代</option><option>代码理解</option><option>代码重构</option><option>工程化</option><option>代码测试</option></select></label>
+            </div>
+            <div class="mother-summary" id="mother-summary">选择母库项目后显示代码路径、Git 地址、初始快照和使用次数。</div>
+            <p class="author-auto-note">派生方向和小瑕疵边界由系统根据母项目与《项目规范.md》自动生成。</p>
           </div>
-          <label class="settings-field"><span>补充要求</span><textarea id="author-notes" name="notes" maxlength="3000" rows="4" placeholder="填写架构侧重、仓库来源或需要避开的方向"></textarea></label>
+          <div class="author-keywords" id="author-common-fields">
+            <label class="settings-field"><span>业务关键词</span><input id="author-business" name="business" required maxlength="500" placeholder="例如 本地新闻、城市服务、空间租赁"></label>
+            <label class="settings-field"><span>是否需要 Docker</span><select id="author-technology" name="technology">
+              <option value="不需要 Docker">不需要 Docker</option>
+              <option value="需要 Docker">需要 Docker</option>
+            </select></label>
+          </div>
+          <label class="settings-field" id="author-notes-field"><span>补充要求</span><textarea id="author-notes" name="notes" maxlength="3000" rows="4" placeholder="填写架构侧重、仓库来源或需要避开的方向"></textarea></label>
           <label class="settings-field"><span>命令预览</span><textarea class="command-preview" id="author-command" rows="9" readonly></textarea></label>
           <div class="author-status" id="author-status" hidden><i data-lucide="circle-check"></i><span></span></div>
-          <div class="settings-actions"><span class="settings-note">只复制命令，不会创建批次、打开终端或启动目标模型。</span><button class="button primary" type="submit" id="author-button"><i data-lucide="copy"></i>复制出题命令</button></div>
+          <div class="settings-actions"><span class="settings-note">复制命令供手动使用，或直接启动本机 Codex CLI。</span><button class="button secondary" type="submit" id="author-button"><i data-lucide="copy"></i>复制出题命令</button><button class="button primary" type="button" id="codex-author-button"><i data-lucide="bot"></i>Codex CLI 出题</button></div>
         </form>
+        <section class="author-jobs" aria-labelledby="author-jobs-title">
+          <div class="section-heading"><div><h3 id="author-jobs-title">Codex 出题任务</h3><p>任务状态和实时过程保存在本地生产库，刷新页面后仍可查看。</p></div><button class="button secondary" type="button" id="author-jobs-refresh"><i data-lucide="refresh-cw"></i>刷新任务</button></div>
+          <div id="author-job-list" class="author-job-list"><div class="empty-state"><strong>暂无 Codex 出题任务</strong></div></div>
+        </section>
       </section>
 
       <section class="export-view" id="export-view" hidden>
-        <div class="section-heading"><div><h2>交付文件</h2><p>按生成时间查看工作簿和原始轨迹副本。</p></div></div>
+        <div class="section-heading"><div><h2>交付文件</h2><p>按生成时间查看工作簿和原始轨迹副本。</p></div><button class="button primary" type="button" id="delivery-package-button"><i data-lucide="archive-download"></i>下载交付包</button></div>
         <div class="file-list" id="file-list"></div>
       </section>
 
@@ -131,8 +153,23 @@
           <label class="settings-field"><span>模型名称</span><input id="config-model" name="model" required placeholder="claude-sonnet"></label>
           <label class="settings-field"><span>API Key <small id="config-key-hint"></small></span><span class="password-field"><input id="config-api-key" name="api_key" type="password" placeholder="留空表示保留现有 Key"><button class="field-icon" id="toggle-api-key" type="button" title="显示 API Key" aria-label="显示 API Key"><i data-lucide="eye"></i></button></span></label>
           <label class="settings-field"><span>提交人</span><input id="config-submitter" name="submitter" required placeholder="真实姓名"></label>
+          <label class="settings-field"><span>模型运行方式</span><select id="config-model-mode" name="model_mode"><option value="local">本地 Claude CLI</option><option value="docker">Docker Claude CLI</option></select></label>
+          <div class="pipeline-config-fields" aria-label="Claude 流水线配置">
+            <label class="settings-field"><span>Claude Docker 镜像</span><input id="config-docker-image" placeholder="claude-cli:latest"></label>
+            <label class="settings-field"><span>容器内命令</span><input id="config-docker-command" placeholder="claude"></label>
+            <div class="pipeline-concurrency-fields">
+              <label class="settings-field"><span>题目质检并发</span><input id="config-qc-concurrency" type="number" min="1" max="8" value="2"></label>
+              <label class="settings-field"><span>模型跑题并发</span><input id="config-model-concurrency" type="number" min="1" max="8" value="2"></label>
+              <label class="settings-field"><span>Codex 交付并发</span><input id="config-codex-concurrency" type="number" min="1" max="8" value="2"></label>
+            </div>
+            <p class="settings-note">模型只接收 SQLite 中该题的原始 User Prompt；中转配置通过容器环境变量传递，不拼入 Prompt。默认镜像不存在时会自动构建。</p>
+          </div>
           <div class="settings-actions"><span class="settings-note">配置文件权限会自动设置为仅当前用户可读写。</span><button class="button primary" type="submit" id="save-config"><i data-lucide="save"></i>保存配置</button></div>
         </form>
+        <section class="environment-panel" aria-labelledby="environment-title">
+          <div class="section-heading"><div><h3 id="environment-title">运行环境</h3><p>启动自动流水线前检查 Codex 和当前选择的 Claude CLI 运行环境。</p></div><button class="button secondary" type="button" id="environment-repair"><i data-lucide="wrench"></i>检测并修复</button></div>
+          <div id="environment-status" class="environment-status"><div class="empty-state"><strong>尚未检测</strong><span>点击“检测并修复”检查本机环境。</span></div></div>
+        </section>
       </section>
     </main>
   </div>

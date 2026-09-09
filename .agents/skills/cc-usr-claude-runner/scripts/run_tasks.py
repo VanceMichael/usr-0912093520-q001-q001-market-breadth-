@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""List and launch QC-passed SQLite-backed questions in Claude Code."""
+"""List and launch QC-passed SQLite-backed questions in Claude Code cross-platform."""
 
 from __future__ import annotations
 
@@ -26,8 +26,13 @@ def find_claude() -> str | None:
     discovered = shutil.which("claude")
     if discovered:
         return discovered
-    local_install = Path.home() / ".local/bin/claude"
-    return str(local_install) if local_install.is_file() else None
+    candidates = [
+        Path.home() / ".local/bin/claude",
+        Path.home() / ".local/bin/claude.exe",
+        Path.home() / ".local/bin/claude.cmd",
+        Path.home() / "AppData/Roaming/npm/claude.cmd",
+    ]
+    return next((str(path) for path in candidates if path.is_file()), None)
 
 
 def claude_version(claude: str) -> str:
@@ -89,6 +94,56 @@ def iterm_available() -> bool:
     return Path("/Applications/iTerm.app").is_dir() and bool(shutil.which("osascript"))
 
 
+def powershell_executable() -> str | None:
+    return shutil.which("pwsh") or shutil.which("powershell")
+
+
+def powershell_quote(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def write_windows_launcher(
+    launcher: Path,
+    launch_helper: Path,
+    env_file: Path,
+    database: Path,
+    question_id: int,
+    claude: str,
+) -> None:
+    lines = [
+        "$ErrorActionPreference = 'Stop'",
+        (
+            f"& {powershell_quote(sys.executable)} {powershell_quote(str(launch_helper))} "
+            f"--env-file {powershell_quote(str(env_file))} "
+            f"--db {powershell_quote(str(database))} "
+            f"--question-id {question_id} --claude {powershell_quote(claude)}"
+        ),
+        "if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }",
+    ]
+    # Windows PowerShell 5.1 needs a BOM to decode non-ASCII paths as UTF-8.
+    launcher.write_text("\n".join(lines) + "\n", encoding="utf-8-sig")
+
+
+def open_windows(launcher: Path) -> subprocess.Popen[str]:
+    shell = powershell_executable()
+    if not shell:
+        raise RuntimeError("PowerShell is not available")
+    creation_flags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
+    return subprocess.Popen(
+        [
+            shell,
+            "-NoLogo",
+            "-NoExit",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(launcher),
+        ],
+        creationflags=creation_flags,
+        cwd=str(launcher.parent),
+    )
+
+
 def select_launch_mode(requested: str) -> str:
     """Resolve auto mode from the host environment, with explicit overrides."""
     if requested in {"iterm", "server"}:
@@ -96,26 +151,16 @@ def select_launch_mode(requested: str) -> str:
     return "iterm" if platform.system() == "Darwin" and iterm_available() else "server"
 
 
-def open_server(launcher: Path, folder: Path, log_path: Path | None = None) -> subprocess.Popen[bytes]:
+def open_server(launcher: Path, folder: Path) -> subprocess.Popen[bytes]:
     """Start an unattended Claude process detached from the launching terminal."""
-    stdout = stderr = subprocess.DEVNULL
-    if log_path is not None:
-        log_path.parent.mkdir(parents=True, exist_ok=True)
-        handle = log_path.open("ab")
-        stdout = handle
-        stderr = subprocess.STDOUT
-    try:
-        return subprocess.Popen(
-            [str(launcher), "--headless"],
-            cwd=folder,
-            stdin=subprocess.DEVNULL,
-            stdout=stdout,
-            stderr=stderr,
-            start_new_session=True,
-        )
-    finally:
-        if log_path is not None:
-            handle.close()
+    return subprocess.Popen(
+        [str(launcher), "--headless"],
+        cwd=folder,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
 
 
 def main() -> int:
@@ -202,6 +247,11 @@ def main() -> int:
         print("iTerm2 mode requires macOS with iTerm2 and osascript.", file=sys.stderr)
         connection.close()
         return 1
+    system = platform.system()
+    if args.mode == "auto" and system == "Windows" and not powershell_executable():
+        print("PowerShell is not available.", file=sys.stderr)
+        connection.close()
+        return 1
 
     batch_run_id = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
     batch_folder = Path(prepared[0][0]["folder_path"]).parent
@@ -220,9 +270,9 @@ def main() -> int:
             "--claude", claude,
         ]
         launcher.write_text(
-            "#!/usr/bin/env sh\nset -eu\n"
-            f"echo {shlex.quote('Task: ' + row['task_id'])}\n"
-            f"exec {shlex.join(command)} \"$@\"\n",
+            ("#!/bin/zsh\nset -eu\n" if mode == "iterm" else "#!/usr/bin/env sh\nset -eu\n")
+            + f"echo {shlex.quote('Task: ' + row['task_id'])}\n"
+            + f"exec {shlex.join(command)} \"$@\"\n",
             encoding="utf-8",
         )
         launcher.chmod(0o700)
@@ -235,10 +285,37 @@ def main() -> int:
                 )
                 connection.close()
                 return 1
-        else:
+        elif system == "Windows" and args.mode == "auto":
+            launcher = run_dir / "launch.ps1"
+            write_windows_launcher(
+                launcher, launch_helper, env_file, args.db.resolve(),
+                int(row["id"]), claude,
+            )
             try:
-                log_path = run_dir / "worker.log"
-                process = open_server(launcher, Path(row["folder_path"]).resolve(), log_path)
+                open_windows(launcher)
+            except (OSError, RuntimeError) as exc:
+                print(
+                    f"Failed to open PowerShell for {row['task_id']}: {exc}",
+                    file=sys.stderr,
+                )
+        else:
+            launcher = run_dir / "launch.command"
+            command = [
+                sys.executable, str(launch_helper),
+                "--env-file", str(env_file),
+                "--db", str(args.db.resolve()),
+                "--question-id", str(row["id"]),
+                "--claude", claude,
+            ]
+            launcher.write_text(
+                "#!/usr/bin/env sh\nset -eu\n"
+                f"echo {shlex.quote('Task: ' + row['task_id'])}\n"
+                f"exec {shlex.join(command)} \"$@\"\n",
+                encoding="utf-8",
+            )
+            launcher.chmod(0o700)
+            try:
+                process = open_server(launcher, Path(row["folder_path"]))
                 (run_dir / "process.pid").write_text(f"{process.pid}\n", encoding="ascii")
             except OSError as exc:
                 print(f"Failed to start server process for {row['task_id']}: {exc}", file=sys.stderr)
@@ -247,11 +324,9 @@ def main() -> int:
         timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
         connection.execute(
             "INSERT INTO runs(question_id, batch_run_id, launched_at, codex_version, "
-            "relay_provider, relay_host, relay_wire_api, model, harness, harness_version, "
-            "status, started_at, finished_at, exit_code, error_message, container_id, "
-            "log_path, trajectory_root, retry_count, heartbeat_at) "
-            "VALUES(?, ?, ?, ?, '', '', '', '', 'Claude Code', ?, 'running', ?, '', NULL, '', '', ?, '', 0, ?)",
-            (row["id"], batch_run_id, timestamp, version, version, timestamp, str(log_path) if mode == "server" else "", timestamp),
+            "relay_provider, relay_host, relay_wire_api, model, harness, harness_version) "
+            "VALUES(?, ?, ?, ?, '', '', '', '', 'Claude Code', ?)",
+            (row["id"], batch_run_id, timestamp, version, version),
         )
         connection.execute(
             "UPDATE questions SET status='running', updated_at=? WHERE id=?",

@@ -1,0 +1,22 @@
+[Unit]
+Description=CC USR production progress console
+Wants=network-online.target
+After=network-online.target ccusr-pipeline.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/UserSatisfactionRating-codex
+Environment=HOME=/home/ubuntu
+Environment=PATH=/home/ubuntu/.local/bin:/home/ubuntu/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 /home/ubuntu/UserSatisfactionRating-codex/webapp/server.py --host 127.0.0.1 --port 8787 --db /home/ubuntu/UserSatisfactionRating-codex/production.sqlite3 --no-open
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=30
+KillMode=control-group
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -21,14 +21,16 @@ from tools.batch_pipeline import (  # noqa: E402
     run_mechanical_qc,
     set_repository,
     set_semantic_qc,
+    prompt_style_issues,
+    snapshot_content_issues,
 )
 
 
 def make_question(index: int, *, difficulty: str = "困难") -> dict:
     domains = {
-        1: ("结算重试状态机", "从零构建一套支付结算服务，贯通回调接收、任务调度、账务记录和故障恢复，并保证重复通知与并发处理下的状态一致。", "payment-race"),
-        2: ("文档协作离线合并", "从零构建一套文档协作服务，完整处理本地编辑、离线变更、重连合并、乱序事件、权限变化和冲突留痕。", "offline-merge"),
-        3: ("媒体处理背压", "从零构建一套媒体处理服务，覆盖上传接入、转码排队、流量背压、进度通知、失败恢复和压力场景验证。", "media-backpressure"),
+        1: ("结算重试状态机", "财务团队需要统一处理支付回调、结算调度和账务记录，服务在故障恢复后仍要识别已经入账的通知，并保证重复投递与并发处理不会造成余额或结算状态分叉。", "payment-race"),
+        2: ("文档协作离线合并", "编辑团队经常在断网期间修改同一份材料，重新联网后需要按照权限和版本顺序合并离线变更，保留无法自动解决的冲突，并让参与者能够追溯每次取舍。", "offline-merge"),
+        3: ("媒体处理背压", "视频运营希望上传任务在流量高峰时仍能稳定排队，转码服务需要根据下游容量施加背压、持续通知进度，并在进程重启后恢复失败或未完成的处理记录。", "media-backpressure"),
     }
     title, prompt, tag = domains[index]
     return {
@@ -261,6 +263,48 @@ class BatchPipelineTests(unittest.TestCase):
                 connection.execute("SELECT qc_report FROM questions").fetchone()[0]
             )
             self.assertIn("首轮 User Prompt 必须是一个自然语言段落", report["errors"])
+            connection.close()
+
+    def test_prompt_style_rejects_canned_opening_and_label_chain(self):
+        issues = prompt_style_issues(
+            "从零构建一套结算平台。背景：财务需要处理重复回调；功能：保存账务记录；验收：并发重试后余额一致。"
+        )
+        self.assertIn("User Prompt 使用了“从零构建一套”式固定开头", issues)
+        self.assertIn("User Prompt 不能把背景、功能、技术、验收等标签串成模板", issues)
+
+    def test_snapshot_documents_must_be_chinese_and_project_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            connection = connect(root / "production.sqlite3")
+            create_batch(connection, root, self.write_spec(root, count=1))
+            folder = root / "0911" / "q001"
+            readme = folder / "README.md"
+            readme.write_text(
+                "# Starting workspace\n\nThis implementation is intentionally left to the task owner.\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "-C", str(folder), "add", "README.md"], check=True)
+            issues = snapshot_content_issues(folder)
+            self.assertTrue(any("中文书面语" in issue for issue in issues))
+            self.assertTrue(any("脚手架或答题说明" in issue for issue in issues))
+
+            readme.write_text(
+                "# 结算状态服务\n\n本项目保存支付回调和账务流水，并为财务人员提供可追溯的结算结果。本文不包含评测或标注任务。\n",
+                encoding="utf-8",
+            )
+            issues = snapshot_content_issues(folder)
+            self.assertTrue(any("评测或标注语境" in issue for issue in issues))
+
+            readme.write_text(
+                "# 结算状态服务\n\n本项目保存支付回调和账务流水，并为财务人员提供可追溯的结算结果。重复通知沿用原有流水号，服务重启后可以继续核对未完成结算。\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(snapshot_content_issues(folder), [])
+            source = folder / "src" / "说明.py"
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_text('"""Starting workspace implementation."""\n', encoding="utf-8")
+            subprocess.run(["git", "-C", str(folder), "add", str(source.relative_to(folder))], check=True)
+            self.assertTrue(any("Python 文档字符串" in issue for issue in snapshot_content_issues(folder)))
             connection.close()
 
 
