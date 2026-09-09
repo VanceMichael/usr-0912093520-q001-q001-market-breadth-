@@ -1042,6 +1042,38 @@ def set_repository(
     render_batch(connection, batch)
 
 
+def update_prompt(
+    connection: sqlite3.Connection, batch: str, number: int, prompt: str
+) -> None:
+    """Replace a stored prompt and invalidate every dependent QC fingerprint."""
+    normalized = prompt.strip()
+    if not normalized:
+        raise ValueError("prompt must not be empty")
+    if "\n" in normalized or "\r" in normalized:
+        raise ValueError("prompt must be one paragraph")
+    row = connection.execute(
+        "SELECT q.id, q.author_mode FROM questions q JOIN batches b ON b.id=q.batch_id "
+        "WHERE b.name=? AND q.question_no=?",
+        (batch, number),
+    ).fetchone()
+    if row is None:
+        raise ValueError("question does not exist")
+    timestamp = now()
+    connection.execute(
+        "UPDATE questions SET prompt=?, prompt_sha256=?, mechanical_qc='pending', "
+        "qc_decision='pending', qc_report='{}', qc_prompt_sha256='', human_approved=0, "
+        "human_reviewer='', approved_at='', status='draft', updated_at=? WHERE id=?",
+        (normalized, prompt_hash(normalized), timestamp, row["id"]),
+    )
+    if row["author_mode"] == "0-1":
+        connection.execute(
+            "UPDATE mother_library SET prompt=?, updated_at=? WHERE source_question_id=?",
+            (normalized, timestamp, row["id"]),
+        )
+    connection.commit()
+    render_batch(connection, batch)
+
+
 def list_batches(connection: sqlite3.Connection) -> None:
     rows = connection.execute(
         "SELECT name, question_count, folder_path FROM batches ORDER BY created_at"
@@ -1108,6 +1140,10 @@ def main() -> int:
     repo_parser.add_argument("--number", type=int, required=True)
     repo_parser.add_argument("--repo-url", required=True)
     repo_parser.add_argument("--snapshot", required=True)
+    prompt_parser = subparsers.add_parser("prompt-update")
+    prompt_parser.add_argument("--batch", required=True)
+    prompt_parser.add_argument("--number", type=int, required=True)
+    prompt_parser.add_argument("--prompt-file", type=Path, required=True)
     render_parser = subparsers.add_parser("render")
     render_parser.add_argument("--batch", required=True)
 
@@ -1135,6 +1171,10 @@ def main() -> int:
         elif args.command == "set-repo":
             set_repository(connection, args.batch, args.number, args.repo_url, args.snapshot)
             print(f"Updated repository metadata for {args.batch} question {args.number}")
+        elif args.command == "prompt-update":
+            prompt = args.prompt_file.read_text(encoding="utf-8")
+            update_prompt(connection, args.batch, args.number, prompt)
+            print(f"Updated prompt for {args.batch} question {args.number}; QC reset")
         elif args.command == "render":
             print(render_batch(connection, args.batch))
         connection.close()

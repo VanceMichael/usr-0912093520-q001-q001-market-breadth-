@@ -9,6 +9,9 @@ A question passes this skill when all of these duplicate checks pass:
 - The state transitions, entities, constraints, and acceptance evidence do not describe substantially the same task in different words.
 - The prompt is one natural Chinese paragraph with a concrete professional context and observable business result; it does not use a canned opening, headings, checklist labels, a reusable requirement tail, or internal evaluation language.
 - Its sentence order and cadence are materially different from other prompts in the batch, rather than merely replacing nouns, technologies, and state names.
+- For a batch with five or more questions, at least three opening perspectives and three requirement/acceptance orders must be visibly different. Fewer than three is a batch-level failure.
+- After removing business nouns, technologies, and field names, a repeated four-stage request sequence is a blocking template finding. Three prompts sharing the “搭建/实现服务 + 并用测试覆盖” spine also fail, even when numeric similarity is below threshold.
+- A finding must trigger prompt repair through the controlled `prompt-update` command, followed by duplicate-check and mechanical QC. Recording `revise` without changing the prompt is not a completed QC outcome.
 
 Task type, 0-1 intent, difficulty, banned topics, repository validity, snapshots, acceptance coverage, and reproducibility are intentionally outside this skill. Authoring and mechanical checks remain separate gates. Passing duplicate QC makes the question ready to launch when mechanical QC and the stored prompt fingerprint are current.
 
