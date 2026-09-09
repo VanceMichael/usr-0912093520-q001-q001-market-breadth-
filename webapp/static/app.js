@@ -567,7 +567,7 @@ function updateSelectionState() {
   const selectedQuestions = state.data.questions.filter((question) => state.selected.has(question.id));
   const launchButton = $("#launch-button");
   launchButton.hidden = state.stage !== 2;
-  launchButton.disabled = selectedQuestions.length === 0 || selectedQuestions.some((question) => !question.can_launch) || selectedQuestions.length > 4;
+  launchButton.disabled = selectedQuestions.length === 0 || selectedQuestions.some((question) => !question.can_launch);
 }
 
 async function copyText(value, successMessage = "已复制", announce = true) {
@@ -794,7 +794,7 @@ $("#workflow-button").addEventListener("click", () => copyText(workflowPrompt(),
 $("#launch-button").addEventListener("click", () => {
   const numbers = selectedNumbers();
   const terminal = state.config?.terminal || "终端";
-  openModal("启动 Claude Code", `将为第 ${numbers.join("、")} 题分别打开新的 ${terminal} 会话，最多同时启动 4 道题。`, "确认启动", async () => {
+  openModal("启动 Claude Code", `将为第 ${numbers.join("、")} 题分别打开新的 ${terminal} 会话。`, "确认启动", async () => {
     closeModal();
     await executeAction("/api/actions/launch", { batch: state.batch, numbers }, $("#launch-button"), "Claude Code 会话已启动");
   });

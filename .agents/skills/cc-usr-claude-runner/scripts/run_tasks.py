@@ -170,7 +170,10 @@ def main() -> int:
     parser.add_argument("--list", action="store_true")
     parser.add_argument("--select")
     parser.add_argument("--launch", action="store_true")
-    parser.add_argument("--max-open", type=int, default=4)
+    parser.add_argument(
+        "--max-open", type=int, default=100,
+        help="maximum questions to launch in one batch (default: 100)",
+    )
     parser.add_argument("--env-file", type=Path, default=PROJECT_ROOT / ".env")
     parser.add_argument(
         "--mode",
