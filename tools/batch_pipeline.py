@@ -17,7 +17,12 @@ from datetime import datetime
 from pathlib import Path
 
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
+DEFAULT_NEWS_FEEDS = (
+    "https://channel.chinanews.com.cn/cns/cl/gn-js.shtml",
+    "https://channel.chinanews.com.cn/cns/cl/gn-kjww.shtml",
+    "https://www.chinanews.com/finance/",
+)
 TASK_TYPES = {
     "0-1 代码生成", "Feature 迭代", "Bug 修复", "代码理解",
     "代码重构", "工程化", "代码测试",
@@ -94,6 +99,14 @@ CREATE TABLE IF NOT EXISTS news_topics (
 
 CREATE INDEX IF NOT EXISTS idx_news_topics_status
     ON news_topics(status, created_at);
+
+CREATE TABLE IF NOT EXISTS news_feeds (
+    id INTEGER PRIMARY KEY,
+    url TEXT NOT NULL UNIQUE,
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS batches (
     id INTEGER PRIMARY KEY,
@@ -327,6 +340,18 @@ def connect(database: Path) -> sqlite3.Connection:
     connection = sqlite3.connect(database)
     connection.row_factory = sqlite3.Row
     connection.executescript(SCHEMA)
+    feed_initialized = connection.execute(
+        "SELECT 1 FROM schema_meta WHERE key='news_feeds_initialized'"
+    ).fetchone()
+    if feed_initialized is None:
+        timestamp = now()
+        connection.executemany(
+            "INSERT OR IGNORE INTO news_feeds(url,enabled,created_at,updated_at) VALUES(?,?,?,?)",
+            [(url, 1, timestamp, timestamp) for url in DEFAULT_NEWS_FEEDS],
+        )
+        connection.execute(
+            "INSERT INTO schema_meta(key,value) VALUES('news_feeds_initialized','1')"
+        )
     batch_columns = {row["name"] for row in connection.execute("PRAGMA table_info(batches)")}
     if "author_mode" not in batch_columns:
         connection.execute("ALTER TABLE batches ADD COLUMN author_mode TEXT NOT NULL DEFAULT '0-1'")

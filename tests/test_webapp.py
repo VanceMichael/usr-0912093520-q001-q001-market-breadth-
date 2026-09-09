@@ -178,8 +178,27 @@ class WebConsoleTests(unittest.TestCase):
             self.assertIn('CC_SWITCH_API_KEY="new-secret"', content)
             self.assertIn('CC_PIPELINE_MODEL_MODE="local"', content)
             self.assertNotIn("old-secret", content)
+            self.assertEqual(len(result["config"]["news_feeds"]), 3)
             if os.name != "nt":
                 self.assertEqual(env_file.stat().st_mode & 0o777, 0o600)
+
+    def test_news_feed_configuration_is_persisted_and_validated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = self.make_database(root)
+            data = ConsoleData(database, root)
+            feeds = [
+                {"url": "https://news.example.com/a", "enabled": True},
+                {"url": "https://news.example.com/b", "enabled": False},
+            ]
+            result = data.update_news_feeds(feeds)
+            self.assertEqual(result, feeds)
+            self.assertEqual(data.env_config()["news_feeds"], [
+                {**feeds[0], "id": 1, "created_at": mock.ANY, "updated_at": mock.ANY},
+                {**feeds[1], "id": 2, "created_at": mock.ANY, "updated_at": mock.ANY},
+            ])
+            with self.assertRaisesRegex(ValueError, "至少启用"):
+                data.update_news_feeds([{"url": "https://news.example.com/a", "enabled": False}])
 
     def test_env_config_keeps_existing_key_when_blank(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -52,6 +52,7 @@ PIPELINE_ENV_KEYS = (
     "CC_PIPELINE_QC_CONCURRENCY", "CC_PIPELINE_MODEL_CONCURRENCY",
     "CC_PIPELINE_CODEX_CONCURRENCY",
 )
+NEWS_URL_MAX = 20
 AUTHOR_JOB_OUTPUT_LIMIT = 200_000
 AUTHOR_JOB_STATUSES = {"queued", "running", "completed", "failed", "interrupted"}
 
@@ -1010,6 +1011,13 @@ class ConsoleData:
                 return max(1, min(int(values.get(name, str(default))), 8))
             except ValueError:
                 return default
+        with closing(self.connect()) as connection:
+            news_feeds = [
+                {**dict(row), "enabled": bool(row["enabled"])}
+                for row in connection.execute(
+                    "SELECT id,url,enabled,created_at,updated_at FROM news_feeds ORDER BY id"
+                )
+            ]
         return {
             "base_url": values["CC_SWITCH_BASE_URL"],
             "model": values["CC_SWITCH_MODEL"],
@@ -1023,7 +1031,49 @@ class ConsoleData:
             "qc_concurrency": env_int("CC_PIPELINE_QC_CONCURRENCY", 2),
             "model_concurrency": env_int("CC_PIPELINE_MODEL_CONCURRENCY", 2),
             "codex_concurrency": env_int("CC_PIPELINE_CODEX_CONCURRENCY", 2),
+            "news_feeds": news_feeds,
         }
+
+    @staticmethod
+    def _validate_news_feeds(raw: object) -> list[tuple[str, int]]:
+        if not isinstance(raw, list) or not raw or len(raw) > NEWS_URL_MAX:
+            raise ValueError(f"新闻来源必须是 1-{NEWS_URL_MAX} 条")
+        result: list[tuple[str, int]] = []
+        seen: set[str] = set()
+        for item in raw:
+            if not isinstance(item, dict):
+                raise ValueError("新闻来源配置格式无效")
+            url = item.get("url", "")
+            if not isinstance(url, str) or "\x00" in url or len(url.strip()) > 500:
+                raise ValueError("新闻来源 URL 无效")
+            url = url.strip()
+            parsed = urlparse(url)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                raise ValueError("新闻来源必须是完整的 HTTP(S) 地址")
+            if parsed.username or parsed.password or parsed.fragment:
+                raise ValueError("新闻来源 URL 不能包含账号或片段")
+            if url in seen:
+                raise ValueError("新闻来源 URL 不能重复")
+            seen.add(url)
+            enabled = item.get("enabled", True)
+            if not isinstance(enabled, bool):
+                raise ValueError("新闻来源启用状态无效")
+            result.append((url, int(enabled)))
+        if not any(enabled for _url, enabled in result):
+            raise ValueError("至少启用一条新闻来源")
+        return result
+
+    def update_news_feeds(self, raw: object) -> list[dict]:
+        feeds = self._validate_news_feeds(raw)
+        timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        with closing(self._write_connection()) as connection:
+            connection.execute("DELETE FROM news_feeds")
+            connection.executemany(
+                "INSERT INTO news_feeds(url,enabled,created_at,updated_at) VALUES(?,?,?,?)",
+                [(url, enabled, timestamp, timestamp) for url, enabled in feeds],
+            )
+            connection.commit()
+        return [{"url": url, "enabled": bool(enabled)} for url, enabled in feeds]
 
     def environment_status(self, repair: bool = False) -> dict[str, object]:
         """Check local tools and repair the bundled Claude image when possible."""
@@ -1190,6 +1240,9 @@ class ConsoleData:
             "model_mode": body.get("model_mode", current.get("CC_PIPELINE_MODEL_MODE", "local")) or "local",
         }
         values = self._validate_env_input(incoming)
+        news_feeds = body.get("news_feeds")
+        if news_feeds is not None:
+            self.update_news_feeds(news_feeds)
         concurrency_values = {}
         for field, env_key in (
             ("qc_concurrency", "CC_PIPELINE_QC_CONCURRENCY"),

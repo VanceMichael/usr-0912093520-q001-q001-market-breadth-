@@ -22,13 +22,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from tools.batch_pipeline import connect  # noqa: E402
+from tools.batch_pipeline import DEFAULT_NEWS_FEEDS, connect  # noqa: E402
 
-DEFAULT_FEEDS = (
-    "https://channel.chinanews.com.cn/cns/cl/gn-js.shtml",
-    "https://channel.chinanews.com.cn/cns/cl/gn-kjww.shtml",
-    "https://www.chinanews.com/finance/",
-)
+DEFAULT_FEEDS = DEFAULT_NEWS_FEEDS
 ATOM = "http://www.w3.org/2005/Atom"
 
 
@@ -184,6 +180,16 @@ def topic_hash(item: dict[str, str]) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+def configured_feeds(database: Path, *, enabled_only: bool = True) -> list[str]:
+    """Read the persisted news-source list used by the autonomous daemon."""
+    with connect(database.resolve()) as connection:
+        query = "SELECT url FROM news_feeds"
+        if enabled_only:
+            query += " WHERE enabled=1"
+        query += " ORDER BY id"
+        return [str(row["url"]) for row in connection.execute(query)]
+
+
 def ingest(database: Path, feeds: list[str], timeout: int = 20) -> tuple[int, list[str]]:
     added = 0
     errors: list[str] = []
@@ -219,6 +225,10 @@ def main() -> int:
     parser.add_argument("--list", action="store_true")
     args = parser.parse_args()
     feeds = [value.strip() for value in args.feeds.split(",") if value.strip()]
+    if "NEWS_FEEDS" not in os.environ and args.feeds == ",".join(DEFAULT_FEEDS):
+        configured = configured_feeds(args.db)
+        if configured:
+            feeds = configured
     if args.list:
         with connect(args.db.resolve()) as connection:
             for row in connection.execute("SELECT id,title,source_url,status,used_batch FROM news_topics ORDER BY id DESC LIMIT 100"):

@@ -164,6 +164,10 @@
             </div>
             <p class="settings-note">模型只接收 SQLite 中该题的原始 User Prompt；中转配置通过容器环境变量传递，不拼入 Prompt。默认镜像不存在时会自动构建。</p>
           </div>
+          <div class="news-feed-config">
+            <div class="section-heading compact-heading"><div><h3>新闻出题来源</h3><p>守护进程每轮从启用的来源抓取主题，保存后立即生效。</p></div><button class="button secondary compact" type="button" id="add-news-feed"><i data-lucide="plus"></i>添加来源</button></div>
+            <div id="news-feed-list" class="news-feed-list"></div>
+          </div>
           <div class="settings-actions"><span class="settings-note">配置文件权限会自动设置为仅当前用户可读写。</span><button class="button primary" type="submit" id="save-config"><i data-lucide="save"></i>保存配置</button></div>
         </form>
         <section class="environment-panel" aria-labelledby="environment-title">

@@ -189,11 +189,33 @@ function renderSettings() {
   $("#config-submitter").value = state.config.submitter || "";
   $("#config-api-key").value = "";
   $("#config-key-hint").textContent = state.config.api_key_hint || "";
+  $("#config-model-mode").value = state.config.model_mode || "local";
   $("#config-docker-image").value = state.config.docker_image || "claude-cli:latest";
   $("#config-docker-command").value = state.config.docker_command || "claude";
   $("#config-qc-concurrency").value = state.config.qc_concurrency || 2;
   $("#config-model-concurrency").value = state.config.model_concurrency || 2;
   $("#config-codex-concurrency").value = state.config.codex_concurrency || 2;
+  renderNewsFeeds();
+}
+
+function renderNewsFeeds() {
+  const container = $("#news-feed-list");
+  if (!container) return;
+  const feeds = state.config?.news_feeds || [];
+  container.innerHTML = feeds.map((feed, index) => `
+    <div class="news-feed-row" data-feed-index="${index}">
+      <input type="url" class="news-feed-url" value="${escapeHtml(feed.url)}" maxlength="500" placeholder="https://example.com/news">
+      <label class="toggle-label"><input type="checkbox" class="news-feed-enabled" ${feed.enabled ? "checked" : ""}>启用</label>
+      <button type="button" class="button secondary compact feed-remove" data-feed-remove="${index}" title="删除来源"><i data-lucide="trash-2"></i>删除</button>
+    </div>`).join("");
+  refreshIcons();
+}
+
+function collectNewsFeeds() {
+  return $$(".news-feed-row").map((row) => ({
+    url: row.querySelector(".news-feed-url")?.value.trim() || "",
+    enabled: Boolean(row.querySelector(".news-feed-enabled")?.checked),
+  }));
 }
 
 function renderEnvironment() {
@@ -847,11 +869,13 @@ $("#settings-form").addEventListener("submit", async (event) => {
         model: $("#config-model").value,
         api_key: $("#config-api-key").value,
         submitter: $("#config-submitter").value,
+        model_mode: $("#config-model-mode").value,
         docker_image: $("#config-docker-image").value,
         docker_command: $("#config-docker-command").value,
         qc_concurrency: Number($("#config-qc-concurrency").value),
         model_concurrency: Number($("#config-model-concurrency").value),
         codex_concurrency: Number($("#config-codex-concurrency").value),
+        news_feeds: collectNewsFeeds(),
       }),
     });
     state.config = result.config;
@@ -874,6 +898,20 @@ $("#toggle-api-key").addEventListener("click", () => {
   $("#toggle-api-key").setAttribute("aria-label", showing ? "显示 API Key" : "隐藏 API Key");
   $("#toggle-api-key").innerHTML = `<i data-lucide="${showing ? "eye" : "eye-off"}"></i>`;
   refreshIcons();
+});
+$("#add-news-feed").addEventListener("click", () => {
+  const feeds = collectNewsFeeds();
+  feeds.push({ url: "", enabled: true });
+  state.config = { ...(state.config || {}), news_feeds: feeds };
+  renderNewsFeeds();
+  const rows = $$(".news-feed-row");
+  rows.at(-1)?.querySelector(".news-feed-url")?.focus();
+});
+$("#news-feed-list").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-feed-remove]");
+  if (!button) return;
+  const row = button.closest(".news-feed-row");
+  row?.remove();
 });
 $("#file-list").addEventListener("click", (event) => {
   const button = event.target.closest("[data-file-path]");

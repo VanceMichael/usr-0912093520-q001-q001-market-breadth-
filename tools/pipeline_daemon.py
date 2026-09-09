@@ -23,7 +23,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from tools.batch_pipeline import connect  # noqa: E402
-from tools.news_topics import DEFAULT_FEEDS, ingest  # noqa: E402
+from tools.news_topics import DEFAULT_FEEDS, configured_feeds, ingest  # noqa: E402
 
 
 def now() -> str:
@@ -205,6 +205,10 @@ def main() -> int:
     parser.add_argument("--poll-seconds", type=int, default=60)
     args = parser.parse_args()
     args.codex = resolve_codex(args.codex)
+    if "NEWS_FEEDS" not in os.environ and args.feeds == ",".join(DEFAULT_FEEDS):
+        persisted_feeds = configured_feeds(args.db)
+        if persisted_feeds:
+            args.feeds = ",".join(persisted_feeds)
     args.feeds = [value.strip() for value in args.feeds.split(",") if value.strip()]
     lock_path = args.log_dir / "daemon.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
