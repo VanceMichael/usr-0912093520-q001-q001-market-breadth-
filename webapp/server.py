@@ -128,6 +128,12 @@ CREATE TABLE IF NOT EXISTS pipeline_items (
 CREATE INDEX IF NOT EXISTS idx_pipeline_jobs_created ON pipeline_jobs(created_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_pipeline_items_job ON pipeline_items(pipeline_job_id, question_no);
 
+CREATE TABLE IF NOT EXISTS delivery_downloads (
+    batch_id INTEGER PRIMARY KEY REFERENCES batches(id) ON DELETE CASCADE,
+    download_count INTEGER NOT NULL DEFAULT 0,
+    last_downloaded_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS vps_nodes (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL UNIQUE,
@@ -1592,7 +1598,9 @@ class ConsoleData:
             "(SELECT COUNT(*) FROM records r JOIN questions q ON q.id=r.question_id "
             " WHERE q.batch_id=b.id) AS record_count, "
             "(SELECT COUNT(*) FROM records r JOIN questions q ON q.id=r.question_id "
-            " WHERE q.batch_id=b.id AND r.delivery_qc_passed=1) AS qc_record_count "
+            " WHERE q.batch_id=b.id AND r.delivery_qc_passed=1) AS qc_record_count, "
+            "COALESCE((SELECT d.download_count FROM delivery_downloads d WHERE d.batch_id=b.id),0) AS download_count, "
+            "COALESCE((SELECT d.last_downloaded_at FROM delivery_downloads d WHERE d.batch_id=b.id),'') AS last_downloaded_at "
             "FROM batches b ORDER BY b.created_at DESC, b.name DESC"
         ).fetchall()
         return [
@@ -1602,6 +1610,8 @@ class ConsoleData:
                 "question_count": row["actual_questions"],
                 "record_count": row["record_count"],
                 "qc_record_count": row["qc_record_count"],
+                "download_count": row["download_count"],
+                "last_downloaded_at": row["last_downloaded_at"],
                 "author_mode": row["author_mode"],
                 "mother_id": row["mother_id"],
                 "folder_path": row["folder_path"],
@@ -1685,6 +1695,16 @@ class ConsoleData:
         with zipfile.ZipFile(payload, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             for path in files:
                 archive.write(path, arcname=path.name)
+        downloaded_at = datetime.now().astimezone().isoformat(timespec="seconds")
+        with closing(self._write_connection()) as connection:
+            connection.execute(
+                "INSERT INTO delivery_downloads(batch_id,download_count,last_downloaded_at) "
+                "SELECT id,1,? FROM batches WHERE name=? "
+                "ON CONFLICT(batch_id) DO UPDATE SET "
+                "download_count=delivery_downloads.download_count+1,last_downloaded_at=excluded.last_downloaded_at",
+                (downloaded_at, batch_name),
+            )
+            connection.commit()
         return f"ccusr-delivery-{batch_name}.zip", payload.getvalue()
 
     @staticmethod

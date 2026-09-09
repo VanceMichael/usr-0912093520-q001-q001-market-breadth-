@@ -147,6 +147,11 @@ class WebConsoleTests(unittest.TestCase):
                         set(archive.namelist()),
                         {"CC_Codex 用户满意度标注（0911-第1题）.xlsx", "轨迹_0911-001.jsonl"},
                     )
+                batch = data.dashboard("0911")["batch"]
+                self.assertEqual(batch["download_count"], 1)
+                self.assertTrue(batch["last_downloaded_at"])
+                data.delivery_package("0911")
+                self.assertEqual(data.dashboard("0911")["batch"]["download_count"], 2)
             finally:
                 data.author_executor.shutdown(wait=True)
                 data.pipeline_executor.shutdown(wait=True)

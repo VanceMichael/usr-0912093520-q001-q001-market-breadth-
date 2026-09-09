@@ -166,6 +166,8 @@ th:nth-child(6) { width: 12%; }
 .file-info strong, .file-info span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .file-info strong { font-size: 12px; }
 .file-info span { color: var(--muted); font-size: 10px; margin-top: 4px; }
+.delivery-download-status { display: inline-flex; margin-top: 8px; color: var(--muted); font-size: 11px; }
+.delivery-download-status.downloaded { color: var(--green); font-weight: 700; }
 
 .settings-view, .author-view, .pipeline-jobs-panel { margin-top: 4px; max-width: 960px; }
 .vps-view { margin-top: 4px; max-width: 1180px; }

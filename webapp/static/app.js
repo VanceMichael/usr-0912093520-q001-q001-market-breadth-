@@ -85,7 +85,7 @@ function renderBatchOptions() {
   const select = $("#batch-select");
   select.innerHTML = state.data.batches.map((batch) => (
     `<option value="${escapeHtml(batch.name)}" ${batch.name === state.batch ? "selected" : ""}>` +
-    `${escapeHtml(batch.name)}（${batch.question_count} 道）</option>`
+    `${escapeHtml(batch.name)}（${batch.question_count} 道${batch.download_count ? " · 已下载" : ""}）</option>`
   )).join("");
 }
 
@@ -147,6 +147,13 @@ function renderFiles() {
   const workbookFiles = state.data.batch.workbooks.map((file) => ({ ...file, type: "workbook" }));
   const trajectoryFiles = state.data.batch.trajectories.map((file) => ({ ...file, type: "trajectory" }));
   const files = [...workbookFiles, ...trajectoryFiles].sort((a, b) => b.modified_at.localeCompare(a.modified_at));
+  const status = $("#delivery-download-status");
+  const downloads = Number(state.data.batch.download_count || 0);
+  status.textContent = downloads
+    ? `已下载 ${downloads} 次 · 最近 ${formatDate(state.data.batch.last_downloaded_at)}`
+    : "尚未下载交付包";
+  status.classList.toggle("downloaded", downloads > 0);
+  $("#delivery-package-button").innerHTML = `<i data-lucide="archive-download"></i>${downloads ? "再次下载" : "下载交付包"}`;
   $("#file-list").innerHTML = files.length ? files.map((file) => `
     <div class="file-row">
       <span class="file-icon"><i data-lucide="${file.type === "workbook" ? "file-spreadsheet" : "file-json"}"></i></span>
@@ -1115,6 +1122,7 @@ $("#delivery-package-button").addEventListener("click", async () => {
     anchor.remove();
     URL.revokeObjectURL(url);
     toast("交付包已开始下载");
+    await loadDashboard(state.batch);
   } catch (error) {
     toast(error.message, true);
   } finally {
