@@ -37,6 +37,14 @@ def data_sheet_path(archive: zipfile.ZipFile) -> str:
     return target if target.startswith("xl/") else f"xl/{target}"
 
 
+def direct_cell_text(cell: ET.Element) -> str:
+    if cell.attrib.get("t") == "str":
+        node = cell.find(f"{{{NS}}}v")
+        return "" if node is None or node.text is None else node.text
+    nodes = cell.findall(f"{{{NS}}}is//{{{NS}}}t")
+    return "".join(node.text or "" for node in nodes)
+
+
 def spec(count: int = 1) -> dict:
     return {
         "batch": "0911",
@@ -199,21 +207,25 @@ class DeliveryPipelineTests(unittest.TestCase):
                 root_xml = ET.fromstring(archive.read(data_sheet_path(archive)))
             rows = root_xml.findall(f"{{{NS}}}sheetData/{{{NS}}}row")
             self.assertEqual(len(rows), 2)
-            headers = []
-            for cell in rows[0].findall(f"{{{NS}}}c"):
-                node = cell.find(f"{{{NS}}}is/{{{NS}}}t")
-                headers.append("" if node is None else node.text)
+            headers = [
+                direct_cell_text(cell)
+                for cell in rows[0].findall(f"{{{NS}}}c")
+            ]
             self.assertEqual(headers, EXPORT_HEADERS)
-            trajectory_cell = rows[1].find(f"{{{NS}}}c[@r='E2']/{{{NS}}}is/{{{NS}}}t")
+            turn_order_cell = rows[1].find(f"{{{NS}}}c[@r='D2']")
+            self.assertIsNotNone(turn_order_cell)
+            self.assertEqual(turn_order_cell.attrib.get("t"), "n")
+            self.assertEqual(turn_order_cell.find(f"{{{NS}}}v").text, "1")
+            trajectory_cell = rows[1].find(f"{{{NS}}}c[@r='F2']/{{{NS}}}is/{{{NS}}}t")
             self.assertIsNotNone(trajectory_cell)
             self.assertIsNone(trajectory_cell.text)
-            harness_cell = rows[1].find(f"{{{NS}}}c[@r='G2']/{{{NS}}}is/{{{NS}}}t")
+            harness_cell = rows[1].find(f"{{{NS}}}c[@r='H2']/{{{NS}}}is/{{{NS}}}t")
             self.assertIsNotNone(harness_cell)
             self.assertEqual(harness_cell.text, "Claude Code")
-            note_cell = rows[1].find(f"{{{NS}}}c[@r='AA2']/{{{NS}}}is/{{{NS}}}t")
+            note_cell = rows[1].find(f"{{{NS}}}c[@r='AB2']/{{{NS}}}is/{{{NS}}}t")
             self.assertIsNotNone(note_cell)
             self.assertEqual(note_cell.text, "质检通过")
-            score_cell = rows[1].find(f"{{{NS}}}c[@r='M2']")
+            score_cell = rows[1].find(f"{{{NS}}}c[@r='N2']")
             self.assertIsNotNone(score_cell)
             self.assertEqual(score_cell.attrib.get("t"), "n")
             trajectories = list((root / "0911").glob("轨迹_0911_第1题_session-001*.jsonl"))
@@ -378,6 +390,30 @@ class DeliveryPipelineTests(unittest.TestCase):
             ])
             self.assertNotEqual(result.returncode, 0, result.stdout)
             self.assertIn("0911-002: launched question has no delivery record", result.stdout)
+
+    def test_delivery_qc_rejects_nonconsecutive_dialogue_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = self.prepare(root)
+            input_path = root / "score.json"
+            input_path.write_text(
+                json.dumps(automated_record(), ensure_ascii=False), encoding="utf-8"
+            )
+            result = self.run_command([
+                sys.executable, str(COLLECTOR), "--db", str(database), "--batch", "0911",
+                "--question", "1", "--turn", "1", "--from-json", str(input_path),
+            ])
+            self.assertEqual(result.returncode, 0, result.stdout)
+            connection = connect(database)
+            connection.execute("UPDATE records SET turn_no=2")
+            connection.commit()
+            connection.close()
+
+            result = self.run_command([
+                sys.executable, str(QC), "--db", str(database), "--batch", "0911",
+            ])
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("turn_no must be consecutive from 1", result.stdout)
 
     def test_automated_record_rejects_meta_and_template_language(self):
         with tempfile.TemporaryDirectory() as directory:

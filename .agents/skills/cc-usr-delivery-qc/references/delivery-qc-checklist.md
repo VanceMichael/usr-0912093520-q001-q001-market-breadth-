@@ -7,6 +7,7 @@ Check every record and correct every supported noncompliance before finalizing t
 - `User Prompt` is the exact prompt for this turn, not a summary. First-turn text matches the stored question. For later turns, compare byte-for-byte with that turn's user event in the original JSONL; `继续` stays `继续` and must never be replaced with the session's first prompt.
 - `SessionID` identifies the matched session; all turns from one session share it.
 - `TurnID/PromptID` is the exact unique ID of this user turn, and the same ID must be present on the matched user event in the original JSONL.
+- `当前对话轮次排序` comes from SQLite `turn_no` and is the user turn's one-based chronological position within the same `SessionID`. It starts at 1 and remains consecutive. Do not use the question number, tool-call count, global row number, or parent-record suffix.
 - `初始环境快照` is the reachable GitHub commit permalink with a full 40-character SHA and remains stable across the session. A repository homepage, branch/tag URL, short SHA, or latest-commit link is invalid.
 - `轨迹文件` is the matched original JSONL file name without a local directory path and remains stable across the session. Reject stream-json terminal output or any file that does not contain the referenced SessionID, PromptID, and user prompt.
 - Reproducibility, harness, harness version, operating system, task type, difficulty, and languages use the project-approved values and describe this turn accurately.
@@ -15,7 +16,7 @@ Check every record and correct every supported noncompliance before finalizing t
 - `其他问题` is text and is empty when there is nothing additional. When non-empty, it follows the same Chinese, evidence, and natural-writing requirements as the five descriptions.
 - `提交人` is the real configured person, never a tool or model name.
 - `提交时间` is ISO 8601 with a timezone and meets the project deadline.
-- `父记录` is empty only for the first turn; later turns point to the immediately preceding record in the same session.
+- `父记录` is empty only when `当前对话轮次排序` is 1; later turns point to the record whose order is exactly one lower in the same session.
 - `审核备注` is written as `质检通过` only by successful finalization.
 
 ## Batch consistency

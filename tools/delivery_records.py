@@ -35,15 +35,15 @@ SNAPSHOT_RE = re.compile(
 NUMERIC_HARNESS_VERSION_RE = re.compile(r"^\d+(?:\.\d+)+$")
 
 EXPORT_HEADERS = [
-    "User Prompt", "SessionID", "TurnID/PromptID", "初始环境快照",
-    "轨迹文件", "环境可复现等级", "Harness", "Harness 版本", "操作系统",
+    "User Prompt", "SessionID", "TurnID/PromptID", "当前对话轮次排序",
+    "初始环境快照", "轨迹文件", "环境可复现等级", "Harness", "Harness 版本", "操作系统",
     "任务类型", "任务难度", "语言/框架", "交付完整性", "交付完整性 - 描述",
     "指令遵循", "指令遵循 - 描述", "任务规划", "任务规划 - 描述",
     "推理能力", "推理能力 - 描述", "执行能力", "执行能力 - 描述",
     "其他问题", "提交人", "提交时间", "父记录", "审核备注",
 ]
 EXPORT_KEYS = [
-    "user_prompt", "session_id", "turn_id", "initial_snapshot",
+    "user_prompt", "session_id", "turn_id", "turn_no", "initial_snapshot",
     "trajectory_file", "reproducibility", "harness", "harness_version",
     "operating_system", "task_type", "difficulty", "languages", "delivery_score",
     "delivery_description", "instruction_score", "instruction_description",
@@ -304,6 +304,28 @@ def validate_records(
             continue
         if len(items) > 10:
             errors.append(f"{session_id}: {len(items)} submitted turns exceed the limit of 10")
+        valid_turn_numbers = [
+            item.get("turn_no") for item in items
+            if isinstance(item.get("turn_no"), int)
+            and not isinstance(item.get("turn_no"), bool)
+        ]
+        if len(valid_turn_numbers) == len(items):
+            ordered = sorted(items, key=lambda item: item["turn_no"])
+            actual = [item["turn_no"] for item in ordered]
+            expected = list(range(1, len(ordered) + 1))
+            if actual != expected:
+                errors.append(
+                    f"{session_id}: turn_no must be consecutive from 1, found {actual}"
+                )
+            for index, item in enumerate(ordered):
+                expected_parent = (
+                    "" if index == 0
+                    else str(ordered[index - 1].get("record_id", ""))
+                )
+                if str(item.get("parent_record", "")).strip() != expected_parent:
+                    errors.append(
+                        f"{item.get('record_id')}: parent_record must match the immediately preceding turn"
+                    )
         for field in stable_fields:
             values = {str(item.get(field, "")) for item in items}
             if len(values) > 1:

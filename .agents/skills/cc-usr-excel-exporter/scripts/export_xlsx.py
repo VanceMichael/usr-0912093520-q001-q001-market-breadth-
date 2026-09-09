@@ -61,13 +61,32 @@ def worksheet_path(template: Path) -> str:
         return target if target.startswith("xl/") else f"xl/{target}"
 
 
-def cell_text(cell: ET.Element) -> str:
-    node = cell.find(f"{{{NS_MAIN}}}is/{{{NS_MAIN}}}t")
-    return "" if node is None or node.text is None else node.text
+def shared_strings(archive: zipfile.ZipFile) -> list[str]:
+    if "xl/sharedStrings.xml" not in archive.namelist():
+        return []
+    root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
+    return [
+        "".join(node.text or "" for node in item.iter(f"{{{NS_MAIN}}}t"))
+        for item in root.findall(f"{{{NS_MAIN}}}si")
+    ]
+
+
+def cell_text(cell: ET.Element, strings: list[str]) -> str:
+    if cell.attrib.get("t") == "s":
+        node = cell.find(f"{{{NS_MAIN}}}v")
+        if node is None or node.text is None:
+            return ""
+        index = int(node.text)
+        return strings[index] if 0 <= index < len(strings) else ""
+    if cell.attrib.get("t") == "str":
+        node = cell.find(f"{{{NS_MAIN}}}v")
+        return "" if node is None or node.text is None else node.text
+    nodes = cell.findall(f"{{{NS_MAIN}}}is//{{{NS_MAIN}}}t")
+    return "".join(node.text or "" for node in nodes)
 
 
 def make_cell(reference: str, value: object, numeric: bool) -> ET.Element:
-    attributes = {"r": reference, "s": "1"}
+    attributes = {"r": reference}
     cell = ET.Element(f"{{{NS_MAIN}}}c", attributes)
     if numeric:
         cell.set("t", "n")
@@ -87,6 +106,7 @@ def make_cell(reference: str, value: object, numeric: bool) -> ET.Element:
 def build_sheet(template: Path, sheet_path: str, records: list[dict]) -> bytes:
     with zipfile.ZipFile(template) as archive:
         root = ET.fromstring(archive.read(sheet_path))
+        strings = shared_strings(archive)
     sheet_data = root.find(f"{{{NS_MAIN}}}sheetData")
     if sheet_data is None:
         raise ValueError("template worksheet has no sheetData")
@@ -94,9 +114,9 @@ def build_sheet(template: Path, sheet_path: str, records: list[dict]) -> bytes:
     if not rows:
         raise ValueError("template worksheet has no header row")
     header_cells = rows[0].findall(f"{{{NS_MAIN}}}c")
-    actual_headers = [cell_text(cell) for cell in header_cells]
+    actual_headers = [cell_text(cell, strings) for cell in header_cells]
     if actual_headers != HEADERS:
-        raise ValueError("template headers do not match the required 27-column contract")
+        raise ValueError("template headers do not match the required 28-column contract")
     for row in rows[1:]:
         sheet_data.remove(row)
     for row_index, record in enumerate(records, start=2):
@@ -107,7 +127,9 @@ def build_sheet(template: Path, sheet_path: str, records: list[dict]) -> bytes:
             if key == "languages" and isinstance(value, list):
                 value = ", ".join(str(item) for item in value)
             reference = f"{column_name(column_index)}{row_index}"
-            row.append(make_cell(reference, value, key in SCORE_KEYS))
+            row.append(
+                make_cell(reference, value, key in SCORE_KEYS or key == "turn_no")
+            )
     dimension = root.find(f"{{{NS_MAIN}}}dimension")
     if dimension is not None:
         dimension.set("ref", f"A1:{column_name(len(KEYS))}{len(records) + 1}")

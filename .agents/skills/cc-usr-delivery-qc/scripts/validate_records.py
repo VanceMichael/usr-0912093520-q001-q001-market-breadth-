@@ -22,7 +22,7 @@ from tools.delivery_records import (  # noqa: E402
 )
 
 
-FIXABLE_FIELDS = frozenset(EXPORT_KEYS) - {"delivery_qc_note"}
+FIXABLE_FIELDS = frozenset(EXPORT_KEYS) - {"turn_no", "delivery_qc_note"}
 
 
 def now() -> str:
@@ -114,7 +114,7 @@ def build_report(
         "passed": not errors and not warnings,
         "errors": errors,
         "warnings": warnings,
-        "scope": "Required export fields, identifiers, values, descriptions, sessions, and deadlines.",
+        "scope": "Required export fields, identifiers, turn order, values, descriptions, sessions, and deadlines.",
     }
 
 
