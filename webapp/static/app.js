@@ -2,6 +2,8 @@ const state = {
   data: null,
   user: null,
   auditLogs: [],
+  vpsNodes: [],
+  selectedVpsId: null,
   batch: null,
   selected: new Set(),
   search: "",
@@ -161,8 +163,9 @@ function renderView() {
   const settingsView = state.view === "settings";
   const authorView = state.view === "author";
   const auditView = state.view === "audit";
-  const nonProductionView = exportsView || settingsView || authorView || auditView;
-  $(".batch-toolbar").hidden = settingsView || authorView || auditView;
+  const vpsView = state.view === "vps";
+  const nonProductionView = exportsView || settingsView || authorView || auditView || vpsView;
+  $(".batch-toolbar").hidden = settingsView || authorView || auditView || vpsView;
   $(".pipeline-band").hidden = nonProductionView;
   $(".list-controls").hidden = nonProductionView;
   $(".table-panel").hidden = nonProductionView;
@@ -170,6 +173,7 @@ function renderView() {
   $("#settings-view").hidden = !settingsView;
   $("#author-view").hidden = !authorView;
   $("#audit-view").hidden = !auditView;
+  $("#vps-view").hidden = !vpsView;
   $("#pipeline-jobs-panel").hidden = nonProductionView;
   const titles = {
     author: ["生成题目", "填写批次信息和关键词，生成可复制的标准出题命令。"],
@@ -178,6 +182,7 @@ function renderView() {
     exports: ["导出中心", "集中查看当前批次的工作簿和原始 JSONL 轨迹。"],
     settings: ["运行配置", "修改下一次 Claude Code 启动使用的中转地址、模型和提交人。"],
     audit: ["审计日志", "查看登录和控制台操作记录。"],
+    vps: ["VPS 管理", "统一查看远程 VPS 节点状态、批次进度和交付物。"],
   };
   $("#page-title").textContent = titles[state.view][0];
   $("#page-subtitle").textContent = titles[state.view][1];
@@ -185,6 +190,7 @@ function renderView() {
   if (exportsView) renderFiles();
   else if (settingsView) renderSettings();
   else if (auditView) renderAuditLogs();
+  else if (vpsView) renderVps();
   else if (!authorView) renderRows();
 }
 
@@ -194,6 +200,7 @@ function renderUser() {
   $("#audit-view").hidden = true;
   $$(".admin-only").forEach((item) => { item.hidden = user?.role !== "admin"; });
   $("#settings-view").hidden = user?.role !== "admin" && state.view === "settings";
+  $("#vps-admin-panel").hidden = user?.role !== "admin";
 }
 
 function renderAuditLogs() {
@@ -201,6 +208,78 @@ function renderAuditLogs() {
   if (!rows) return;
   rows.innerHTML = state.auditLogs.length ? state.auditLogs.map((log) => `
     <tr><td>${escapeHtml(formatDate(log.created_at))}</td><td>${escapeHtml(log.username)}</td><td>${escapeHtml(log.action)}</td><td>${escapeHtml(log.target || "-")}</td><td class="audit-${log.outcome === "success" ? "success" : "failed"}">${escapeHtml(log.outcome === "success" ? "成功" : "失败")}</td><td>${escapeHtml(log.remote_addr || "-")}</td></tr>`).join("") : `<tr><td colspan="6">暂无审计记录</td></tr>`;
+}
+
+function selectedVps() {
+  return state.vpsNodes.find((node) => Number(node.id) === Number(state.selectedVpsId)) || null;
+}
+
+function renderVps() {
+  const list = $("#vps-node-list");
+  if (!list) return;
+  if (!state.vpsNodes.length) {
+    list.innerHTML = `<div class="empty-state"><strong>暂无 VPS 节点</strong><span>管理员可以在下方添加节点。</span></div>`;
+    $("#vps-detail").innerHTML = `<div class="empty-state"><strong>请先添加 VPS</strong></div>`;
+    return;
+  }
+  if (!selectedVps()) state.selectedVpsId = state.vpsNodes[0].id;
+  list.innerHTML = state.vpsNodes.map((node) => `
+    <button class="vps-node ${escapeHtml(node.status)} ${Number(node.id) === Number(state.selectedVpsId) ? "active" : ""}" data-vps-id="${node.id}">
+      <strong>${escapeHtml(node.name)}</strong><span class="node-status">${node.status === "online" ? "在线" : node.status === "disabled" ? "已停用" : "离线"}</span>
+      <span>${escapeHtml(node.base_url)}</span>
+    </button>`).join("");
+  const selected = selectedVps();
+  if (state.user?.role === "admin" && selected) {
+    $("#vps-id").value = selected.id;
+    $("#vps-name").value = selected.name;
+    $("#vps-base-url").value = selected.base_url;
+    $("#vps-ssh-command").value = selected.ssh_command || "";
+    $("#vps-enabled").checked = Boolean(selected.enabled);
+  }
+  renderVpsDetail();
+  refreshIcons();
+}
+
+function renderVpsDetail() {
+  const container = $("#vps-detail");
+  const node = selectedVps();
+  if (!container || !node) return;
+  if (node.status !== "online" || !node.dashboard) {
+    container.innerHTML = `<div class="vps-detail-head"><div><h3>${escapeHtml(node.name)}</h3><p>${escapeHtml(node.error || "节点暂时不可用")}</p></div><a class="button secondary compact" href="${escapeHtml(node.base_url)}" target="_blank" rel="noreferrer">打开原始页面</a></div><div class="empty-state"><i data-lucide="wifi-off"></i><strong>无法读取远程控制台</strong><span>${node.ssh_command ? `先执行 SSH 隧道：${escapeHtml(node.ssh_command)}` : "请检查节点地址和服务状态。"}</span></div>`;
+    refreshIcons();
+    return;
+  }
+  const dashboard = node.dashboard;
+  const summary = dashboard.summary || {};
+  const batch = dashboard.batch || {};
+  const questions = dashboard.questions || [];
+  container.innerHTML = `<div class="vps-detail-head"><div><h3>${escapeHtml(node.name)} · ${escapeHtml(batch.name || "暂无批次")}</h3><p>${escapeHtml(node.base_url)} · 共 ${questions.length} 道题</p></div><div><a class="button secondary compact" href="${escapeHtml(node.base_url)}" target="_blank" rel="noreferrer">打开原始页面</a><button class="button primary compact" id="vps-package-download" type="button"><i data-lucide="archive-download"></i>下载交付包</button></div></div><div class="vps-summary"><span class="summary-chip">题目<strong>${summary.total || 0}</strong></span><span class="summary-chip">待处理<strong>${summary.waiting || 0}</strong></span><span class="summary-chip success">质检通过<strong>${summary.qc_passed || 0}</strong></span><span class="summary-chip success">已交付<strong>${summary.delivered || 0}</strong></span></div><div class="vps-batch-list">${questions.length ? questions.map((question) => `<div class="vps-batch"><div><strong>第 ${question.question_no} 题 · ${escapeHtml(question.title)}</strong><span>${escapeHtml(question.stage_label || "未知阶段")}</span></div><span class="tag ${question.exported ? "green" : "amber"}">${question.exported ? "已导出" : "进行中"}</span></div>`).join("") : `<div class="empty-state"><strong>当前批次暂无题目</strong></div>`}</div>`;
+  $("#vps-package-download").addEventListener("click", downloadVpsPackage);
+  refreshIcons();
+}
+
+async function loadVpsNodes() {
+  try {
+    const result = await api("/api/vps-nodes");
+    state.vpsNodes = result.nodes || [];
+    renderVps();
+  } catch (error) { toast(error.message, true); }
+}
+
+async function downloadVpsPackage() {
+  const node = selectedVps();
+  const batch = node?.dashboard?.batch?.name;
+  if (!node || !batch) return;
+  try {
+    const response = await fetch(`/api/vps-nodes/${node.id}/delivery-package?batch=${encodeURIComponent(batch)}`);
+    if (!response.ok) throw new Error((await response.json()).error || "下载失败");
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement("a");
+    anchor.href = url; anchor.download = `ccusr-${node.name}-${batch}.zip`;
+    document.body.append(anchor); anchor.click(); anchor.remove(); URL.revokeObjectURL(url);
+    toast("远程交付包已开始下载");
+  } catch (error) { toast(error.message, true); }
 }
 
 function renderSettings() {
@@ -960,6 +1039,35 @@ $("#logout-button").addEventListener("click", async () => {
   window.location.href = "/login.html";
 });
 $("#audit-refresh").addEventListener("click", loadAuditLogs);
+$("#vps-refresh").addEventListener("click", loadVpsNodes);
+$("#vps-node-list").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-vps-id]");
+  if (!button) return;
+  state.selectedVpsId = Number(button.dataset.vpsId);
+  renderVps();
+});
+$("#vps-new").addEventListener("click", () => {
+  $("#vps-id").value = "";
+  $("#vps-name").value = "";
+  $("#vps-base-url").value = "";
+  $("#vps-ssh-command").value = "";
+  $("#vps-enabled").checked = true;
+  $("#vps-name").focus();
+});
+$("#vps-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  try {
+    await api("/api/vps-nodes", { method: "POST", body: JSON.stringify({
+      id: $("#vps-id").value ? Number($("#vps-id").value) : null,
+      name: $("#vps-name").value,
+      base_url: $("#vps-base-url").value,
+      ssh_command: $("#vps-ssh-command").value,
+      enabled: $("#vps-enabled").checked,
+    }) });
+    toast("VPS 节点已保存");
+    await loadVpsNodes();
+  } catch (error) { toast(error.message, true); }
+});
 $("#file-list").addEventListener("click", (event) => {
   const button = event.target.closest("[data-file-path]");
   if (button) copyText(button.dataset.filePath, "文件路径已复制");
@@ -1030,5 +1138,6 @@ loadAuth().then(() => {
   loadAuthorJobs();
   loadMothers();
   loadPipelineJobs();
+  loadVpsNodes();
   if (state.user?.role === "admin") loadConfig();
 }).catch(() => {});

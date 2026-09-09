@@ -167,6 +167,32 @@ th:nth-child(6) { width: 12%; }
 .audit-table td:nth-child(2), .audit-table td:nth-child(3) { color: var(--ink); font-weight: 650; }
 .audit-success { color: var(--green) !important; }
 .audit-failed { color: var(--red-dark) !important; }
+.vps-view { margin-top: 4px; max-width: 1180px; }
+.vps-layout { display: grid; grid-template-columns: 270px minmax(0, 1fr); gap: 14px; align-items: start; }
+.vps-node-list, .vps-detail, .vps-admin-panel { border: 1px solid var(--line); border-radius: 7px; background: #fff; }
+.vps-node-list { padding: 8px; display: grid; gap: 5px; }
+.vps-node { width: 100%; border: 1px solid transparent; border-radius: 6px; background: transparent; padding: 12px; text-align: left; color: var(--ink); }
+.vps-node:hover, .vps-node.active { border-color: #efb6be; background: var(--red-soft); }
+.vps-node strong, .vps-node span { display: block; }
+.vps-node span { margin-top: 4px; color: var(--muted); font-size: 11px; }
+.vps-node .node-status { display: inline-flex; align-items: center; gap: 5px; color: var(--muted); }
+.vps-node .node-status::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: #aaa; }
+.vps-node.online .node-status::before { background: var(--green); }
+.vps-node.offline .node-status::before { background: var(--red); }
+.vps-detail { min-height: 260px; padding: 20px; }
+.vps-detail-head { display: flex; justify-content: space-between; gap: 12px; align-items: start; border-bottom: 1px solid var(--line); padding-bottom: 14px; }
+.vps-detail-head h3 { margin: 0; font-size: 17px; }
+.vps-detail-head p { margin: 5px 0 0; color: var(--muted); font-size: 11px; }
+.vps-summary { display: grid; grid-template-columns: repeat(4, minmax(100px, 1fr)); gap: 8px; margin: 16px 0; }
+.vps-summary .summary-chip { display: grid; justify-content: start; gap: 2px; height: auto; padding: 10px; }
+.vps-batch-list { display: grid; gap: 8px; }
+.vps-batch { display: flex; justify-content: space-between; gap: 12px; align-items: center; padding: 10px 12px; border-top: 1px solid var(--line); }
+.vps-batch strong, .vps-batch span { display: block; }
+.vps-batch span { margin-top: 3px; color: var(--muted); font-size: 11px; }
+.vps-admin-panel { margin-top: 14px; padding: 18px; }
+.vps-form { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; align-items: end; }
+.vps-form .settings-actions { grid-column: 1 / -1; }
+@media (max-width: 800px) { .vps-layout { grid-template-columns: 1fr; } .vps-summary { grid-template-columns: repeat(2, minmax(100px, 1fr)); } .vps-form { grid-template-columns: 1fr; } }
 .settings-card { display: grid; gap: 18px; padding: 24px; border: 1px solid var(--line); border-radius: 7px; background: #fff; box-shadow: 0 4px 16px rgba(37, 31, 33, .045); }
 .settings-field { display: grid; gap: 7px; color: var(--muted); font-size: 11px; font-weight: 650; }
 .settings-field input, .settings-field textarea { width: 100%; border: 1px solid #d8d4db; border-radius: 6px; outline: 0; color: var(--ink); background: #fff; }

@@ -19,6 +19,7 @@
         <button class="nav-item active" data-view="production"><i data-lucide="list-checks"></i><span>生产批次</span></button>
         <button class="nav-item" data-view="records"><i data-lucide="database"></i><span>交付记录</span></button>
         <button class="nav-item" data-view="exports"><i data-lucide="file-spreadsheet"></i><span>导出中心</span></button>
+        <button class="nav-item" data-view="vps"><i data-lucide="server"></i><span>VPS 管理</span></button>
         <button class="nav-item" data-view="settings"><i data-lucide="settings-2"></i><span>运行配置</span></button>
         <button class="nav-item admin-only" data-view="audit" hidden><i data-lucide="history"></i><span>审计日志</span></button>
       </nav>
@@ -147,6 +148,25 @@
       <section class="export-view" id="export-view" hidden>
         <div class="section-heading"><div><h2>交付文件</h2><p>按生成时间查看工作簿和原始轨迹副本。</p></div><button class="button primary" type="button" id="delivery-package-button"><i data-lucide="archive-download"></i>下载交付包</button></div>
         <div class="file-list" id="file-list"></div>
+      </section>
+
+      <section class="vps-view" id="vps-view" hidden>
+        <div class="section-heading"><div><h2>VPS 管理</h2><p>统一查看远程节点状态、批次进度和交付包。节点服务保持内网监听，通过 SSH 隧道连接。</p></div><button class="button secondary" type="button" id="vps-refresh"><i data-lucide="refresh-cw"></i>刷新节点</button></div>
+        <div class="vps-layout">
+          <div class="vps-node-list" id="vps-node-list"><div class="empty-state"><strong>正在读取 VPS 节点</strong></div></div>
+          <div class="vps-detail" id="vps-detail"><div class="empty-state"><i data-lucide="server"></i><strong>选择一个 VPS 节点</strong><span>选择左侧节点后查看远程生产进度。</span></div></div>
+        </div>
+        <section class="vps-admin-panel admin-only" id="vps-admin-panel" hidden>
+          <div class="section-heading"><div><h3>节点配置</h3><p>管理员可以添加或修改远程控制台地址。当前 VPS 默认使用本机 18787 SSH 隧道。</p></div></div>
+          <form class="vps-form" id="vps-form">
+            <input type="hidden" id="vps-id">
+            <label class="settings-field"><span>节点名称</span><input id="vps-name" required placeholder="例如 VPS-01"></label>
+            <label class="settings-field"><span>控制台地址</span><input id="vps-base-url" type="url" required placeholder="http://127.0.0.1:18787"></label>
+            <label class="settings-field"><span>SSH 隧道命令</span><input id="vps-ssh-command" placeholder="ssh -N -L 18787:127.0.0.1:8787 ubuntu@host"></label>
+            <label class="check-label"><input id="vps-enabled" type="checkbox" checked><span>启用节点</span></label>
+            <div class="settings-actions"><button class="button primary" type="submit"><i data-lucide="save"></i>保存节点</button><button class="button secondary" type="button" id="vps-new"><i data-lucide="plus"></i>新增节点</button></div>
+          </form>
+        </section>
       </section>
 
       <section class="settings-view" id="settings-view" hidden>

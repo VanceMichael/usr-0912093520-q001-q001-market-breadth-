@@ -216,6 +216,25 @@ class WebConsoleTests(unittest.TestCase):
             self.assertEqual([log["action"] for log in logs[:3]], ["logout", "login", "login"])
             self.assertEqual(logs[0]["username"], "renhuangding")
 
+    def test_vps_node_registry_and_remote_dashboard_shape(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = self.make_database(root)
+            (root / ".env").write_text("CC_CONSOLE_PASSWORD=ldy888!\n", encoding="utf-8")
+            data = ConsoleData(database, root)
+            _token, user = data.login("zhanglei", "ldy888!")
+            with mock.patch.object(
+                data, "_vps_request", return_value=(json.dumps({"summary": {"total": 1}}).encode(), {})
+            ):
+                nodes = data.vps_nodes(user)
+            self.assertEqual(nodes[0]["status"], "online")
+            self.assertEqual(nodes[0]["dashboard"]["summary"]["total"], 1)
+            saved = data.save_vps_node({
+                "name": "VPS-02", "base_url": "http://127.0.0.1:18788",
+                "ssh_command": "ssh -N -L 18788:127.0.0.1:8787 ubuntu@example.com", "enabled": True,
+            })
+            self.assertEqual(saved["name"], "VPS-02")
+
     def test_env_config_keeps_existing_key_when_blank(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

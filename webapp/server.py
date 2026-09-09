@@ -20,6 +20,8 @@ import subprocess
 import sys
 import tempfile
 import threading
+import urllib.error
+import urllib.request
 import webbrowser
 import zipfile
 from contextlib import closing
@@ -27,7 +29,7 @@ from datetime import datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, quote, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
 
 
 class _OSProxy:
@@ -145,6 +147,17 @@ CREATE TABLE IF NOT EXISTS console_audit_logs (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_console_audit_created ON console_audit_logs(created_at DESC, id DESC);
+
+CREATE TABLE IF NOT EXISTS vps_nodes (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    base_url TEXT NOT NULL,
+    ssh_command TEXT NOT NULL DEFAULT '',
+    enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_vps_nodes_enabled ON vps_nodes(enabled, name);
 """
 
 
@@ -230,18 +243,37 @@ class ConsoleData:
         self._pipeline_process_lock = threading.Lock()
         self._sessions: dict[str, tuple[dict[str, object], datetime]] = {}
         self._session_lock = threading.Lock()
+        self._vps_sessions: dict[int, str] = {}
         if self.database.is_file():
             connection = initialize_database(self.database)
             connection.close()
         self._initialize_author_jobs()
         self._initialize_pipeline_jobs()
         self._initialize_audit_logs()
+        self._initialize_vps_nodes()
 
     def _initialize_audit_logs(self) -> None:
         if not self.database.is_file():
             return
         with closing(self._write_connection()) as connection:
             connection.executescript(AUTHOR_JOB_SCHEMA)
+            connection.commit()
+
+    def _initialize_vps_nodes(self) -> None:
+        if not self.database.is_file():
+            return
+        with closing(self._write_connection()) as connection:
+            connection.executescript(AUTHOR_JOB_SCHEMA)
+            if connection.execute("SELECT 1 FROM vps_nodes LIMIT 1").fetchone() is None:
+                timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+                connection.execute(
+                    "INSERT INTO vps_nodes(name,base_url,ssh_command,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                    (
+                        "VPS-01", "http://127.0.0.1:18787",
+                        "ssh -N -L 18787:127.0.0.1:8787 ubuntu@43.161.250.107",
+                        1, timestamp, timestamp,
+                    ),
+                )
             connection.commit()
 
     def _write_connection(self) -> sqlite3.Connection:
@@ -314,6 +346,133 @@ class ConsoleData:
                 (max(1, min(limit, 500)),),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    @staticmethod
+    def _validate_vps_node(body: dict[str, object]) -> tuple[int | None, str, str, str, int]:
+        raw_id = body.get("id")
+        node_id = None if raw_id in (None, "") else int(raw_id)
+        name = str(body.get("name", "")).strip()
+        base_url = str(body.get("base_url", "")).strip().rstrip("/")
+        ssh_command = str(body.get("ssh_command", "")).strip()
+        enabled = body.get("enabled", True)
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 _-]{1,47}", name):
+            raise ValueError("VPS 名称必须是 2-48 位字母、数字、空格、下划线或连字符")
+        parsed = urlparse(base_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+            raise ValueError("VPS 地址必须是完整的 HTTP(S) 地址")
+        if isinstance(enabled, bool):
+            enabled_value = int(enabled)
+        else:
+            raise ValueError("VPS 启用状态无效")
+        if len(ssh_command) > 500 or "\x00" in ssh_command:
+            raise ValueError("SSH 隧道命令无效")
+        return node_id, name, base_url, ssh_command, enabled_value
+
+    def save_vps_node(self, body: dict[str, object]) -> dict:
+        node_id, name, base_url, ssh_command, enabled = self._validate_vps_node(body)
+        timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        with closing(self._write_connection()) as connection:
+            if node_id is None:
+                cursor = connection.execute(
+                    "INSERT INTO vps_nodes(name,base_url,ssh_command,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+                    (name, base_url, ssh_command, enabled, timestamp, timestamp),
+                )
+                node_id = int(cursor.lastrowid)
+            else:
+                result = connection.execute(
+                    "UPDATE vps_nodes SET name=?,base_url=?,ssh_command=?,enabled=?,updated_at=? WHERE id=?",
+                    (name, base_url, ssh_command, enabled, timestamp, node_id),
+                )
+                if result.rowcount != 1:
+                    raise ValueError("VPS 节点不存在")
+            connection.commit()
+        return {"id": node_id, "name": name, "base_url": base_url, "ssh_command": ssh_command, "enabled": bool(enabled)}
+
+    def delete_vps_node(self, node_id: object) -> None:
+        try:
+            value = int(node_id)
+        except (TypeError, ValueError):
+            raise ValueError("VPS 节点编号无效") from None
+        with closing(self._write_connection()) as connection:
+            result = connection.execute("DELETE FROM vps_nodes WHERE id=?", (value,))
+            if result.rowcount != 1:
+                raise ValueError("VPS 节点不存在")
+            connection.commit()
+        self._vps_sessions.pop(value, None)
+
+    def _vps_request(self, node: dict, user: dict[str, object], path: str, *, method: str = "GET", payload: object = None) -> tuple[bytes, dict[str, str]]:
+        node_id = int(node["id"])
+        base_url = str(node["base_url"]).rstrip("/") + "/"
+        headers = {"Accept": "application/json"}
+        cookie = self._vps_sessions.get(node_id, "")
+        if not cookie:
+            login_body = json.dumps({"username": user["username"], "password": self._console_password()}).encode("utf-8")
+            login_request = urllib.request.Request(urljoin(base_url, "api/auth/login"), data=login_body, method="POST", headers={"Content-Type": "application/json", "Accept": "application/json"})
+            try:
+                with urllib.request.urlopen(login_request, timeout=8) as response:
+                    cookie_header = response.headers.get("Set-Cookie", "")
+                    cookie = cookie_header.split(";", 1)[0]
+            except (OSError, urllib.error.HTTPError) as exc:
+                raise RuntimeError(f"{node['name']} 登录失败：{exc}") from exc
+            if not cookie:
+                raise RuntimeError(f"{node['name']} 未返回登录会话")
+            self._vps_sessions[node_id] = cookie
+        headers["Cookie"] = cookie
+        data = None
+        if payload is not None:
+            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        request = urllib.request.Request(urljoin(base_url, path.lstrip("/")), data=data, method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.read(), {key.lower(): value for key, value in response.headers.items()}
+        except urllib.error.HTTPError as exc:
+            if exc.code == 401:
+                self._vps_sessions.pop(node_id, None)
+            detail = exc.read().decode("utf-8", errors="replace")[:300]
+            raise RuntimeError(f"{node['name']} 请求失败（{exc.code}）：{detail}") from exc
+        except OSError as exc:
+            raise RuntimeError(f"{node['name']} 不可达：{exc}") from exc
+
+    def _node_rows(self) -> list[dict]:
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                "SELECT id,name,base_url,ssh_command,enabled,created_at,updated_at FROM vps_nodes ORDER BY name,id"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def vps_nodes(self, user: dict[str, object]) -> list[dict]:
+        result = []
+        for node in self._node_rows():
+            item = {**node, "enabled": bool(node["enabled"]), "status": "disabled" if not node["enabled"] else "offline", "error": ""}
+            if node["enabled"]:
+                try:
+                    payload, _headers = self._vps_request(node, user, "/api/dashboard")
+                    item["status"] = "online"
+                    item["dashboard"] = json.loads(payload.decode("utf-8"))
+                except (OSError, RuntimeError, ValueError) as exc:
+                    item["error"] = str(exc)
+            result.append(item)
+        return result
+
+    def vps_dashboard(self, node_id: object, user: dict[str, object]) -> dict:
+        node = next((row for row in self._node_rows() if int(row["id"]) == int(node_id)), None)
+        if node is None:
+            raise ValueError("VPS 节点不存在")
+        payload, _headers = self._vps_request(node, user, "/api/dashboard")
+        return json.loads(payload.decode("utf-8"))
+
+    def vps_delivery_package(self, node_id: object, batch: object, user: dict[str, object]) -> tuple[str, bytes]:
+        node = next((row for row in self._node_rows() if int(row["id"]) == int(node_id)), None)
+        if node is None:
+            raise ValueError("VPS 节点不存在")
+        batch_name = str(batch or "")
+        if not BATCH_RE.fullmatch(batch_name):
+            raise ValueError("批次名无效")
+        payload, headers = self._vps_request(node, user, "/api/delivery-package?batch=" + quote(batch_name))
+        disposition = headers.get("content-disposition", "")
+        match = re.search(r'filename="([^"]+)"', disposition)
+        return (match.group(1) if match else f"ccusr-delivery-{batch_name}.zip"), payload
 
     def _initialize_author_jobs(self) -> None:
         if not self.database.is_file():
@@ -1970,6 +2129,29 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                     return
                 self.send_json({"logs": self.data.audit_logs()})
                 return
+            if parsed.path == "/api/vps-nodes":
+                user = self.current_user()
+                self.send_json({"nodes": self.data.vps_nodes(user)})
+                return
+            match = re.fullmatch(r"/api/vps-nodes/(\d+)/dashboard", parsed.path)
+            if match:
+                user = self.current_user()
+                self.send_json(self.data.vps_dashboard(int(match.group(1)), user))
+                return
+            match = re.fullmatch(r"/api/vps-nodes/(\d+)/delivery-package", parsed.path)
+            if match:
+                user = self.current_user()
+                batch = parse_qs(parsed.query).get("batch", [None])[0]
+                filename, payload = self.data.vps_delivery_package(int(match.group(1)), batch, user)
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "application/zip")
+                self.send_header("Content-Length", str(len(payload)))
+                self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(payload)
+                self.data._audit(str(user["username"]), "download_vps_delivery_package", target=f"{match.group(1)}:{batch or ''}", remote_addr=self.remote_addr())
+                return
             if parsed.path == "/api/delivery-package":
                 batch = parse_qs(parsed.query).get("batch", [None])[0]
                 filename, payload = self.data.delivery_package(batch)
@@ -2022,10 +2204,17 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 self.send_json({"ok": True}, cookie="ccusr_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0")
                 return
             permission = "admin" if self.path in {"/api/config", "/api/actions/environment-repair"} else "operate"
+            if self.path in {"/api/vps-nodes", "/api/vps-nodes/delete"}:
+                permission = "admin"
             user = self.require_user(permission=permission)
             if user is None:
                 return
-            if self.path == "/api/actions/open":
+            if self.path == "/api/vps-nodes":
+                result = self.data.save_vps_node(body)
+            elif self.path == "/api/vps-nodes/delete":
+                self.data.delete_vps_node(body.get("id"))
+                result = {"ok": True, "message": "VPS 节点已删除"}
+            elif self.path == "/api/actions/open":
                 target = self.data.resolve_open_target(str(body.get("kind", "")), body.get("id"))
                 open_local_path(target, self.data.project_root)
                 result = {"ok": True, "message": f"已打开 {target.name}"}
