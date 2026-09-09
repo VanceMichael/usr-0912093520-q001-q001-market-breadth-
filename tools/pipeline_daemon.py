@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """Run one serialized autonomous production cycle.
 
 The control agent authors and audits batches; Claude Code question runs remain
@@ -319,21 +320,35 @@ def resolve_codex(codex: str) -> str:
     return shutil.which(codex) or str(Path.home() / ".local" / "bin" / codex)
 
 
-def claim_topic(database: Path) -> dict | None:
+def claim_topics(database: Path, count: int) -> list[dict]:
+    """Atomically claim exactly ``count`` distinct topics, or claim none."""
+    count = max(1, count)
     with connect(database.resolve()) as connection:
-        row = connection.execute(
-            "SELECT * FROM news_topics WHERE status='new' ORDER BY created_at,id LIMIT 1"
-        ).fetchone()
-        if row is None:
-            return None
-        connection.execute("UPDATE news_topics SET status='claimed',updated_at=? WHERE id=?", (now(), row["id"]))
+        connection.execute("BEGIN IMMEDIATE")
+        rows = connection.execute(
+            "SELECT * FROM news_topics WHERE status='new' ORDER BY created_at,id LIMIT ?",
+            (count,),
+        ).fetchall()
+        if len(rows) < count:
+            return []
+        timestamp = now()
+        connection.executemany(
+            "UPDATE news_topics SET status='claimed',updated_at=? WHERE id=?",
+            [(timestamp, row["id"]) for row in rows],
+        )
         connection.commit()
-        return dict(row)
+        return [dict(row) for row in rows]
 
 
-def release_topic(database: Path, topic_id: int, status: str, batch: str = "") -> None:
+def release_topics(database: Path, topic_ids: list[int], status: str, batch: str = "") -> None:
+    if not topic_ids:
+        return
     with connect(database.resolve()) as connection:
-        connection.execute("UPDATE news_topics SET status=?,used_batch=?,updated_at=? WHERE id=?", (status, batch, now(), topic_id))
+        timestamp = now()
+        connection.executemany(
+            "UPDATE news_topics SET status=?,used_batch=?,updated_at=? WHERE id=?",
+            [(status, batch, timestamp, topic_id) for topic_id in topic_ids],
+        )
         connection.commit()
 
 
@@ -362,11 +377,35 @@ def has_new_topics(database: Path) -> bool:
         return connection.execute("SELECT 1 FROM news_topics WHERE status='new' LIMIT 1").fetchone() is not None
 
 
-def create_batch(database: Path, codex: str, topic: dict, batch: str, log: Path, timeout: int, store: SchedulerStore | None = None) -> int:
-    context = json.dumps({key: topic.get(key, "") for key in ("title", "summary", "article_url", "source_url", "published_at")}, ensure_ascii=False)
+def author_prompt(topics: list[dict], batch: str, batch_size: int, distribution: str) -> str:
+    source_urls = list(dict.fromkeys(
+        str(topic.get("source_url", "")).strip()
+        for topic in topics
+        if str(topic.get("source_url", "")).strip()
+    ))
+    sources = "、".join(source_urls)
+    context = json.dumps([
+        {
+            "question_no": index,
+            **{key: topic.get(key, "") for key in ("title", "summary", "article_url", "source_url", "published_at")},
+        }
+        for index, topic in enumerate(topics, start=1)
+    ], ensure_ascii=False)
+    return f"""使用 $cc-usr-question-author 创建批次。
+批次名：{batch}
+题目数量：{batch_size}
+难度分配：{distribution}
+出题要求：业务关键词：从 {sources} 读取主题来进行出题，本轮必须按下方新闻主题清单的 question_no 将主题与题目一一绑定，每条新闻必须且只能生成一道题，不得遗漏、复用、合并主题或从同一主题派生多道题；技术关键词：需要 Docker，每道题的初始工程必须提供 Dockerfile，有外部依赖时同时提供 Docker Compose，并支持通过命令完成构建和验收；补充要求：在整批中合理覆盖 Node.js（JavaScript 或 TypeScript）、Python、Go、Java，每道题只选择其中一种主要后端技术栈。{backend_only_requirement()}每道题的 difficulty 字段必须严格按上述题数分配，不得擅自改变题数或难度。新闻只作为业务背景种子，不要复制新闻标题，不要把新闻事实当成实现要求，也不要使用新闻网站代码或受版权保护的正文。先检查 production.sqlite3 中已有题目，发现重复或模板化表达必须重写。
+新闻主题清单：{context}
+严格遵守 项目规范.md。完成真实初始工程、GitHub 可访问快照和登记后，运行出题机械质检，并使用 $cc-usr-question-qc 完成重复、自然度和反模板质检；不要启动目标模型。全过程只修改本项目和题目工作区，完成后输出批次名、每题状态和任何阻塞原因。"""
+
+
+def create_batch(database: Path, codex: str, topics: list[dict], batch: str, log: Path, timeout: int, store: SchedulerStore | None = None) -> int:
     batch_size = author_batch_size()
+    if len(topics) != batch_size:
+        raise ValueError(f"expected {batch_size} news topics, got {len(topics)}")
     distribution = difficulty_distribution(batch_size, difficulty_plan())
-    prompt = f"""你是持续生产控制 agent。严格读取并遵守项目根目录的 项目规范.md，以及 .agents/skills/cc-usr-question-author/SKILL.md 和 cc-usr-question-qc/SKILL.md。现在创建一个名为 {batch} 的首轮 0-1 代码生成批次，生成 {batch_size} 道彼此明显不同、业务导向、可执行验收的题目。难度必须严格分配为：{distribution}；每道题的 difficulty 字段按此填写，不得擅自改变题数或难度。{backend_only_requirement()}新闻主题只作为业务背景种子，不要复制新闻标题，不要把新闻事实当成实现要求，也不要使用新闻网站代码或受版权保护的正文。先检查现有 production.sqlite3 的题目避免重复；完成真实初始工程、GitHub 可访问快照、机械质检和重复性质检后才算完成。主题种子如下：{context}。全过程只修改本项目和题目工作区，完成后输出批次名、每题状态和任何阻塞原因。"""
+    prompt = author_prompt(topics, batch, batch_size, distribution)
     return run_command(codex_command(codex, prompt), PROJECT_ROOT, log, timeout, store)
 
 
@@ -412,39 +451,49 @@ def fail_authored_batch(database: Path, batch: str) -> None:
 def create_next_batch(
     database: Path, args: argparse.Namespace, store: SchedulerStore | None = None,
 ) -> tuple[int, str]:
-    topic = claim_topic(database)
-    if topic is None:
+    batch_size = author_batch_size()
+    topics = claim_topics(database, batch_size)
+    if not topics:
+        if store:
+            store.heartbeat(
+                phase="idle", batch="",
+                detail=f"可用新闻不足 {batch_size} 条，等待更多不同主题",
+            )
         return 0, ""
+    topic_ids = [int(topic["id"]) for topic in topics]
     batch = f"news{datetime.now().strftime('%m%d%H%M%S')}"
     if store:
         store.heartbeat(phase="author", batch=batch, detail="Codex 正在生成并质检题目")
         store.event(
-            "topic_claimed", f"已领取新闻主题：{topic.get('title', '')}",
+            "topics_claimed", f"已领取 {len(topics)} 条不同新闻主题",
             phase="author", batch=batch,
-            details={"article_url": topic.get("article_url", ""), "source_url": topic.get("source_url", "")},
+            details={
+                "topic_ids": topic_ids,
+                "article_urls": [topic.get("article_url", "") for topic in topics],
+            },
         )
     log = args.log_dir.resolve() / f"author-{batch}.log"
     try:
-        code = create_batch(database, args.codex, topic, batch, log, args.agent_timeout, store)
+        code = create_batch(database, args.codex, topics, batch, log, args.agent_timeout, store)
     except Exception:
         fail_authored_batch(database, batch)
-        release_topic(database, topic["id"], "new")
+        release_topics(database, topic_ids, "new")
         raise
     if code == 0:
-        complete, total, ready = authored_batch_result(database, batch, author_batch_size())
-        release_topic(database, topic["id"], "used", batch)
+        complete, total, ready = authored_batch_result(database, batch, batch_size)
+        release_topics(database, topic_ids, "used", batch)
         if not complete:
             if store:
                 store.event(
                     "author_validation_failed",
                     f"出题结果未通过调度门禁：实际 {total} 道，可运行 {ready} 道",
                     level="error", phase="author", batch=batch,
-                    details={"total": total, "ready": ready, "expected": author_batch_size()},
+                    details={"total": total, "ready": ready, "expected": batch_size},
                 )
             return 1, batch
     else:
         fail_authored_batch(database, batch)
-        release_topic(database, topic["id"], "new")
+        release_topics(database, topic_ids, "new")
     return code, batch
 
 
