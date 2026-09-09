@@ -51,15 +51,22 @@ def load_runtime_env(path: Path) -> None:
         key, value = stripped.split("=", 1)
         key = key.strip()
         value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+        if len(value) >= 2 and value[0] == value[-1] == '"':
+            try:
+                value = str(json.loads(value))
+            except json.JSONDecodeError:
+                value = value[1:-1]
+        elif len(value) >= 2 and value[0] == value[-1] == "'":
             value = value[1:-1]
         if key == "CC_GITHUB_TOKEN" and value:
-            os.environ.setdefault("GH_TOKEN", value)
-            os.environ.setdefault("GITHUB_TOKEN", value)
+            os.environ["GH_TOKEN"] = value
+            os.environ["GITHUB_TOKEN"] = value
         elif key == "CC_AUTHOR_DIFFICULTY" and value:
-            os.environ.setdefault("CC_AUTHOR_DIFFICULTY", value)
+            os.environ["CC_AUTHOR_DIFFICULTY"] = value
+        elif key == "CC_AUTHOR_DIFFICULTY_WEIGHTS" and value:
+            os.environ["CC_AUTHOR_DIFFICULTY_WEIGHTS"] = value
         elif key == "CC_AUTHOR_BATCH_SIZE" and value:
-            os.environ.setdefault("CC_AUTHOR_BATCH_SIZE", value)
+            os.environ["CC_AUTHOR_BATCH_SIZE"] = value
 
 
 def author_batch_size() -> int:
@@ -68,6 +75,48 @@ def author_batch_size() -> int:
     except ValueError:
         return 10
     return max(1, min(value, 20))
+
+
+def difficulty_plan() -> dict[str, int]:
+    raw = os.environ.get("CC_AUTHOR_DIFFICULTY_WEIGHTS", "").strip()
+    try:
+        parsed = json.loads(raw) if raw else {}
+    except json.JSONDecodeError:
+        parsed = {}
+    plan: dict[str, int] = {}
+    if isinstance(parsed, dict):
+        for difficulty in ("中等", "困难", "地狱"):
+            try:
+                weight = int(parsed.get(difficulty, 0))
+            except (TypeError, ValueError):
+                weight = 0
+            if weight > 0:
+                plan[difficulty] = weight
+    if plan:
+        return plan
+    legacy = os.environ.get("CC_AUTHOR_DIFFICULTY", "中等").strip()
+    return {legacy if legacy in {"中等", "困难", "地狱"} else "中等": 100}
+
+
+def difficulty_distribution(count: int, plan: dict[str, int]) -> str:
+    order = ("中等", "困难", "地狱")
+    total = sum(plan.values())
+    entries: list[list[object]] = []
+    allocated = 0
+    for index, difficulty in enumerate(order):
+        if difficulty not in plan:
+            continue
+        raw = count * plan[difficulty] / total
+        base = int(raw)
+        allocated += base
+        entries.append([raw - base, -index, difficulty, base])
+    for entry in sorted(entries, reverse=True)[: count - allocated]:
+        entry[3] = int(entry[3]) + 1
+    counts = {str(entry[2]): int(entry[3]) for entry in entries}
+    return "、".join(
+        f"{difficulty} {counts[difficulty]} 道（{plan[difficulty] / total:.0%}）"
+        for difficulty in order if difficulty in plan
+    )
 
 
 def codex_command(codex: str, prompt: str) -> list[str]:
@@ -123,11 +172,9 @@ def has_new_topics(database: Path) -> bool:
 
 def create_batch(database: Path, codex: str, topic: dict, batch: str, log: Path, timeout: int) -> int:
     context = json.dumps({key: topic.get(key, "") for key in ("title", "summary", "article_url", "source_url", "published_at")}, ensure_ascii=False)
-    difficulty = os.environ.get("CC_AUTHOR_DIFFICULTY", "中等").strip() or "中等"
-    if difficulty not in {"中等", "困难", "地狱"}:
-        difficulty = "中等"
     batch_size = author_batch_size()
-    prompt = f"""你是持续生产控制 agent。严格读取并遵守项目根目录的 项目规范.md，以及 .agents/skills/cc-usr-question-author/SKILL.md 和 cc-usr-question-qc/SKILL.md。现在创建一个名为 {batch} 的首轮 0-1 代码生成批次，生成 {batch_size} 道彼此明显不同、业务导向、可执行验收的题目。所有题目的 difficulty 字段必须填写为“{difficulty}”，不得擅自使用其他难度。新闻主题只作为业务背景种子，不要复制新闻标题，不要把新闻事实当成实现要求，也不要使用新闻网站代码或受版权保护的正文。先检查现有 production.sqlite3 的题目避免重复；完成真实初始工程、GitHub 可访问快照、机械质检和重复性质检后才算完成。主题种子如下：{context}。全过程只修改本项目和题目工作区，完成后输出批次名、每题状态和任何阻塞原因。"""
+    distribution = difficulty_distribution(batch_size, difficulty_plan())
+    prompt = f"""你是持续生产控制 agent。严格读取并遵守项目根目录的 项目规范.md，以及 .agents/skills/cc-usr-question-author/SKILL.md 和 cc-usr-question-qc/SKILL.md。现在创建一个名为 {batch} 的首轮 0-1 代码生成批次，生成 {batch_size} 道彼此明显不同、业务导向、可执行验收的题目。难度必须严格分配为：{distribution}；每道题的 difficulty 字段按此填写，不得擅自改变题数或难度。新闻主题只作为业务背景种子，不要复制新闻标题，不要把新闻事实当成实现要求，也不要使用新闻网站代码或受版权保护的正文。先检查现有 production.sqlite3 的题目避免重复；完成真实初始工程、GitHub 可访问快照、机械质检和重复性质检后才算完成。主题种子如下：{context}。全过程只修改本项目和题目工作区，完成后输出批次名、每题状态和任何阻塞原因。"""
     return run_command(codex_command(codex, prompt), PROJECT_ROOT, log, timeout)
 
 
@@ -193,6 +240,7 @@ def run_batch(database: Path, args: argparse.Namespace, batch: str) -> int:
 
 
 def cycle(args: argparse.Namespace) -> int:
+    load_runtime_env(args.env_file.resolve())
     database = args.db.resolve()
     added, errors = ingest(database, args.feeds, args.feed_timeout)
     print(f"news: added={added} feed_errors={len(errors)}", flush=True)

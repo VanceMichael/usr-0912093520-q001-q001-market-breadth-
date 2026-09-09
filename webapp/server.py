@@ -49,7 +49,7 @@ SNAPSHOT_RE = re.compile(r"^https://github\.com/[^/]+/[^/]+/commit/[0-9a-fA-F]{4
 ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 ENV_KEYS = (
     "CC_SWITCH_BASE_URL", "CC_SWITCH_MODEL", "CC_SWITCH_API_KEY", "CC_USR_SUBMITTER",
-    "CC_GITHUB_TOKEN", "CC_AUTHOR_DIFFICULTY", "CC_AUTHOR_BATCH_SIZE",
+    "CC_GITHUB_TOKEN", "CC_AUTHOR_DIFFICULTY", "CC_AUTHOR_DIFFICULTY_WEIGHTS", "CC_AUTHOR_BATCH_SIZE",
 )
 PIPELINE_ENV_KEYS = (
     "CC_CLAUDE_DOCKER_IMAGE", "CC_CLAUDE_DOCKER_COMMAND",
@@ -434,10 +434,12 @@ class ConsoleData:
             connection.commit()
         self._cleanup_pipeline_containers(active_ids)
 
-    @staticmethod
-    def author_prompt(batch: str, count: int, business: str, technology: str, notes: str,
+    @classmethod
+    def author_prompt(cls, batch: str, count: int, business: str, technology: str, notes: str,
                       mode: str = "0-1", task_type: str = "0-1 代码生成", mother: dict | None = None,
-                      derived_notes: str = "", defect_tolerance: str = "", difficulty: str = "中等") -> str:
+                      derived_notes: str = "", defect_tolerance: str = "", difficulty: object = "中等") -> str:
+        difficulty_plan = cls._author_difficulty_plan(difficulty)
+        difficulty_text = cls._difficulty_prompt(count, difficulty_plan)
         technology_label = "Docker 要求" if technology in {"需要 Docker", "不需要 Docker"} else "技术关键词"
         requirements = "；".join(filter(None, (
             f"业务关键词：{business}" if business else "",
@@ -456,7 +458,7 @@ class ConsoleData:
                 "在项目根目录执行派生出题任务。先读取项目规范和 cc-usr-question-author 的全部引用，"
                 "使用母库中的 0-1 母项目生成独立的非 0-1 题目批次。\n"
                 f"批次名：{batch}\n题目数量：{count}\n题型：{task_type}\n"
-                f"母库信息：{mother_text}\n目标难度：{difficulty}。所有题目的 difficulty 字段必须填写为“{difficulty}”。\n出题要求：{requirements or '根据母项目代码、已登记快照和《项目规范.md》自动生成，不需要额外填写关键词。'}\n"
+                f"母库信息：{mother_text}\n难度分配：{difficulty_text}。每道题的 difficulty 字段必须严格按此分配填写。\n出题要求：{requirements or '根据母项目代码、已登记快照和《项目规范.md》自动生成，不需要额外填写关键词。'}\n"
                 f"派生方向：{derived_notes or '围绕母项目已有业务设计真实的后续工作'}\n"
                 f"可接受的小瑕疵：{defect_tolerance or '允许不影响构建和主要流程的小问题，并将其记录为可迭代方向'}\n"
                 "保留母项目路径、Git 地址、初始快照和派生使用关系；每道题使用独立工作区和独立 Prompt，"
@@ -468,7 +470,7 @@ class ConsoleData:
             ".agents/skills/cc-usr-question-author/references/task-contract.md、"
             ".agents/skills/cc-usr-question-author/references/content-quality.md，"
             "然后严格使用 cc-usr-question-author 的现有 SQLite 出题流程。\n"
-            f"批次名：{batch}\n题目数量：{count}\n目标难度：{difficulty}。所有题目的 difficulty 字段必须填写为“{difficulty}”。\n出题要求：{requirements}\n"
+            f"批次名：{batch}\n题目数量：{count}\n难度分配：{difficulty_text}。每道题的 difficulty 字段必须严格按此分配填写。\n出题要求：{requirements}\n"
             "创建完整批次和独立题目工作区，准备并提交干净 baseline，创建并推送可访问的 "
             "GitHub 仓库，登记精确的 40 位 SHA 快照，完成机械质检和重复题质检。"
             "每个 User Prompt 都要写成自然、具体的中文书面需求，不用标题、清单、固定开头或可换名复用的句式。"
@@ -938,9 +940,10 @@ class ConsoleData:
                 if task_type == "Feature 迭代" and not row["iteration_ready"]:
                     raise ValueError("该母项目暂不适合生成 Feature 迭代题")
                 mother = dict(row)
-        difficulty = self.read_env().get("CC_AUTHOR_DIFFICULTY", "中等").strip() or "中等"
-        if difficulty not in AUTHOR_DIFFICULTIES:
-            difficulty = "中等"
+        env = self.read_env()
+        difficulty = self._author_difficulty_plan(
+            env.get("CC_AUTHOR_DIFFICULTY_WEIGHTS", ""), env.get("CC_AUTHOR_DIFFICULTY", "中等")
+        )
         prompt = self.author_prompt(batch, count, business, technology, notes, mode, task_type, mother, derived_notes, defect_tolerance, difficulty)
         timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
         with closing(self._write_connection()) as connection:
@@ -1168,10 +1171,67 @@ class ConsoleData:
             return 10
         return max(1, min(value, 20))
 
+    @staticmethod
+    def _author_difficulty_plan(raw: object, legacy: object = "中等") -> dict[str, int]:
+        """Normalize selected authoring difficulties to positive integer weights."""
+        parsed: object = None
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                parsed = None
+        elif isinstance(raw, dict):
+            parsed = raw
+        if not isinstance(parsed, dict):
+            parsed = {str(legacy or "中等").strip() or "中等": 100}
+        plan: dict[str, int] = {}
+        for difficulty in AUTHOR_DIFFICULTIES:
+            value = parsed.get(difficulty, 0)
+            try:
+                weight = int(value)
+            except (TypeError, ValueError):
+                weight = 0
+            if weight > 0:
+                plan[difficulty] = weight
+        return plan or {"中等": 100}
+
+    @staticmethod
+    def _difficulty_counts(count: int, plan: dict[str, int]) -> dict[str, int]:
+        total_weight = sum(plan.values())
+        if count <= 0 or total_weight <= 0:
+            return {}
+        entries = []
+        allocated = 0
+        for order, difficulty in enumerate(AUTHOR_DIFFICULTIES):
+            weight = plan.get(difficulty, 0)
+            if weight <= 0:
+                continue
+            raw = count * weight / total_weight
+            base = int(raw)
+            allocated += base
+            entries.append((raw - base, -order, difficulty, base))
+        for _fraction, _order, difficulty, _base in sorted(entries, reverse=True)[: count - allocated]:
+            index = next(index for index, item in enumerate(entries) if item[2] == difficulty)
+            fraction, order, name, base = entries[index]
+            entries[index] = (fraction, order, name, base + 1)
+        return {difficulty: base for _fraction, _order, difficulty, base in entries if base > 0}
+
+    @classmethod
+    def _difficulty_prompt(cls, count: int, plan: dict[str, int]) -> str:
+        total = sum(plan.values()) or 1
+        counts = cls._difficulty_counts(count, plan)
+        return "、".join(
+            f"{difficulty} {counts.get(difficulty, 0)} 道（{plan[difficulty] / total:.0%}）"
+            for difficulty in AUTHOR_DIFFICULTIES if difficulty in plan
+        )
+
     def env_config(self) -> dict[str, object]:
         values = self.read_env()
         key = values["CC_SWITCH_API_KEY"]
         github_token = values.get("CC_GITHUB_TOKEN", "")
+        difficulty_plan = self._author_difficulty_plan(
+            values.get("CC_AUTHOR_DIFFICULTY_WEIGHTS", ""), values.get("CC_AUTHOR_DIFFICULTY", "中等")
+        )
         def env_int(name: str, default: int) -> int:
             try:
                 return max(1, min(int(values.get(name, str(default))), 8))
@@ -1192,7 +1252,7 @@ class ConsoleData:
             "api_key_hint": f"已配置（末尾 {key[-4:]}）" if len(key) >= 4 else ("已配置" if key else "未配置"),
             "github_token_configured": bool(github_token),
             "github_token_hint": f"已配置（末尾 {github_token[-4:]}）" if len(github_token) >= 4 else ("已配置" if github_token else "未配置"),
-            "author_difficulty": values.get("CC_AUTHOR_DIFFICULTY", "中等").strip() or "中等",
+            "author_difficulty_weights": difficulty_plan,
             "author_batch_size": self._author_batch_size(values.get("CC_AUTHOR_BATCH_SIZE", "")),
             **runtime_info(),
             "docker_image": values.get("CC_CLAUDE_DOCKER_IMAGE", "").strip() or "claude-cli:latest",
@@ -1405,7 +1465,12 @@ class ConsoleData:
             "model": body.get("model", current["CC_SWITCH_MODEL"]),
             "api_key": body.get("api_key", ""),
             "github_token": body.get("github_token", ""),
-            "author_difficulty": body.get("author_difficulty", current.get("CC_AUTHOR_DIFFICULTY", "中等")),
+            "author_difficulty_weights": body.get(
+                "author_difficulty_weights",
+                self._author_difficulty_plan(
+                    current.get("CC_AUTHOR_DIFFICULTY_WEIGHTS", ""), current.get("CC_AUTHOR_DIFFICULTY", "中等")
+                ),
+            ),
             "author_batch_size": body.get("author_batch_size", current.get("CC_AUTHOR_BATCH_SIZE", "10") or "10"),
             "submitter": body.get("submitter", current["CC_USR_SUBMITTER"]),
             "docker_image": body.get("docker_image", current.get("CC_CLAUDE_DOCKER_IMAGE", "claude-cli:latest")),
@@ -1417,9 +1482,26 @@ class ConsoleData:
         if not isinstance(github_token, str) or "\x00" in github_token or "\n" in github_token or "\r" in github_token:
             raise ValueError("github_token 配置无效")
         github_token = github_token.strip() or current.get("CC_GITHUB_TOKEN", "")
-        author_difficulty = str(incoming["author_difficulty"] or "中等").strip()
-        if author_difficulty not in AUTHOR_DIFFICULTIES:
-            raise ValueError("出题难度必须是中等、困难或地狱")
+        raw_difficulty_plan = incoming["author_difficulty_weights"]
+        if not isinstance(raw_difficulty_plan, dict):
+            raise ValueError("出题难度比例配置无效")
+        difficulty_plan: dict[str, int] = {}
+        for difficulty in AUTHOR_DIFFICULTIES:
+            raw_weight = raw_difficulty_plan.get(difficulty, 0)
+            if isinstance(raw_weight, bool) or not isinstance(raw_weight, (int, str)):
+                raise ValueError(f"{difficulty}难度比例无效")
+            try:
+                weight = int(raw_weight)
+            except ValueError as exc:
+                raise ValueError(f"{difficulty}难度比例无效") from exc
+            if not 0 <= weight <= 100:
+                raise ValueError("难度比例必须是 0-100")
+            if weight:
+                difficulty_plan[difficulty] = weight
+        if not difficulty_plan:
+            raise ValueError("至少启用一种出题难度")
+        if sum(difficulty_plan.values()) != 100:
+            raise ValueError("启用难度的比例合计必须等于 100%")
         raw_batch_size = incoming["author_batch_size"]
         if isinstance(raw_batch_size, bool) or not isinstance(raw_batch_size, (int, str)):
             raise ValueError("author_batch_size 配置无效")
@@ -1460,7 +1542,8 @@ class ConsoleData:
             "CC_SWITCH_API_KEY": values["api_key"],
             "CC_USR_SUBMITTER": values["submitter"],
             "CC_GITHUB_TOKEN": github_token,
-            "CC_AUTHOR_DIFFICULTY": author_difficulty,
+            "CC_AUTHOR_DIFFICULTY": next(iter(difficulty_plan)),
+            "CC_AUTHOR_DIFFICULTY_WEIGHTS": json.dumps(difficulty_plan, ensure_ascii=False, separators=(",", ":")),
             "CC_AUTHOR_BATCH_SIZE": str(author_batch_size),
             "CC_CLAUDE_DOCKER_IMAGE": values["docker_image"],
             "CC_CLAUDE_DOCKER_COMMAND": values["docker_command"],

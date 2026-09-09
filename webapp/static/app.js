@@ -269,7 +269,7 @@ function renderSettings() {
   $("#config-key-hint").textContent = state.config.api_key_hint || "";
   $("#config-github-token").value = "";
   $("#config-github-token-hint").textContent = state.config.github_token_hint || "";
-  $("#config-author-difficulty").value = state.config.author_difficulty || "中等";
+  renderDifficultyWeights(state.config.author_difficulty_weights || { 中等: 100 });
   $("#config-author-batch-size").value = state.config.author_batch_size || 10;
   $("#config-model-mode").value = state.config.model_mode || "local";
   $("#config-docker-image").value = state.config.docker_image || "claude-cli:latest";
@@ -278,6 +278,45 @@ function renderSettings() {
   $("#config-model-concurrency").value = state.config.model_concurrency || 2;
   $("#config-codex-concurrency").value = state.config.codex_concurrency || 2;
   renderNewsFeeds();
+}
+
+function renderDifficultyWeights(weights) {
+  ["中等", "困难", "地狱"].forEach((difficulty) => {
+    const enabled = $(`.difficulty-enabled[data-difficulty="${difficulty}"]`);
+    const input = $(`.difficulty-weight[data-difficulty="${difficulty}"]`);
+    const weight = Number(weights[difficulty] || 0);
+    enabled.checked = weight > 0;
+    input.disabled = !enabled.checked;
+    input.value = weight;
+  });
+  updateDifficultyTotal();
+}
+
+function collectDifficultyWeights() {
+  return Object.fromEntries(["中等", "困难", "地狱"].map((difficulty) => {
+    const enabled = $(`.difficulty-enabled[data-difficulty="${difficulty}"]`).checked;
+    const weight = Number($(`.difficulty-weight[data-difficulty="${difficulty}"]`).value);
+    return [difficulty, enabled ? weight : 0];
+  }));
+}
+
+function updateDifficultyTotal() {
+  const total = Object.values(collectDifficultyWeights()).reduce((sum, value) => sum + value, 0);
+  const element = $("#difficulty-total");
+  element.textContent = `比例合计 ${total}%${total === 100 ? "" : "，保存前需调整为 100%"}`;
+  element.classList.toggle("invalid", total !== 100);
+}
+
+function difficultySummary(count, weights = state.config?.author_difficulty_weights || { 中等: 100 }) {
+  const enabled = ["中等", "困难", "地狱"].filter((difficulty) => Number(weights[difficulty]) > 0);
+  const total = enabled.reduce((sum, difficulty) => sum + Number(weights[difficulty]), 0) || 1;
+  const rows = enabled.map((difficulty, order) => {
+    const raw = count * Number(weights[difficulty]) / total;
+    return { difficulty, count: Math.floor(raw), fraction: raw - Math.floor(raw), order };
+  });
+  let remaining = count - rows.reduce((sum, row) => sum + row.count, 0);
+  [...rows].sort((a, b) => b.fraction - a.fraction || a.order - b.order).slice(0, remaining).forEach((row) => { row.count += 1; });
+  return rows.map((row) => `${row.difficulty} ${row.count} 道（${Math.round(Number(weights[row.difficulty]) / total * 100)}%）`).join("、");
 }
 
 function renderNewsFeeds() {
@@ -724,21 +763,21 @@ function authorPrompt() {
   const business = $("#author-business").value.trim().replace(/\s+/g, " ");
   const technology = $("#author-technology").value.trim().replace(/\s+/g, " ");
   const notes = $("#author-notes").value.trim().replace(/\s+/g, " ");
-  const difficulty = state.config?.author_difficulty || "中等";
+  const difficulty = difficultySummary(Number(count) || 10);
   const mode = selectedAuthorMode();
   if (mode === "derived") {
     const mother = state.mothers.find((item) => String(item.id) === $("#author-mother").value);
     const taskType = $("#author-task-type").value;
     const derivedNotes = $("#author-derived-notes")?.value.trim().replace(/\s+/g, " ") || "";
     const tolerance = $("#author-defect-tolerance")?.value.trim().replace(/\s+/g, " ") || "";
-    return `使用 $cc-usr-question-author 基于母库生成派生题目。\n批次名：${batch}\n题目数量：${count}\n题型：${taskType}\n目标难度：${difficulty}\n母库项目：${mother ? `${mother.title}（ID ${mother.id}，代码路径 ${mother.workspace_path}，Git ${mother.repo_url || "待登记"}，已用 ${mother.use_count} 次）` : "系统自动选择符合规范的母库项目"}\n派生方向：${derivedNotes || "围绕母项目已有业务设计真实的后续工作"}\n可接受的小瑕疵：${tolerance || "允许不影响构建和主要流程的小问题，并记录为可迭代方向"}\n出题要求：根据母项目代码、已登记快照和《项目规范.md》自动生成，不需要额外填写关键词。每道题的 difficulty 字段必须填写为“${difficulty}”。\n严格遵守项目规范和母库引用规则，保留母题关系并完成独立快照与质检，不要启动目标模型。`;
+    return `使用 $cc-usr-question-author 基于母库生成派生题目。\n批次名：${batch}\n题目数量：${count}\n题型：${taskType}\n难度分配：${difficulty}\n母库项目：${mother ? `${mother.title}（ID ${mother.id}，代码路径 ${mother.workspace_path}，Git ${mother.repo_url || "待登记"}，已用 ${mother.use_count} 次）` : "系统自动选择符合规范的母库项目"}\n派生方向：${derivedNotes || "围绕母项目已有业务设计真实的后续工作"}\n可接受的小瑕疵：${tolerance || "允许不影响构建和主要流程的小问题，并记录为可迭代方向"}\n出题要求：根据母项目代码、已登记快照和《项目规范.md》自动生成，不需要额外填写关键词。每道题的 difficulty 字段必须严格按上述题数分配。\n严格遵守项目规范和母库引用规则，保留母题关系并完成独立快照与质检，不要启动目标模型。`;
   }
   const requirements = [
     business && `业务关键词：${business}`,
     technology && `技术关键词：${technology}`,
     notes && `补充要求：${notes}`,
   ].filter(Boolean).join("；") || "<填写出题关键词>";
-  return `使用 $cc-usr-question-author 创建批次。\n批次名：${batch}\n题目数量：${count}\n目标难度：${difficulty}\n出题要求：${requirements}\n所有题目的 difficulty 字段必须填写为“${difficulty}”。严格遵守 项目规范.md。创建完成后运行出题机械质检，不要启动目标模型。`;
+  return `使用 $cc-usr-question-author 创建批次。\n批次名：${batch}\n题目数量：${count}\n难度分配：${difficulty}\n出题要求：${requirements}\n每道题的 difficulty 字段必须严格按上述题数分配。严格遵守 项目规范.md。创建完成后运行出题机械质检，不要启动目标模型。`;
 }
 
 function renderAuthorCommand() {
@@ -953,7 +992,7 @@ $("#settings-form").addEventListener("submit", async (event) => {
         api_key: $("#config-api-key").value,
         submitter: $("#config-submitter").value,
         github_token: $("#config-github-token").value,
-        author_difficulty: $("#config-author-difficulty").value,
+        author_difficulty_weights: collectDifficultyWeights(),
         author_batch_size: Number($("#config-author-batch-size").value),
         model_mode: $("#config-model-mode").value,
         docker_image: $("#config-docker-image").value,
@@ -1007,6 +1046,18 @@ $("#news-feed-list").addEventListener("click", (event) => {
   if (!button) return;
   const row = button.closest(".news-feed-row");
   row?.remove();
+});
+document.querySelectorAll(".difficulty-enabled").forEach((checkbox) => {
+  checkbox.addEventListener("change", () => {
+    const input = $(`.difficulty-weight[data-difficulty="${checkbox.dataset.difficulty}"]`);
+    input.disabled = !checkbox.checked;
+    if (checkbox.checked && Number(input.value) === 0) input.value = 1;
+    if (!checkbox.checked) input.value = 0;
+    updateDifficultyTotal();
+  });
+});
+document.querySelectorAll(".difficulty-weight").forEach((input) => {
+  input.addEventListener("input", updateDifficultyTotal);
 });
 $("#vps-refresh").addEventListener("click", loadVpsNodes);
 $("#vps-node-list").addEventListener("click", (event) => {

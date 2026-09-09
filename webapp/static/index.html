@@ -174,7 +174,15 @@
           <label class="settings-field"><span>API Key <small id="config-key-hint"></small></span><span class="password-field"><input id="config-api-key" name="api_key" type="password" placeholder="留空表示保留现有 Key"><button class="field-icon" id="toggle-api-key" type="button" title="显示 API Key" aria-label="显示 API Key"><i data-lucide="eye"></i></button></span></label>
           <label class="settings-field"><span>提交人</span><input id="config-submitter" name="submitter" required placeholder="真实姓名"></label>
           <label class="settings-field"><span>GitHub / gh Token <small id="config-github-token-hint"></small></span><span class="password-field"><input id="config-github-token" name="github_token" type="password" placeholder="留空表示保留现有 Token"><button class="field-icon" id="toggle-github-token" type="button" title="显示 GitHub Token" aria-label="显示 GitHub Token"><i data-lucide="eye"></i></button></span></label>
-          <label class="settings-field"><span>自动出题难度</span><select id="config-author-difficulty" name="author_difficulty"><option value="中等">中等</option><option value="困难">困难</option><option value="地狱">地狱</option></select></label>
+          <fieldset class="difficulty-config">
+            <legend>自动出题难度比例</legend>
+            <div class="difficulty-rows">
+              <label class="difficulty-row"><span><input class="difficulty-enabled" type="checkbox" data-difficulty="中等" checked>中等</span><span class="ratio-input"><input class="difficulty-weight" type="number" data-difficulty="中等" min="0" max="100" value="100"><small>%</small></span></label>
+              <label class="difficulty-row"><span><input class="difficulty-enabled" type="checkbox" data-difficulty="困难">困难</span><span class="ratio-input"><input class="difficulty-weight" type="number" data-difficulty="困难" min="0" max="100" value="0" disabled><small>%</small></span></label>
+              <label class="difficulty-row"><span><input class="difficulty-enabled" type="checkbox" data-difficulty="地狱">地狱</span><span class="ratio-input"><input class="difficulty-weight" type="number" data-difficulty="地狱" min="0" max="100" value="0" disabled><small>%</small></span></label>
+            </div>
+            <p class="difficulty-total" id="difficulty-total">比例合计 100%</p>
+          </fieldset>
           <label class="settings-field"><span>自动出题每批题数</span><input id="config-author-batch-size" name="author_batch_size" type="number" min="1" max="20" value="10" required></label>
           <label class="settings-field"><span>模型运行方式</span><select id="config-model-mode" name="model_mode"><option value="local">本地 Claude CLI</option><option value="docker">Docker Claude CLI</option></select></label>
           <div class="pipeline-config-fields" aria-label="Claude 流水线配置">

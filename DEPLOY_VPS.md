@@ -28,7 +28,7 @@ docker run --rm ccusr-claude-worker:local claude --version
 python3 tools/pipeline_daemon.py --concurrency 2
 ```
 
-新闻主题默认来自项目内 `tools/news_topics.py` 配置的中国新闻网频道。自动出题每批默认 10 道，可在控制台“运行配置”中调整为 1-20 道。每个成功导出的批次会标记为 `completed`，后续循环不会重复交付。
+新闻主题默认来自项目内 `tools/news_topics.py` 配置的中国新闻网频道。自动出题每批默认 10 道，可在控制台“运行配置”中调整为 1-20 道；中等、困难、地狱难度可多选并按合计 100% 的比例分配。保存后的题数和难度比例会从下一轮自动出题开始生效。每个成功导出的批次会标记为 `completed`，后续循环不会重复交付。
 
 ## systemd 常驻运行
 

@@ -243,17 +243,29 @@ class WebConsoleTests(unittest.TestCase):
                 "api_key": "api-secret",
                 "submitter": "提交人",
                 "github_token": token,
-                "author_difficulty": "中等",
+                "author_difficulty_weights": {"中等": 50, "困难": 30, "地狱": 20},
                 "author_batch_size": 10,
             })
-            self.assertEqual(result["config"]["author_difficulty"], "中等")
+            self.assertEqual(
+                result["config"]["author_difficulty_weights"],
+                {"中等": 50, "困难": 30, "地狱": 20},
+            )
             self.assertEqual(result["config"]["author_batch_size"], 10)
             self.assertEqual(result["config"]["github_token_hint"], "已配置（末尾 7890）")
             self.assertNotIn(token, json.dumps(result["config"], ensure_ascii=False))
             content = (root / ".env").read_text(encoding="utf-8")
             self.assertIn(f'CC_GITHUB_TOKEN="{token}"', content)
-            prompt = ConsoleData.author_prompt("batch", 2, "新闻", "", "", difficulty="中等")
-            self.assertIn("目标难度：中等", prompt)
+            self.assertIn('CC_AUTHOR_DIFFICULTY_WEIGHTS="{\\"中等\\":50,\\"困难\\":30,\\"地狱\\":20}"', content)
+            prompt = ConsoleData.author_prompt(
+                "batch", 10, "新闻", "", "", difficulty={"中等": 50, "困难": 30, "地狱": 20}
+            )
+            self.assertIn("难度分配：中等 5 道（50%）、困难 3 道（30%）、地狱 2 道（20%）", prompt)
+            with self.assertRaisesRegex(ValueError, "合计必须等于 100"):
+                data.update_env({
+                    "base_url": "https://relay.example.com/v1", "model": "claude-test",
+                    "api_key": "", "submitter": "提交人",
+                    "author_difficulty_weights": {"中等": 50, "困难": 20},
+                })
 
     def test_empty_dashboard_includes_zero_summary(self):
         with tempfile.TemporaryDirectory() as directory:
