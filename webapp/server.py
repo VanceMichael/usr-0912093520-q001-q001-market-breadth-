@@ -1396,7 +1396,7 @@ class ConsoleData:
                 online = (datetime.now().astimezone() - datetime.fromisoformat(heartbeat)).total_seconds() <= 15
             except ValueError:
                 pass
-        if normalized in {"start", "resume", "retry", "restart"} and not online:
+        if normalized in {"start", "author_only", "resume", "retry", "restart"} and not online:
             result["started_process"] = self._start_scheduler_process()
             result["message"] = "调度器启动指令已发送"
         return result

@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS scheduler_state (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     desired_state TEXT NOT NULL DEFAULT 'running',
     actual_state TEXT NOT NULL DEFAULT 'stopped',
+    run_mode TEXT NOT NULL DEFAULT 'full',
     phase TEXT NOT NULL DEFAULT 'idle',
     batch_name TEXT NOT NULL DEFAULT '',
     detail TEXT NOT NULL DEFAULT '',
@@ -65,9 +66,12 @@ CREATE INDEX IF NOT EXISTS idx_scheduler_controls_requested
     ON scheduler_controls(id DESC);
 """
 
-VALID_ACTIONS = {"start", "pause", "drain", "stop", "restart", "resume", "retry"}
+VALID_ACTIONS = {
+    "start", "author_only", "pause", "drain", "stop", "restart", "resume", "retry",
+}
 ACTION_DESIRED_STATE = {
     "start": "running",
+    "author_only": "running",
     "resume": "running",
     "retry": "running",
     "pause": "paused",
@@ -97,6 +101,13 @@ class SchedulerStore:
         self.database.parent.mkdir(parents=True, exist_ok=True)
         with closing(self.connect()) as connection:
             connection.executescript(SCHEDULER_SCHEMA)
+            columns = {
+                str(row["name"]) for row in connection.execute("PRAGMA table_info(scheduler_state)")
+            }
+            if "run_mode" not in columns:
+                connection.execute(
+                    "ALTER TABLE scheduler_state ADD COLUMN run_mode TEXT NOT NULL DEFAULT 'full'"
+                )
             timestamp = now()
             connection.execute(
                 "INSERT OR IGNORE INTO scheduler_state(id,updated_at) VALUES(1,?)",
@@ -111,7 +122,7 @@ class SchedulerStore:
 
     def update(self, **values: object) -> dict:
         allowed = {
-            "desired_state", "actual_state", "phase", "batch_name", "detail", "pid",
+            "desired_state", "actual_state", "run_mode", "phase", "batch_name", "detail", "pid",
             "heartbeat_at", "started_at", "last_error", "cycle_count", "restart_count",
             "consecutive_failures",
         }
@@ -195,6 +206,7 @@ class SchedulerStore:
         if action not in VALID_ACTIONS:
             raise ValueError("不支持的调度器控制动作")
         desired = ACTION_DESIRED_STATE[action]
+        requested_mode = "author_only" if action == "author_only" else "full" if action == "start" else ""
         timestamp = now()
         with closing(self.connect()) as connection:
             cursor = connection.execute(
@@ -202,15 +214,23 @@ class SchedulerStore:
                 (action, timestamp),
             )
             connection.execute(
-                "UPDATE scheduler_state SET desired_state=?,updated_at=?,"
-                "last_error=CASE WHEN ? IN ('retry','start','resume') THEN '' ELSE last_error END,"
+                "UPDATE scheduler_state SET desired_state=?,"
+                "run_mode=CASE WHEN ?<>'' THEN ? ELSE run_mode END,updated_at=?,"
+                "last_error=CASE WHEN ? IN ('retry','start','author_only','resume') THEN '' ELSE last_error END,"
                 "consecutive_failures=CASE WHEN ?='retry' THEN 0 ELSE consecutive_failures END WHERE id=1",
-                (desired, timestamp, action, action),
+                (desired, requested_mode, requested_mode, timestamp, action, action),
             )
             connection.commit()
             control_id = int(cursor.lastrowid)
         self.event("control_requested", f"收到控制指令：{action}", details={"control_id": control_id})
-        return {"ok": True, "action": action, "control_id": control_id, "desired_state": desired}
+        state = self.state()
+        return {
+            "ok": True,
+            "action": action,
+            "control_id": control_id,
+            "desired_state": desired,
+            "run_mode": state.get("run_mode", "full"),
+        }
 
     def apply_controls(self, desired_state: str, message: str = "") -> None:
         timestamp = now()

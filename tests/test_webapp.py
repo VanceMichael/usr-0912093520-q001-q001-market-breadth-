@@ -242,6 +242,10 @@ class WebConsoleTests(unittest.TestCase):
                 self.assertEqual(result["desired_state"], "paused")
                 events = data.scheduler_events({"limit": ["10"]})["events"]
                 self.assertEqual(events[-1]["event_type"], "control_requested")
+
+                result = data.scheduler_control("author_only")
+                self.assertEqual(result["run_mode"], "author_only")
+                self.assertEqual(data.scheduler_snapshot()["state"]["run_mode"], "author_only")
             finally:
                 data.shutdown()
 

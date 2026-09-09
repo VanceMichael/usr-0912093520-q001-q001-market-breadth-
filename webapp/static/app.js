@@ -292,6 +292,10 @@ function schedulerPhaseLabel(value) {
   return ({ idle: "等待下一轮", news: "抓取新闻", author: "出题与题目质检", model: "Claude 跑题", delivery: "交付生产", delivery_qc: "交付质检", export: "Excel / JSONL 导出", error: "异常" })[value] || value || "未上报";
 }
 
+function schedulerModeLabel(value) {
+  return value === "author_only" ? "只出题+质检" : "完整流水线";
+}
+
 function renderResource(label, percent, detail, warning = 85) {
   const value = Number(percent);
   const known = Number.isFinite(value);
@@ -328,7 +332,7 @@ function renderScheduler() {
   const runtime = snapshot.state || {};
   const online = Boolean(runtime.process_online);
   const status = online ? runtime.actual_state : "stopped";
-  $("#scheduler-overview").innerHTML = `<div class="scheduler-status-line ${escapeHtml(status)}"><div><span class="node-signal ${online ? "online" : ""}"></span><div><strong>${escapeHtml(selected.name)} · ${online ? schedulerStateLabel(runtime.actual_state) : "守护进程离线"}</strong><p>${escapeHtml(schedulerPhaseLabel(runtime.phase))}${runtime.batch_name ? ` · ${escapeHtml(runtime.batch_name)}` : ""} · ${escapeHtml(runtime.detail || "暂无运行详情")}</p></div></div><dl><div><dt>心跳</dt><dd>${runtime.heartbeat_age_seconds === null ? "暂无" : `${runtime.heartbeat_age_seconds} 秒前`}</dd></div><div><dt>PID</dt><dd>${runtime.pid || "-"}</dd></div><div><dt>已完成周期</dt><dd>${runtime.cycle_count || 0}</dd></div><div><dt>连续失败</dt><dd>${runtime.consecutive_failures || 0}</dd></div></dl></div>${runtime.last_error ? `<div class="scheduler-error"><i data-lucide="triangle-alert"></i><span>${escapeHtml(runtime.last_error)}</span></div>` : ""}`;
+  $("#scheduler-overview").innerHTML = `<div class="scheduler-status-line ${escapeHtml(status)}"><div><span class="node-signal ${online ? "online" : ""}"></span><div><strong>${escapeHtml(selected.name)} · ${online ? schedulerStateLabel(runtime.actual_state) : "守护进程离线"}</strong><p>${escapeHtml(schedulerModeLabel(runtime.run_mode))} · ${escapeHtml(schedulerPhaseLabel(runtime.phase))}${runtime.batch_name ? ` · ${escapeHtml(runtime.batch_name)}` : ""} · ${escapeHtml(runtime.detail || "暂无运行详情")}</p></div></div><dl><div><dt>心跳</dt><dd>${runtime.heartbeat_age_seconds === null ? "暂无" : `${runtime.heartbeat_age_seconds} 秒前`}</dd></div><div><dt>PID</dt><dd>${runtime.pid || "-"}</dd></div><div><dt>已完成周期</dt><dd>${runtime.cycle_count || 0}</dd></div><div><dt>连续失败</dt><dd>${runtime.consecutive_failures || 0}</dd></div></dl></div>${runtime.last_error ? `<div class="scheduler-error"><i data-lucide="triangle-alert"></i><span>${escapeHtml(runtime.last_error)}</span></div>` : ""}`;
   const queue = snapshot.queue || {};
   const stats = [["新闻待用", queue.news_ready], ["活跃批次", queue.batches_active], ["待跑题", queue.questions_ready], ["运行中", queue.questions_running], ["已完成题", queue.questions_completed], ["质检记录", queue.deliveries_passed]];
   $("#scheduler-queue").innerHTML = stats.map(([label, value]) => `<div class="scheduler-stat"><span>${label}</span><strong>${value || 0}</strong></div>`).join("");
@@ -342,6 +346,7 @@ function renderScheduler() {
     if (batch.status === "completed") label = "已交付";
     else if (batch.status === "partial") label = "部分交付";
     else if (batch.status === "failed") label = "无可交付题目";
+    else if (batch.status === "ready") label = "出题质检完成";
     else if (passed) label = "交付质检中";
     else if (Number(batch.records)) label = "交付生产中";
     else if (Number(batch.running)) label = "Claude 跑题中";
@@ -451,7 +456,8 @@ async function controlScheduler(action) {
   const execute = async () => {
     const path = selected.kind === "local" ? "/api/scheduler/control" : `/api/vps-nodes/${selected.id}/scheduler/control`;
     const result = await api(path, { method: "POST", body: JSON.stringify({ action }) });
-    toast(result.message || `已发送${schedulerStateLabel(result.desired_state)}指令`);
+    const fallback = action === "author_only" ? "已切换为只出题+质检模式" : `已发送${schedulerStateLabel(result.desired_state)}指令`;
+    toast(result.message || fallback);
     await loadSchedulers({ quiet: true });
   };
   if (action === "stop") {

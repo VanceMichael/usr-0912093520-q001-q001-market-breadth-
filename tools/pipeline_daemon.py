@@ -308,6 +308,84 @@ def create_batch(database: Path, codex: str, topic: dict, batch: str, log: Path,
     return run_command(codex_command(codex, prompt), PROJECT_ROOT, log, timeout, store)
 
 
+def authored_batch_result(database: Path, batch: str, expected_count: int) -> tuple[bool, int, int]:
+    with connect(database.resolve()) as connection:
+        batch_row = connection.execute(
+            "SELECT id,question_count FROM batches WHERE name=?", (batch,),
+        ).fetchone()
+        if batch_row is None:
+            return False, 0, 0
+        total = int(connection.execute(
+            "SELECT COUNT(*) FROM questions WHERE batch_id=?", (batch_row["id"],),
+        ).fetchone()[0])
+        ready = int(connection.execute(
+            "SELECT COUNT(*) FROM questions WHERE batch_id=? AND status='approved' "
+            "AND mechanical_qc='pass' AND qc_decision='pass' "
+            "AND qc_prompt_sha256=prompt_sha256 AND repo_url<>'' "
+            "AND initial_snapshot<>'' AND local_initial_sha<>''",
+            (batch_row["id"],),
+        ).fetchone()[0])
+        complete = (
+            int(batch_row["question_count"]) == expected_count
+            and total == expected_count
+            and ready == expected_count
+        )
+        connection.execute(
+            "UPDATE batches SET status=?,updated_at=? WHERE id=?",
+            ("ready" if complete else "failed", now(), batch_row["id"]),
+        )
+        connection.commit()
+        return complete, total, ready
+
+
+def fail_authored_batch(database: Path, batch: str) -> None:
+    with connect(database.resolve()) as connection:
+        connection.execute(
+            "UPDATE batches SET status='failed',updated_at=? WHERE name=?",
+            (now(), batch),
+        )
+        connection.commit()
+
+
+def create_next_batch(
+    database: Path, args: argparse.Namespace, store: SchedulerStore | None = None,
+) -> tuple[int, str]:
+    topic = claim_topic(database)
+    if topic is None:
+        return 0, ""
+    batch = f"news{datetime.now().strftime('%m%d%H%M%S')}"
+    if store:
+        store.heartbeat(phase="author", batch=batch, detail="Codex 正在生成并质检题目")
+        store.event(
+            "topic_claimed", f"已领取新闻主题：{topic.get('title', '')}",
+            phase="author", batch=batch,
+            details={"article_url": topic.get("article_url", ""), "source_url": topic.get("source_url", "")},
+        )
+    log = args.log_dir.resolve() / f"author-{batch}.log"
+    try:
+        code = create_batch(database, args.codex, topic, batch, log, args.agent_timeout, store)
+    except Exception:
+        fail_authored_batch(database, batch)
+        release_topic(database, topic["id"], "new")
+        raise
+    if code == 0:
+        complete, total, ready = authored_batch_result(database, batch, author_batch_size())
+        release_topic(database, topic["id"], "used", batch)
+        if not complete:
+            if store:
+                store.event(
+                    "author_validation_failed",
+                    f"出题结果未通过调度门禁：实际 {total} 道，可运行 {ready} 道",
+                    level="error", phase="author", batch=batch,
+                    details={"total": total, "ready": ready, "expected": author_batch_size()},
+                )
+            return 1, batch
+    else:
+        fail_authored_batch(database, batch)
+        release_topic(database, topic["id"], "new")
+    return code, batch
+
+
 def pipeline_batch_timeout(
     question_count: int, model_concurrency: int, codex_concurrency: int,
     worker_timeout: int, agent_timeout: int, max_attempts: int,
@@ -377,30 +455,23 @@ def cycle(args: argparse.Namespace, store: SchedulerStore | None = None) -> tupl
         if store:
             store.heartbeat(phase="idle", batch="", detail="手动任务运行中，自动调度暂不接单")
         return 0, ""
+    run_mode = str(
+        (store.state().get("run_mode") if store else getattr(args, "run_mode", "full")) or "full"
+    )
+    if run_mode == "author_only":
+        return create_next_batch(database, args, store)
     for existing_batch in active_batches(database):
         if run_batch(database, args, existing_batch, store):
             return 1, existing_batch
     created_batch = ""
     if not active_batches(database) and count_ready(database) < args.ready_watermark:
-        topic = claim_topic(database)
-        if topic:
-            batch = f"news{datetime.now().strftime('%m%d%H%M%S')}"
-            created_batch = batch
-            if store:
-                store.heartbeat(phase="author", batch=batch, detail="Codex 正在生成并质检题目")
-                store.event(
-                    "topic_claimed", f"已领取新闻主题：{topic.get('title', '')}",
-                    phase="author", batch=batch,
-                    details={"article_url": topic.get("article_url", ""), "source_url": topic.get("source_url", "")},
-                )
-            log = args.log_dir.resolve() / f"author-{batch}.log"
-            code = create_batch(database, args.codex, topic, batch, log, args.agent_timeout, store)
-            release_topic(database, topic["id"], "used" if code == 0 else "new", batch if code == 0 else "")
-            if code:
-                return code, batch
-            run_code = run_batch(database, args, batch, store)
+        code, created_batch = create_next_batch(database, args, store)
+        if code:
+            return code, created_batch
+        if created_batch:
+            run_code = run_batch(database, args, created_batch, store)
             if run_code:
-                return run_code, batch
+                return run_code, created_batch
     return 0, created_batch
 
 

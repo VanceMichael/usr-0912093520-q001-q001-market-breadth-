@@ -1,12 +1,15 @@
 import os
 import tempfile
 import time
+from argparse import Namespace
 from pathlib import Path
 from unittest import mock
 
 from tools.pipeline_daemon import (
     active_batches,
+    authored_batch_result,
     cleanup_logs,
+    cycle,
     create_batch,
     difficulty_distribution,
     difficulty_plan,
@@ -114,3 +117,66 @@ def test_batch_timeout_scales_with_question_waves_and_delivery_pool() -> None:
         agent_timeout=3600,
         max_attempts=2,
     ) == 40200
+
+
+def test_author_only_cycle_creates_batch_without_running_model_pipeline() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        database = root / "production.sqlite3"
+        with connect(database) as connection:
+            connection.execute(
+                "INSERT INTO news_topics(source_url,article_url,title,topic_hash,status,created_at,updated_at) "
+                "VALUES('https://news.example','https://news.example/1','topic','hash','new','now','now')"
+            )
+            connection.commit()
+        args = Namespace(
+            db=database, env_file=root / ".env", dynamic_feeds=False, feeds=[],
+            feed_timeout=1, concurrency=2, codex_concurrency=1,
+            worker_image="image", run_mode="author_only", log_dir=root / "runs" / "daemon",
+            agent_timeout=60, codex="codex", ready_watermark=4,
+        )
+        with mock.patch("tools.pipeline_daemon.ingest", return_value=(0, [])), mock.patch(
+            "tools.pipeline_daemon.create_batch", return_value=0
+        ) as author, mock.patch(
+            "tools.pipeline_daemon.authored_batch_result", return_value=(True, 10, 10)
+        ), mock.patch("tools.pipeline_daemon.run_batch") as run_batch:
+            code, batch = cycle(args)
+        assert code == 0
+        assert batch.startswith("news")
+        author.assert_called_once()
+        run_batch.assert_not_called()
+        with connect(database) as connection:
+            topic = connection.execute("SELECT status,used_batch FROM news_topics").fetchone()
+        assert tuple(topic) == ("used", batch)
+
+
+def test_authored_batch_must_have_every_question_ready() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        database = root / "production.sqlite3"
+        with connect(database) as connection:
+            connection.execute(
+                "INSERT INTO batches(name,folder_path,markdown_path,question_count,created_at,updated_at) "
+                "VALUES('batch',?,?,2,'now','now')",
+                (str(root / "batch"), str(root / "batch.md")),
+            )
+            batch_id = connection.execute("SELECT id FROM batches").fetchone()[0]
+            for number, status in ((1, "approved"), (2, "draft")):
+                connection.execute(
+                    "INSERT INTO questions(batch_id,question_no,task_id,folder_name,folder_path,title,prompt,"
+                    "prompt_sha256,task_type,difficulty,languages,repo_url,initial_snapshot,local_initial_sha,"
+                    "reproducibility,mechanical_qc,qc_decision,qc_prompt_sha256,status,created_at,updated_at) "
+                    "VALUES(?,?,?,?,?,'title','prompt','hash','0-1 代码生成','中等','Python',"
+                    "'https://github.com/org/repo','https://github.com/org/repo/commit/sha','sha',"
+                    "'无外部依赖','pass','pass','hash',?,'now','now')",
+                    (batch_id, number, f"task-{number}", f"q{number}", str(root / f"q{number}"), status),
+                )
+            connection.commit()
+        assert authored_batch_result(database, "batch", 2) == (False, 2, 1)
+        with connect(database) as connection:
+            assert connection.execute("SELECT status FROM batches").fetchone()[0] == "failed"
+            connection.execute("UPDATE questions SET status='approved'")
+            connection.commit()
+        assert authored_batch_result(database, "batch", 2) == (True, 2, 2)
+        with connect(database) as connection:
+            assert connection.execute("SELECT status FROM batches").fetchone()[0] == "ready"
