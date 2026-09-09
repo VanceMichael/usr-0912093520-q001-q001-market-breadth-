@@ -2,6 +2,8 @@
 
 Check every record and correct every supported noncompliance before finalizing the batch.
 
+发现即处理：任何错误、警告、缺失字段、证据冲突或链路不一致都要在当前质检任务中立即核对、修正并复检。不能只把问题列在报告里，不能等导出阶段再处理，也不能在仍有问题时写入“质检通过”。
+
 ## Required export fields
 
 - `User Prompt` is the exact prompt for this turn, not a summary. First-turn text matches the stored question. For later turns, compare byte-for-byte with that turn's user event in the original JSONL; `继续` stays `继续` and must never be replaced with the session's first prompt.
@@ -26,5 +28,12 @@ Check every record and correct every supported noncompliance before finalizing t
 - Scores and descriptions do not contradict each other or omit an obvious issue visible in the evidence.
 - Descriptions contain no evaluator self-reference, model-performance wording, generation-process wording, scoring/QC language, fixed element labels, stock openings, arrows, placeholders, or verbatim reuse across dimensions. They do not read like translated or mechanically assembled prose.
 - Internal provenance remains truthful. Corrections never change `human_authored` or claim a human action that did not occur.
+
+## Repair loop
+
+1. 看到首个错误或警告后，先定位对应 `record_id` 和字段，再读取规定的权威来源。
+2. 能从证据恢复的字段立即写入临时修正 JSON，并执行 `--fixes`。每项修正必须记录原因和 before/after；不能为了让检查变绿而猜值或改动无关字段。
+3. 修正命令结束后马上重新执行整批校验。若仍有问题、出现新问题或命令返回非零，继续下一轮修正，不得执行 `--finalize`。
+4. 只有在同一批次最新报告同时满足 `errors=[]` 和 `warnings=[]` 后，才允许 finalize。若证据确实缺失，保持未通过并明确缺少哪份来源。
 
 Use the stored question/run metadata for inherited fields and inspect the matched session or workspace only when a judgment field needs correction. Record the reason and exact before/after values for every change.
