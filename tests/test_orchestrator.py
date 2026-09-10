@@ -303,6 +303,15 @@ class OrchestratorTest(unittest.TestCase):
             heartbeat.assert_called_once()
             stop.assert_called_once_with("container")
 
+    def test_run_heartbeat_closes_database_connection(self):
+        connection = mock.Mock()
+        with mock.patch.object(orchestrator, "connect", return_value=connection):
+            orchestrator.update_run_heartbeat(Path("production.sqlite3"), 7, "run-1")
+
+        connection.execute.assert_called_once()
+        connection.commit.assert_called_once()
+        connection.close.assert_called_once()
+
     def test_exhausted_question_is_blocked_without_another_container(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

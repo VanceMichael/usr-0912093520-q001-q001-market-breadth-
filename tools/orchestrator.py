@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 from collections import deque
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -284,7 +285,7 @@ def retry_delay_seconds(failure_number: int, base: int, maximum: int) -> int:
 
 def update_run_heartbeat(db: Path, question_id: int, run_id: str) -> None:
     try:
-        with connect(db) as connection:
+        with closing(connect(db)) as connection:
             connection.execute(
                 "UPDATE runs SET heartbeat_at=? WHERE batch_run_id=? AND question_id=?",
                 (now(), run_id, question_id),
@@ -376,7 +377,7 @@ def run_one(
     trajectory_root.mkdir(parents=True, exist_ok=True)
     worker_env = task_root / f".{run_id}.env"
     container_name = f"ccusr-{task_id}-{secrets.token_hex(2)}"
-    with connect(db) as connection:
+    with closing(connect(db)) as connection:
         timestamp = now()
         connection.execute(
             "INSERT INTO runs(question_id,batch_run_id,launched_at,codex_version,"
@@ -399,7 +400,7 @@ def run_one(
     def fail_setup(message: str) -> tuple[str, int, str]:
         finished = now()
         classification = classify_failure("failed", f"failed before worker launch: {message}")
-        with connect(db) as connection:
+        with closing(connect(db)) as connection:
             connection.execute(
                 "UPDATE runs SET status='failed',finished_at=?,exit_code=78,error_message=?,"
                 "failure_kind=?,retryable=? "
@@ -434,7 +435,7 @@ def run_one(
         missing = [key for key in required if not env_values.get(key)]
         if missing:
             raise ValueError("missing worker configuration: " + ", ".join(missing))
-        with connect(db) as connection:
+        with closing(connect(db)) as connection:
             connection.execute(
                 "UPDATE runs SET model=? WHERE batch_run_id=? AND question_id=?",
                 (env_values["CC_SWITCH_MODEL"], run_id, row["id"]),
@@ -502,7 +503,7 @@ def run_one(
                     error = f"effective trajectory gate rejected run: {exc}"
                 else:
                     status, error = "succeeded", ""
-                    with connect(db) as connection:
+                    with closing(connect(db)) as connection:
                         connection.execute(
                             "UPDATE runs SET session_id=? WHERE batch_run_id=? AND question_id=?",
                             (evidence.session_id, run_id, row["id"]),
@@ -520,7 +521,7 @@ def run_one(
         if status == "succeeded"
         else classify_failure(status, error, locals().get("stream_diagnostics", ""))
     )
-    with connect(db) as connection:
+    with closing(connect(db)) as connection:
         connection.execute(
             "UPDATE runs SET status=?,finished_at=?,exit_code=?,error_message=?,heartbeat_at=?,"
             "failure_kind=?,retryable=? "
@@ -540,7 +541,7 @@ def run_one(
 
 def failed_attempts(db: Path, question_id: int) -> int:
     """Count model/content attempts; transient gateway failures have a separate budget."""
-    with connect(db) as connection:
+    with closing(connect(db)) as connection:
         return int(connection.execute(
             "SELECT COUNT(*) FROM runs WHERE question_id=? AND status IN ('failed','timeout') "
             "AND COALESCE(failure_kind,'')!='transient_gateway'",
@@ -549,7 +550,7 @@ def failed_attempts(db: Path, question_id: int) -> int:
 
 
 def gateway_failed_attempts(db: Path, question_id: int) -> int:
-    with connect(db) as connection:
+    with closing(connect(db)) as connection:
         return int(connection.execute(
             "SELECT COUNT(*) FROM runs WHERE question_id=? AND status='failed' "
             "AND failure_kind='transient_gateway'",
@@ -558,7 +559,7 @@ def gateway_failed_attempts(db: Path, question_id: int) -> int:
 
 
 def latest_failure(db: Path, question_id: int, fallback: str) -> FailureClassification:
-    with connect(db) as connection:
+    with closing(connect(db)) as connection:
         row = connection.execute(
             "SELECT status,error_message,failure_kind,retryable FROM runs "
             "WHERE question_id=? AND status IN ('failed','timeout') ORDER BY id DESC LIMIT 1",
@@ -573,7 +574,7 @@ def latest_failure(db: Path, question_id: int, fallback: str) -> FailureClassifi
 
 
 def record_retry_delay(db: Path, question_id: int, seconds: int) -> None:
-    with connect(db) as connection:
+    with closing(connect(db)) as connection:
         connection.execute(
             "UPDATE runs SET retry_delay_seconds=? WHERE id=("
             "SELECT id FROM runs WHERE question_id=? ORDER BY id DESC LIMIT 1)",
@@ -583,7 +584,7 @@ def record_retry_delay(db: Path, question_id: int, seconds: int) -> None:
 
 
 def has_unsuccessful_attempt(db: Path, question_id: int) -> bool:
-    with connect(db) as connection:
+    with closing(connect(db)) as connection:
         return connection.execute(
             "SELECT 1 FROM runs WHERE question_id=? "
             "AND status IN ('failed','timeout','interrupted') LIMIT 1",
@@ -592,7 +593,7 @@ def has_unsuccessful_attempt(db: Path, question_id: int) -> bool:
 
 
 def block_question(db: Path, question_id: int) -> None:
-    with connect(db) as connection:
+    with closing(connect(db)) as connection:
         connection.execute(
             "UPDATE questions SET status='blocked',updated_at=? WHERE id=?",
             (now(), question_id),
@@ -700,7 +701,7 @@ def run_codex(codex: str, prompt: str, log_path: Path, timeout: int) -> int:
 
 
 def record_counts(db: Path, question_id: int) -> tuple[int, int]:
-    with connect(db) as connection:
+    with closing(connect(db)) as connection:
         row = connection.execute(
             "SELECT COUNT(*) AS total,"
             "SUM(CASE WHEN delivery_qc_passed=1 AND delivery_qc_note='质检通过' THEN 1 ELSE 0 END) AS passed "
@@ -711,7 +712,7 @@ def record_counts(db: Path, question_id: int) -> tuple[int, int]:
 
 
 def delivery_needed(db: Path, row: sqlite3.Row) -> bool:
-    with connect(db) as connection:
+    with closing(connect(db)) as connection:
         succeeded = connection.execute(
             "SELECT 1 FROM runs WHERE question_id=? AND status='succeeded' LIMIT 1",
             (row["id"],),
@@ -723,7 +724,7 @@ def delivery_needed(db: Path, row: sqlite3.Row) -> bool:
 def release_question_lease(db: Path, question_id: int, kind: str, owner: str) -> None:
     if kind not in {"model", "delivery"}:
         raise ValueError("unknown lease kind")
-    with connect(db) as connection:
+    with closing(connect(db)) as connection:
         connection.execute(
             f"UPDATE questions SET {kind}_lease_owner='',{kind}_lease_expires_at='' "
             f"WHERE id=? AND {kind}_lease_owner=?",
@@ -733,7 +734,7 @@ def release_question_lease(db: Path, question_id: int, kind: str, owner: str) ->
 
 
 def clear_question_leases(db: Path) -> None:
-    with connect(db) as connection:
+    with closing(connect(db)) as connection:
         connection.execute(
             "UPDATE questions SET model_lease_owner='',model_lease_expires_at='',"
             "delivery_lease_owner='',delivery_lease_expires_at=''"
@@ -758,7 +759,7 @@ def _claim_rows(
     expires = (datetime.now().astimezone() + timedelta(seconds=max(60, lease_seconds))).isoformat(
         timespec="seconds"
     )
-    with connect(db) as connection:
+    with closing(connect(db)) as connection:
         connection.execute("BEGIN IMMEDIATE")
         if kind == "model":
             rows = connection.execute(
@@ -813,7 +814,7 @@ def _claim_rows(
 
 
 def active_batch_names(db: Path) -> list[str]:
-    with connect(db) as connection:
+    with closing(connect(db)) as connection:
         return [
             str(row["name"])
             for row in connection.execute(
@@ -824,7 +825,7 @@ def active_batch_names(db: Path) -> list[str]:
 
 
 def solo2_pending_available(db: Path, max_attempts: int) -> bool:
-    with connect(db) as connection:
+    with closing(connect(db)) as connection:
         return connection.execute(
             "SELECT 1 FROM records r LEFT JOIN solo2_submissions s ON s.record_id=r.record_id "
             "WHERE r.delivery_qc_passed=1 AND r.delivery_qc_note='质检通过' "
@@ -840,7 +841,7 @@ def solo2_pending_available(db: Path, max_attempts: int) -> bool:
 
 
 def batch_ready_to_finalize(db: Path, batch: str) -> bool:
-    with connect(db) as connection:
+    with closing(connect(db)) as connection:
         rows = connection.execute(
             "SELECT q.status,q.maintenance_mode,COUNT(r.id) AS records,"
             "SUM(CASE WHEN r.delivery_qc_passed=1 AND r.delivery_qc_note='质检通过' THEN 1 ELSE 0 END) passed "
@@ -897,7 +898,7 @@ def deliver_one(
 def finalize_batch(
     db: Path, batch: str, codex: str, data_root: Path, timeout: int,
 ) -> tuple[int, str]:
-    with connect(db) as connection:
+    with closing(connect(db)) as connection:
         batch_row = connection.execute(
             "SELECT id,folder_path,status FROM batches WHERE name=?", (batch,),
         ).fetchone()
@@ -913,7 +914,7 @@ def finalize_batch(
             (batch_row["id"],),
         ).fetchall()
     if not states:
-        with connect(db) as connection:
+        with closing(connect(db)) as connection:
             connection.execute(
                 "UPDATE batches SET status='failed',updated_at=? WHERE name=?", (now(), batch),
             )
@@ -934,7 +935,7 @@ def finalize_batch(
     if not terminal:
         return 0, "batch still has pending questions"
     if not eligible:
-        with connect(db) as connection:
+        with closing(connect(db)) as connection:
             connection.execute(
                 "UPDATE batches SET status='failed',updated_at=? WHERE name=?", (now(), batch),
             )
@@ -955,7 +956,7 @@ def finalize_batch(
     if code or not set(folder.glob("CC_Codex*.xlsx")) - before or len(new_trajectories) < len(eligible):
         return code or 1, "export did not create a complete delivery package"
     status = "completed" if len(eligible) == len(states) else "partial"
-    with connect(db) as connection:
+    with closing(connect(db)) as connection:
         connection.execute(
             "UPDATE batches SET status=?,updated_at=? WHERE name=?", (status, now(), batch),
         )
@@ -977,7 +978,7 @@ def run_delivery_pipeline(args: argparse.Namespace) -> int:
     gateway_circuit_cooldown = getattr(
         args, "gateway_circuit_cooldown", DEFAULT_GATEWAY_CIRCUIT_COOLDOWN,
     )
-    with connect(database) as connection:
+    with closing(connect(database)) as connection:
         rows = question_rows(connection, args.batch)
         candidates = []
         for row in rows:
@@ -1074,7 +1075,7 @@ def run_delivery_pipeline(args: argparse.Namespace) -> int:
     print(message, flush=True)
     if code:
         errors.append(message)
-    with connect(database) as connection:
+    with closing(connect(database)) as connection:
         status = connection.execute(
             "SELECT status FROM batches WHERE name=?", (args.batch,),
         ).fetchone()
