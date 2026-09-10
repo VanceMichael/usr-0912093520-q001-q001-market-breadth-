@@ -258,6 +258,9 @@ def load_runtime_env(path: Path) -> None:
             "CC_CLAUDE_DOCKER_IMAGE", "CC_CLAUDE_HEARTBEAT_SECONDS",
             "CC_CLAUDE_START_TIMEOUT", "CC_CLAUDE_STALLED_TIMEOUT",
             "CC_PIPELINE_WORKER_TIMEOUT",
+            "CC_GATEWAY_MAX_ATTEMPTS", "CC_GATEWAY_BACKOFF_BASE",
+            "CC_GATEWAY_BACKOFF_MAX", "CC_GATEWAY_CIRCUIT_THRESHOLD",
+            "CC_GATEWAY_CIRCUIT_WINDOW", "CC_GATEWAY_CIRCUIT_COOLDOWN",
         } and value:
             os.environ[key] = value
 
@@ -508,8 +511,13 @@ def create_next_batch(
 def pipeline_batch_timeout(
     question_count: int, model_concurrency: int, codex_concurrency: int,
     worker_timeout: int, agent_timeout: int, max_attempts: int,
+    gateway_max_attempts: int = 0, gateway_backoff_max: int = 0,
 ) -> int:
-    model_budget = math.ceil(question_count / max(1, model_concurrency)) * worker_timeout * max_attempts
+    per_wave = (
+        worker_timeout * (max_attempts + max(0, gateway_max_attempts))
+        + max(0, gateway_max_attempts - 1) * max(0, gateway_backoff_max)
+    )
+    model_budget = math.ceil(question_count / max(1, model_concurrency)) * per_wave
     delivery_budget = math.ceil(question_count / max(1, codex_concurrency)) * agent_timeout * 2
     return max(model_budget, delivery_budget) + agent_timeout + 600
 
@@ -526,6 +534,7 @@ def run_batch(database: Path, args: argparse.Namespace, batch: str, store: Sched
     batch_timeout = pipeline_batch_timeout(
         question_count, args.concurrency, args.codex_concurrency,
         args.worker_timeout, args.agent_timeout, args.max_attempts,
+        args.gateway_max_attempts, args.gateway_backoff_max,
     )
     return run_command(
         [
@@ -540,6 +549,12 @@ def run_batch(database: Path, args: argparse.Namespace, batch: str, store: Sched
             "--codex-concurrency", str(args.codex_concurrency),
             "--agent-timeout", str(args.agent_timeout),
             "--max-attempts", str(args.max_attempts),
+            "--gateway-max-attempts", str(args.gateway_max_attempts),
+            "--gateway-backoff-base", str(args.gateway_backoff_base),
+            "--gateway-backoff-max", str(args.gateway_backoff_max),
+            "--gateway-circuit-threshold", str(args.gateway_circuit_threshold),
+            "--gateway-circuit-window", str(args.gateway_circuit_window),
+            "--gateway-circuit-cooldown", str(args.gateway_circuit_cooldown),
             "--timeout", str(args.worker_timeout),
         ],
         PROJECT_ROOT,
@@ -567,6 +582,18 @@ def cycle(args: argparse.Namespace, store: SchedulerStore | None = None) -> tupl
         )
     except ValueError:
         pass
+    for field, key in (
+        ("gateway_max_attempts", "CC_GATEWAY_MAX_ATTEMPTS"),
+        ("gateway_backoff_base", "CC_GATEWAY_BACKOFF_BASE"),
+        ("gateway_backoff_max", "CC_GATEWAY_BACKOFF_MAX"),
+        ("gateway_circuit_threshold", "CC_GATEWAY_CIRCUIT_THRESHOLD"),
+        ("gateway_circuit_window", "CC_GATEWAY_CIRCUIT_WINDOW"),
+        ("gateway_circuit_cooldown", "CC_GATEWAY_CIRCUIT_COOLDOWN"),
+    ):
+        try:
+            setattr(args, field, max(1, int(os.environ.get(key, getattr(args, field)))))
+        except ValueError:
+            pass
     args.worker_image = os.environ.get("CC_CLAUDE_DOCKER_IMAGE", args.worker_image).strip() or args.worker_image
     if store:
         store.heartbeat(phase="news", batch="", detail="正在抓取新闻主题")
@@ -612,6 +639,12 @@ def main() -> int:
     parser.add_argument("--concurrency", type=int, default=2)
     parser.add_argument("--codex-concurrency", type=int, default=1)
     parser.add_argument("--max-attempts", type=int, default=2)
+    parser.add_argument("--gateway-max-attempts", type=int, default=3)
+    parser.add_argument("--gateway-backoff-base", type=int, default=30)
+    parser.add_argument("--gateway-backoff-max", type=int, default=300)
+    parser.add_argument("--gateway-circuit-threshold", type=int, default=2)
+    parser.add_argument("--gateway-circuit-window", type=int, default=120)
+    parser.add_argument("--gateway-circuit-cooldown", type=int, default=180)
     parser.add_argument("--worker-timeout", type=int, default=3600)
     parser.add_argument("--ready-watermark", type=int, default=4)
     parser.add_argument("--feed-timeout", type=int, default=20)

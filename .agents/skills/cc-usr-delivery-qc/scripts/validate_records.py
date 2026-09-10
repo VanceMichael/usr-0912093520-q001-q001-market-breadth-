@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import ntpath
 import posixpath
@@ -29,6 +30,10 @@ FIXABLE_FIELDS = frozenset(EXPORT_KEYS) - {"turn_no", "delivery_qc_note"}
 SKILL_PATH_RE = re.compile(
     r"(?i)(?:\.agents[/\\]+skills[/\\]+|\.claude[/\\]+skills[/\\]+|"
     r"\.codex[/\\]+skills[/\\]+|[/\\]skills[/\\][^\s'\"`]+[/\\]SKILL\.md)"
+)
+CONFIG_PATH_RE = re.compile(
+    r"(?i)(?:CLAUDE\.md|AGENTS\.md|\.claude[/\\]+settings(?:\.local)?\.json|"
+    r"\.codex[/\\]+config\.toml)"
 )
 
 
@@ -63,6 +68,29 @@ def _event_user_prompt(event: dict) -> str:
             if isinstance(block, dict) and block.get("type") == "text"
         )
     return ""
+
+
+def _event_prompt_id(event: dict) -> str:
+    return str(event.get("promptId") or event.get("prompt_id") or event.get("uuid") or "")
+
+
+def _assistant_has_text(event: dict) -> bool:
+    if event.get("type") != "assistant":
+        return False
+    message = event.get("message")
+    if not isinstance(message, dict) or message.get("role") != "assistant":
+        return False
+    content = message.get("content")
+    if isinstance(content, str):
+        return bool(content.strip())
+    if isinstance(content, list):
+        return any(
+            isinstance(block, dict)
+            and block.get("type") == "text"
+            and str(block.get("text") or "").strip()
+            for block in content
+        )
+    return False
 
 
 def _path_is_within(path_text: str, allowed: tuple[Path, ...], workspace: Path) -> bool:
@@ -104,58 +132,162 @@ def _trajectory_events(path: Path) -> list[dict]:
     return events
 
 
+def _trajectory_root(source_row: sqlite3.Row) -> tuple[Path, bool]:
+    configured = str(source_row["source_trajectory_root"] or "").strip()
+    if configured:
+        return Path(configured).resolve(), True
+    batch_run_id = str(source_row["source_batch_run_id"] or "").strip()
+    task_id = str(source_row["task_id"] or "").strip()
+    batch_folder = Path(str(source_row["batch_folder"])).resolve()
+    if batch_run_id and task_id:
+        isolated = batch_folder / ".runs" / batch_run_id / task_id / "claude-home" / "projects"
+        if isolated.is_dir():
+            return isolated.resolve(), True
+    return batch_folder, False
+
+
+def _named_trajectory_candidates(root: Path, name: str, recursive: bool) -> list[Path]:
+    if not root.is_dir():
+        return []
+    paths = root.rglob("*.jsonl") if recursive else root.glob("*.jsonl")
+    return sorted(
+        path.resolve() for path in paths
+        if path.is_file() and (path.name == name or path.name.endswith("_" + name))
+    )
+
+
 def trajectory_integrity_issues(record: dict, source_row: sqlite3.Row) -> list[str]:
-    """Reject target sessions that loaded instructions outside their workspace."""
+    """Require one exact, complete trajectory from the record's successful run."""
     trajectory_name = str(record.get("trajectory_file") or "")
     if not trajectory_name.endswith(".jsonl") or "/" in trajectory_name or "\\" in trajectory_name:
         return []
-    root_value = str(source_row["source_trajectory_root"] or "").strip()
-    roots = [Path(root_value).resolve()] if root_value else [Path(str(source_row["batch_folder"])).resolve()]
-    candidates: list[tuple[Path, list[dict]]] = []
-    for root in roots:
-        if not root.is_dir():
-            continue
-        for path in root.rglob("*.jsonl"):
-            if path.name != trajectory_name and not path.name.endswith("_" + trajectory_name):
-                continue
-            if not path.is_file():
-                continue
-            try:
-                events = _trajectory_events(path)
-            except (OSError, ValueError):
-                continue
-            if any(
-                _event_session_id(event) == str(record.get("session_id"))
-                and _event_user_prompt(event).strip() == str(record.get("user_prompt", "")).strip()
-                for event in events
-            ):
-                candidates.append((path, events))
-    if not candidates:
-        return []
-
     record_id = str(record.get("record_id") or "<unknown>")
+    root, recursive = _trajectory_root(source_row)
+    paths = _named_trajectory_candidates(root, trajectory_name, recursive)
+    if not paths:
+        return [f"{record_id}: original trajectory not found in authoritative root: {root}"]
+    if len(paths) > 1:
+        return [
+            f"{record_id}: trajectory file is ambiguous under {root}: "
+            + ", ".join(str(path) for path in paths)
+        ]
+    path = paths[0]
+    try:
+        events = _trajectory_events(path)
+    except (OSError, ValueError) as exc:
+        return [f"{record_id}: original trajectory is unreadable or invalid: {exc}"]
+    if not events:
+        return [f"{record_id}: original trajectory is empty: {path}"]
+
+    session_id = str(record.get("session_id") or "")
+    turn_id = str(record.get("turn_id") or "")
+    user_prompt = str(record.get("user_prompt") or "")
+    exact_matches = [
+        index for index, event in enumerate(events)
+        if _event_session_id(event) == session_id
+        and _event_prompt_id(event) == turn_id
+        and _event_user_prompt(event) == user_prompt
+    ]
+    if len(exact_matches) != 1:
+        return [
+            f"{record_id}: trajectory must contain exactly one exact "
+            f"SessionID + PromptID + User Prompt match, found {len(exact_matches)} in {path}"
+        ]
+    session_events = [event for event in events if _event_session_id(event) in {"", session_id}]
+    issues: list[str] = []
+    foreign_sessions = sorted({
+        _event_session_id(event) for event in events
+        if _event_session_id(event) not in {"", session_id}
+    })
+    if foreign_sessions:
+        issues.append(
+            f"{record_id}: trajectory contains events from other SessionIDs: "
+            + ", ".join(foreign_sessions)
+        )
+    real_turns = [
+        (index, event) for index, event in enumerate(events)
+        if _event_session_id(event) in {"", session_id}
+        and _event_user_prompt(event) and _event_prompt_id(event)
+    ]
+    matched_index = exact_matches[0]
+    ordinal = next((number for number, (index, _event) in enumerate(real_turns, 1) if index == matched_index), None)
+    if ordinal is not None and ordinal != record.get("turn_no"):
+        issues.append(
+            f"{record_id}: turn_no {record.get('turn_no')} does not match trajectory user-turn order {ordinal}"
+        )
+
+    calls: Counter[str] = Counter()
+    results: Counter[str] = Counter()
+    call_positions: dict[str, list[int]] = {}
+    result_positions: dict[str, list[int]] = {}
+    for event_index, event in enumerate(session_events):
+        message = event.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use":
+                identifier = str(block.get("id") or "")
+                if identifier:
+                    calls[identifier] += 1
+                    call_positions.setdefault(identifier, []).append(event_index)
+                else:
+                    issues.append(f"{record_id}: trajectory contains a tool call without an id")
+            elif block.get("type") == "tool_result":
+                identifier = str(block.get("tool_use_id") or "")
+                if identifier:
+                    results[identifier] += 1
+                    result_positions.setdefault(identifier, []).append(event_index)
+                else:
+                    issues.append(f"{record_id}: trajectory contains a tool result without tool_use_id")
+    missing_results = sorted((calls - results).elements())
+    orphan_results = sorted((results - calls).elements())
+    if missing_results:
+        issues.append(f"{record_id}: trajectory has tool calls without matching results: " + ", ".join(missing_results[:10]))
+    if orphan_results:
+        issues.append(f"{record_id}: trajectory has tool results without matching calls: " + ", ".join(orphan_results[:10]))
+    duplicate_calls = sorted(identifier for identifier, count in calls.items() if count > 1)
+    duplicate_results = sorted(identifier for identifier, count in results.items() if count > 1)
+    if duplicate_calls or duplicate_results:
+        issues.append(
+            f"{record_id}: trajectory reuses tool identifiers; calls={duplicate_calls[:10]}, results={duplicate_results[:10]}"
+        )
+    out_of_order = sorted(
+        identifier for identifier in calls.keys() & results.keys()
+        if min(result_positions[identifier]) <= min(call_positions[identifier])
+    )
+    if out_of_order:
+        issues.append(f"{record_id}: trajectory has tool results before their calls: " + ", ".join(out_of_order[:10]))
+
+    next_turn_indexes = [index for index, _event in real_turns if index > matched_index]
+    turn_end = next_turn_indexes[0] if next_turn_indexes else len(events)
+    turn_assistant_events = [
+        event for event in events[matched_index + 1:turn_end]
+        if event.get("type") == "assistant"
+    ]
+    if not turn_assistant_events or not _assistant_has_text(turn_assistant_events[-1]):
+        issues.append(f"{record_id}: trajectory turn has no final assistant text response")
+
     folder = Path(str(source_row["question_folder"])).resolve()
     alternate = str(source_row["container_cwd"] or "").strip()
-    allowed = (folder,) + ((Path(alternate),) if alternate.startswith("/") else ())
-    issues: list[str] = []
+    allowed = (folder,) + ((Path(alternate).resolve(),) if alternate.startswith("/") else ())
     seen: set[str] = set()
-    for _path, events in candidates:
-        for event in events:
-            if _event_session_id(event) not in {"", str(record.get("session_id"))}:
+    for event in session_events:
+        message = event.get("message")
+        if not isinstance(message, dict) or not isinstance(message.get("content"), list):
+            continue
+        for block in message["content"]:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
                 continue
-            message = event.get("message")
-            if isinstance(message, dict) and isinstance(message.get("content"), list):
-                for block in message["content"]:
-                    if (
-                        isinstance(block, dict) and block.get("type") == "tool_use"
-                        and str(block.get("name") or "").casefold() in {"skill", "slashcommand"}
-                    ):
-                        key = f"{record_id}: trajectory invoked a Skill tool"
-                        if key not in seen:
-                            seen.add(key)
-                            issues.append(key)
-            for text in _event_strings(event):
-                match = SKILL_PATH_RE.search(text)
+            if str(block.get("name") or "").casefold() in {"skill", "slashcommand"}:
+                key = f"{record_id}: trajectory invoked a Skill tool"
+                if key not in seen:
+                    seen.add(key)
+                    issues.append(key)
+            for text in _event_strings(block.get("input")):
+                match = SKILL_PATH_RE.search(text) or CONFIG_PATH_RE.search(text)
                 if not match:
                     continue
                 marker_start = match.start()
@@ -165,10 +297,8 @@ def trajectory_integrity_issues(record: dict, source_row: sqlite3.Row) -> list[s
                 referenced = text[prefix_start:]
                 if _path_is_within(referenced, allowed, folder):
                     continue
-                key = (
-                    f"{record_id}: trajectory read an external skill path "
-                    f"({text[marker_start:marker_start + 120]})"
-                )
+                kind = "skill" if SKILL_PATH_RE.search(text) else "instruction/config"
+                key = f"{record_id}: trajectory read an external {kind} path ({text[marker_start:marker_start + 120]})"
                 if key not in seen:
                     seen.add(key)
                     issues.append(key)
@@ -211,21 +341,31 @@ def build_report(
         for row in missing_questions
     )
     source_query = (
-        "SELECT r.record_id, r.turn_no, r.user_prompt, r.session_id, r.trajectory_file, "
+        "SELECT r.record_id, r.turn_no, r.user_prompt, r.session_id, r.turn_id, r.trajectory_file, "
         "r.initial_snapshot, r.reproducibility, r.harness, r.harness_version, "
         "r.task_type, r.difficulty, r.languages, q.prompt AS source_prompt, "
         "q.initial_snapshot AS source_snapshot, q.reproducibility AS source_reproducibility, "
         "q.task_type AS source_task_type, q.difficulty AS source_difficulty, "
-        "q.languages AS source_languages, "
+        "q.languages AS source_languages, q.task_id AS task_id, "
+        "(SELECT x.id FROM runs x WHERE x.question_id=q.id AND x.status='succeeded' "
+        " AND x.session_id=r.session_id ORDER BY x.launched_at DESC, x.id DESC LIMIT 1) AS source_run_id, "
         "(SELECT x.session_id FROM runs x WHERE x.question_id=q.id "
+        " AND x.status='succeeded' AND x.session_id=r.session_id "
         " ORDER BY x.launched_at DESC, x.id DESC LIMIT 1) AS source_session_id, "
+        "(SELECT x.batch_run_id FROM runs x WHERE x.question_id=q.id "
+        " AND x.status='succeeded' AND x.session_id=r.session_id "
+        " ORDER BY x.launched_at DESC, x.id DESC LIMIT 1) AS source_batch_run_id, "
         "(SELECT x.harness FROM runs x WHERE x.question_id=q.id "
+        " AND x.status='succeeded' AND x.session_id=r.session_id "
         " ORDER BY x.launched_at DESC, x.id DESC LIMIT 1) AS source_harness, "
         "(SELECT x.harness_version FROM runs x WHERE x.question_id=q.id "
+        " AND x.status='succeeded' AND x.session_id=r.session_id "
         " ORDER BY x.launched_at DESC, x.id DESC LIMIT 1) AS source_harness_version, "
         "(SELECT x.trajectory_root FROM runs x WHERE x.question_id=q.id "
+        " AND x.status='succeeded' AND x.session_id=r.session_id "
         " ORDER BY x.launched_at DESC, x.id DESC LIMIT 1) AS source_trajectory_root, "
         "(SELECT x.container_cwd FROM runs x WHERE x.question_id=q.id "
+        " AND x.status='succeeded' AND x.session_id=r.session_id "
         " ORDER BY x.launched_at DESC, x.id DESC LIMIT 1) AS container_cwd, "
         "q.folder_path AS question_folder, b.folder_path AS batch_folder "
         "FROM records r JOIN questions q ON q.id=r.question_id "
@@ -237,6 +377,11 @@ def build_report(
         source_parameters.extend(sorted(selected_numbers))
     source_rows = connection.execute(source_query, source_parameters).fetchall()
     for row in source_rows:
+        if row["source_run_id"] is None:
+            errors.append(
+                f"{row['record_id']}: session_id is not linked to a succeeded registered run"
+            )
+            continue
         common_fields = {
             "initial_snapshot": "source_snapshot",
             "reproducibility": "source_reproducibility",

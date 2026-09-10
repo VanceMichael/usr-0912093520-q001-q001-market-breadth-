@@ -573,6 +573,12 @@ function renderSettings() {
   $("#config-qc-concurrency").value = state.config.qc_concurrency || 2;
   $("#config-model-concurrency").value = state.config.model_concurrency || 2;
   $("#config-codex-concurrency").value = state.config.codex_concurrency || 2;
+  $("#config-gateway-max-attempts").value = state.config.gateway_max_attempts || 3;
+  $("#config-gateway-backoff-base").value = state.config.gateway_backoff_base || 30;
+  $("#config-gateway-backoff-max").value = state.config.gateway_backoff_max || 300;
+  $("#config-gateway-circuit-threshold").value = state.config.gateway_circuit_threshold || 2;
+  $("#config-gateway-circuit-window").value = state.config.gateway_circuit_window || 120;
+  $("#config-gateway-circuit-cooldown").value = state.config.gateway_circuit_cooldown || 180;
   renderNewsFeeds();
 }
 
@@ -1308,6 +1314,12 @@ $("#settings-form").addEventListener("submit", async (event) => {
         qc_concurrency: Number($("#config-qc-concurrency").value),
         model_concurrency: Number($("#config-model-concurrency").value),
         codex_concurrency: Number($("#config-codex-concurrency").value),
+        gateway_max_attempts: Number($("#config-gateway-max-attempts").value),
+        gateway_backoff_base: Number($("#config-gateway-backoff-base").value),
+        gateway_backoff_max: Number($("#config-gateway-backoff-max").value),
+        gateway_circuit_threshold: Number($("#config-gateway-circuit-threshold").value),
+        gateway_circuit_window: Number($("#config-gateway-circuit-window").value),
+        gateway_circuit_cooldown: Number($("#config-gateway-circuit-cooldown").value),
         news_feeds: collectNewsFeeds(),
       }),
     });

@@ -32,6 +32,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from tools.batch_pipeline import SNAPSHOT_RE, connect, prompt_hash, question_rows  # noqa: E402
 from tools.runtime_environment import docker_info, repair_docker_engine  # noqa: E402
 from tools.text_encoding import read_portable_text  # noqa: E402
+from tools.trajectory_gate import TrajectoryGateError, validate_effective_trajectory  # noqa: E402
 
 
 class PipelineInterrupted(RuntimeError):
@@ -439,9 +440,13 @@ class Pipeline:
         launch_time = timestamp()
         with closing(self.db()) as connection:
             connection.execute(
-                "INSERT INTO runs(question_id,batch_run_id,launched_at,codex_version,model,harness,harness_version,container_cwd,trajectory_root,operating_system) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (question_id, batch_run_id, launch_time, "", config["CC_SWITCH_MODEL"], "Claude Code", model_version, "/workspace", str(trajectory_root), "MacOS/Linux"),
+                "INSERT INTO runs(question_id,batch_run_id,launched_at,codex_version,model,harness,harness_version,container_cwd,trajectory_root,operating_system,status,started_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    question_id, batch_run_id, launch_time, "", config["CC_SWITCH_MODEL"],
+                    "Claude Code", model_version, "/workspace", str(trajectory_root),
+                    "MacOS/Linux", "running", launch_time,
+                ),
             )
             connection.execute("UPDATE questions SET status='running', updated_at=? WHERE id=?", (launch_time, question_id))
             connection.commit()
@@ -520,6 +525,9 @@ class Pipeline:
         finished = timestamp()
         if returncode:
             error = stalled_detail or f"Docker Claude CLI 退出码：{returncode}"
+            self.finish_model_run(
+                question_id, batch_run_id, "failed", returncode, error, finished,
+            )
             self.item(
                 question_id, status="failed", error=error,
                 heartbeat_at=finished, health_status="stalled" if stalled else "failed",
@@ -527,9 +535,30 @@ class Pipeline:
                 finished_at=finished,
             )
             raise RuntimeError(f"{row['task_id']} 模型运行失败：{error}")
-        with closing(self.db()) as connection:
-            connection.execute("UPDATE questions SET status='completed', updated_at=? WHERE id=?", (finished, question_id))
-            connection.commit()
+        try:
+            evidence = validate_effective_trajectory(
+                trajectory_root,
+                str(row["prompt"]),
+                folder,
+                str(row["local_initial_sha"] or "").strip(),
+            )
+        except (OSError, TrajectoryGateError) as exc:
+            error = f"有效轨迹门禁未通过：{exc}"
+            self.finish_model_run(question_id, batch_run_id, "failed", 1, error, finished)
+            self.item(
+                question_id, status="failed", error=error, heartbeat_at=finished,
+                health_status="failed", health_detail=error, finished_at=finished,
+            )
+            raise RuntimeError(f"{row['task_id']} {error}") from exc
+        self.finish_model_run(
+            question_id, batch_run_id, "succeeded", 0, "", finished,
+            evidence.session_id,
+        )
+        self.log(
+            f"题目 {row['task_id']}：有效轨迹门禁通过（assistant "
+            f"{evidence.assistant_messages} 条，工具调用 {evidence.tool_uses} 次，"
+            f"代码变化 {evidence.changed_files} 个文件）"
+        )
         self.item(
             question_id, status="model_completed", heartbeat_at=finished,
             activity_at=finished, health_status="completed",
@@ -575,12 +604,64 @@ class Pipeline:
         finished = timestamp()
         if returncode:
             error = f"本地 Claude CLI 退出码：{returncode}"
+            self.finish_model_run(
+                question_id, self.pipeline_root.name, "failed", returncode, error, finished,
+            )
             self.item(question_id, status="failed", error=error, finished_at=finished, health_status="failed", health_detail=error)
             raise RuntimeError(f"{row['task_id']} 模型运行失败：{error}")
-        with closing(self.db()) as connection:
-            connection.execute("UPDATE questions SET status='completed', updated_at=? WHERE id=?", (finished, question_id))
-            connection.commit()
+        try:
+            evidence = validate_effective_trajectory(
+                trajectory_root,
+                str(row["prompt"]),
+                Path(str(row["folder_path"])).resolve(strict=True),
+                str(row["local_initial_sha"] or "").strip(),
+            )
+        except (OSError, TrajectoryGateError) as exc:
+            error = f"有效轨迹门禁未通过：{exc}"
+            self.finish_model_run(
+                question_id, self.pipeline_root.name, "failed", 1, error, finished,
+            )
+            self.item(
+                question_id, status="failed", error=error, finished_at=finished,
+                health_status="failed", health_detail=error,
+            )
+            raise RuntimeError(f"{row['task_id']} {error}") from exc
+        self.finish_model_run(
+            question_id, self.pipeline_root.name, "succeeded", 0, "", finished,
+            evidence.session_id,
+        )
+        self.log(
+            f"题目 {row['task_id']}：有效轨迹门禁通过（assistant "
+            f"{evidence.assistant_messages} 条，工具调用 {evidence.tool_uses} 次，"
+            f"代码变化 {evidence.changed_files} 个文件）"
+        )
         self.item(question_id, status="model_completed", heartbeat_at=finished, activity_at=finished, health_status="completed", health_detail="本地 Claude CLI 已正常完成", finished_at=finished)
+
+    def finish_model_run(
+        self,
+        question_id: int,
+        batch_run_id: str,
+        status: str,
+        exit_code: int,
+        error: str,
+        finished_at: str,
+        session_id: str = "",
+    ) -> None:
+        question_status = "completed" if status == "succeeded" else "approved"
+        with closing(self.db()) as connection:
+            connection.execute(
+                "UPDATE runs SET status=?,finished_at=?,exit_code=?,error_message=?,"
+                "session_id=?,heartbeat_at=? WHERE question_id=? AND batch_run_id=?",
+                (
+                    status, finished_at, exit_code, error, session_id, finished_at,
+                    question_id, batch_run_id,
+                ),
+            )
+            connection.execute(
+                "UPDATE questions SET status=?,updated_at=? WHERE id=?",
+                (question_status, finished_at, question_id),
+            )
+            connection.commit()
 
     @staticmethod
     def docker_run_health(
@@ -811,7 +892,8 @@ class Pipeline:
         with closing(self.db()) as connection:
             states = connection.execute(
                 "SELECT q.id, q.status, "
-                "(SELECT COUNT(*) FROM runs x WHERE x.question_id=q.id) AS run_count, "
+                "(SELECT COUNT(*) FROM runs x WHERE x.question_id=q.id "
+                "AND x.status='succeeded') AS successful_run_count, "
                 "(SELECT COUNT(*) FROM records r WHERE r.question_id=q.id) AS record_count, "
                 "(SELECT COUNT(*) FROM records r WHERE r.question_id=q.id "
                 "AND r.delivery_qc_passed=1 AND r.delivery_qc_note='质检通过') AS passed_count "
@@ -822,7 +904,7 @@ class Pipeline:
             int(state["id"]): {
                 "model_done": bool(
                     int(state["record_count"] or 0) > 0
-                    or (state["status"] == "completed" and int(state["run_count"] or 0) > 0)
+                    or int(state["successful_run_count"] or 0) > 0
                 ),
                 "record_count": int(state["record_count"] or 0),
                 "delivery_passed": bool(

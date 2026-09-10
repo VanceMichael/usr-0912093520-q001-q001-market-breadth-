@@ -148,6 +148,9 @@ class AutoPipelineTests(unittest.TestCase):
         self.assertIn("pid", columns)
         self.assertIn("retry_of_job_id", columns)
         self.assertTrue({"heartbeat_at", "activity_at", "health_status", "health_detail"} <= item_columns)
+        with auto_pipeline.connect(database) as connection:
+            run_columns = {row["name"] for row in connection.execute("PRAGMA table_info(runs)")}
+        self.assertTrue({"failure_kind", "retryable", "retry_delay_seconds"} <= run_columns)
 
     def test_question_progress_treats_successful_run_as_completed_model_stage(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -170,7 +173,7 @@ class AutoPipelineTests(unittest.TestCase):
                 (batch_id, str(root / "q001"), auto_pipeline.prompt_hash("需求"), created, created),
             ).lastrowid
             connection.execute(
-                "INSERT INTO runs(question_id,batch_run_id,launched_at) VALUES(?,?,?)",
+                "INSERT INTO runs(question_id,batch_run_id,launched_at,status) VALUES(?,?,?,'succeeded')",
                 (question_id, "run-1", created),
             )
             connection.commit()

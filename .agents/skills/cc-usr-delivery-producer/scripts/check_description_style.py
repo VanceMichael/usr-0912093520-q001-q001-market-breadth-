@@ -34,8 +34,22 @@ FORBIDDEN = (
     "Impact:",
 )
 TURN_OPENING_RE = re.compile(r"^(?:本轮|这轮|这一轮)")
-SELF_REFERENCE_RE = re.compile(r"(?:AI|Codex)\s*(?:认为|分析|自动|生成)|基于轨迹生成|自动生成")
+SELF_REFERENCE_RE = re.compile(
+    r"(?:AI|Codex|Claude|ChatGPT)\s*(?:认为|分析|自动|生成|评分|撰写)"
+    r"|(?:作为|身为)\s*(?:AI|Codex|Claude|ChatGPT|模型|智能体)"
+    r"|(?:由|使用|借助)\s*(?:AI|Codex|Claude|ChatGPT|模型)\s*(?:生成|撰写|创建)"
+    r"|(?:自动生成|基于轨迹生成|根据轨迹生成|本评分由)"
+    r"|(?:评分|打分|评测|质检|评价者|审核人员|生成过程)"
+    r"|(?:轨迹|日志)(?:显示|表明|可见)"
+    r"|(?:模型|智能体|助手)(?:的)?(?:表现|回答|输出|生成过程)",
+    re.IGNORECASE,
+)
 PLACEHOLDER_RE = re.compile(r"\[[^\]]+\]|=>|→|->")
+UNNECESSARY_ENGLISH_RE = re.compile(
+    r"(?<![/\\._'\"\w])(?:rationale|overall|generally|basically|summary|conclusion)"
+    r"\b(?!\s*[:=])",
+    re.IGNORECASE,
+)
 STYLE_FIELDS = tuple(f"{prefix}_description" for prefix in PREFIXES)
 
 
@@ -78,6 +92,9 @@ def check_record(path: Path, record: dict, record_index: int) -> list[str]:
             errors.append(f"{path} record {record_index}: {field} exposes generation or evaluator language")
         if PLACEHOLDER_RE.search(text):
             errors.append(f"{path} record {record_index}: {field} contains scaffolding or an arrow")
+        prose = re.sub(r"```.*?```|`[^`]*`|https?://\S+", " ", text, flags=re.DOTALL)
+        if UNNECESSARY_ENGLISH_RE.search(prose):
+            errors.append(f"{path} record {record_index}: {field} contains unnecessary English evaluator wording")
         if text.count("；") + text.count(";") > 1:
             errors.append(f"{path} record {record_index}: {field} has repeated semicolon joins")
         if text.count("，") >= 10 and text.count("、") >= 3:
@@ -93,6 +110,38 @@ def check_record(path: Path, record: dict, record_index: int) -> list[str]:
             similarity = SequenceMatcher(None, descriptions[left], descriptions[right]).ratio()
             if similarity >= 0.86:
                 errors.append(f"{path} record {record_index}: descriptions {left + 1} and {right + 1} are mechanically similar ({similarity:.2f})")
+
+    other_issues = record.get("other_issues")
+    if isinstance(other_issues, str) and other_issues.strip():
+        text = other_issues.strip()
+        for phrase in FORBIDDEN:
+            if phrase in text:
+                errors.append(f"{path} record {record_index}: other_issues contains forbidden phrase {phrase!r}")
+        if TURN_OPENING_RE.search(text):
+            errors.append(f"{path} record {record_index}: other_issues uses a turn-recap opening")
+        if SELF_REFERENCE_RE.search(text):
+            errors.append(f"{path} record {record_index}: other_issues exposes generation or evaluator language")
+        if PLACEHOLDER_RE.search(text):
+            errors.append(f"{path} record {record_index}: other_issues contains scaffolding or an arrow")
+        prose = re.sub(r"```.*?```|`[^`]*`|https?://\S+", " ", text, flags=re.DOTALL)
+        if UNNECESSARY_ENGLISH_RE.search(prose):
+            errors.append(f"{path} record {record_index}: other_issues contains unnecessary English evaluator wording")
+        if len(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]", text)) < 12:
+            errors.append(f"{path} record {record_index}: other_issues must use complete Chinese prose")
+        if text.count("；") + text.count(";") > 1:
+            errors.append(f"{path} record {record_index}: other_issues has repeated semicolon joins")
+        if text.count("，") >= 10 and text.count("、") >= 3:
+            errors.append(f"{path} record {record_index}: other_issues reads as a dense inventory")
+        normalized_other = re.sub(r"\s+", "", text)
+        for description in descriptions:
+            normalized_description = re.sub(r"\s+", "", description)
+            if normalized_other == normalized_description or SequenceMatcher(
+                None, normalized_other, normalized_description,
+            ).ratio() >= 0.9:
+                errors.append(
+                    f"{path} record {record_index}: other_issues repeats a five-dimension description"
+                )
+                break
     return errors
 
 
@@ -122,7 +171,7 @@ def main() -> int:
         for error in errors:
             print(f"- {error}", file=sys.stderr)
         return 1
-    print(f"STYLE GATE PASSED: checked {len(records)} record(s), five descriptions each")
+    print(f"STYLE GATE PASSED: checked {len(records)} record(s), five descriptions and non-empty other_issues")
     return 0
 
 

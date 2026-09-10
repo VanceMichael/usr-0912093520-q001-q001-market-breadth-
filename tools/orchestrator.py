@@ -8,12 +8,16 @@ import concurrent.futures
 import json
 import os
 import platform
+import random
 import re
 import secrets
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
+from collections import deque
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -23,11 +27,91 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from tools.batch_pipeline import SNAPSHOT_RE, connect, prompt_hash, question_rows
 from tools.text_encoding import read_portable_text
+from tools.trajectory_gate import TrajectoryGateError, validate_effective_trajectory
 
 
 DEFAULT_HEARTBEAT_SECONDS = 5
 DEFAULT_START_TIMEOUT = 300
 DEFAULT_STALLED_TIMEOUT = 900
+DEFAULT_GATEWAY_MAX_ATTEMPTS = 3
+DEFAULT_GATEWAY_BACKOFF_BASE = 30
+DEFAULT_GATEWAY_BACKOFF_MAX = 300
+DEFAULT_GATEWAY_CIRCUIT_THRESHOLD = 2
+DEFAULT_GATEWAY_CIRCUIT_WINDOW = 120
+DEFAULT_GATEWAY_CIRCUIT_COOLDOWN = 180
+
+TRANSIENT_GATEWAY_RE = re.compile(
+    r"(?i)(?:\b(?:429|500|502|503|504)\b|gateway[ -]?(?:time-?out|error)|"
+    r"server error mid-response|ECONNRESET|ETIMEDOUT|ENOTFOUND|"
+    r"connection (?:reset|timed out)|temporarily unavailable|rate limit)"
+)
+PERMANENT_AUTH_RE = re.compile(
+    r"(?i)(?:\b(?:401|403)\b|invalid (?:api key|auth(?:entication)? token)|"
+    r"unauthorized|authentication failed|permission denied.*(?:api|model))"
+)
+MODEL_CONFIG_RE = re.compile(
+    r"(?i)(?:unsupported model|invalid model|model (?:is )?not found|"
+    r"model .* does not exist|unknown model provider)"
+)
+UNRECOGNIZED_MODEL_WARNING = "[claude-code:unrecognized_model]"
+
+
+@dataclass(frozen=True)
+class FailureClassification:
+    kind: str
+    retryable: bool
+
+
+class GatewayCircuitBreaker:
+    """Coordinate transient provider failures across concurrent workers."""
+
+    def __init__(self, threshold: int, window_seconds: int, cooldown_seconds: int) -> None:
+        self.threshold = max(1, threshold)
+        self.window_seconds = max(1, window_seconds)
+        self.cooldown_seconds = max(1, cooldown_seconds)
+        self._failures: deque[float] = deque()
+        self._open_until = 0.0
+        self._half_open_in_flight = False
+        self._condition = threading.Condition()
+
+    def wait_until_allowed(self) -> None:
+        while True:
+            with self._condition:
+                current = time.monotonic()
+                if not self._open_until:
+                    return
+                if current >= self._open_until and not self._half_open_in_flight:
+                    self._half_open_in_flight = True
+                    return
+                delay = max(0.1, self._open_until - current) if current < self._open_until else 1.0
+                self._condition.wait(timeout=min(delay, 5.0))
+
+    def record_transient_failure(self) -> None:
+        with self._condition:
+            current = time.monotonic()
+            while self._failures and current - self._failures[0] > self.window_seconds:
+                self._failures.popleft()
+            self._failures.append(current)
+            if self._half_open_in_flight or len(self._failures) >= self.threshold:
+                self._open_until = current + self.cooldown_seconds
+                self._half_open_in_flight = False
+            self._condition.notify_all()
+
+    def record_recovery(self) -> None:
+        with self._condition:
+            self._failures.clear()
+            self._open_until = 0.0
+            self._half_open_in_flight = False
+            self._condition.notify_all()
+
+    def snapshot(self) -> dict[str, float | int | bool]:
+        with self._condition:
+            return {
+                "failure_count": len(self._failures),
+                "open": self._open_until > time.monotonic(),
+                "open_until": self._open_until,
+                "half_open_in_flight": self._half_open_in_flight,
+            }
 
 
 def now() -> str:
@@ -126,22 +210,72 @@ def claude_task_state(trajectory_root: Path) -> str:
     return "complete" if observed else "unknown"
 
 
-def stream_result_state(log_path: Path) -> str:
-    """Return success, failure, or missing from Claude's final stream event."""
+def stream_result_details(log_path: Path) -> tuple[str, str]:
+    """Return final stream state plus provider diagnostics outside tool payloads."""
     found = "missing"
+    diagnostics: list[str] = []
     try:
         with log_path.open(encoding="utf-8", errors="replace") as handle:
             for line in handle:
                 try:
                     event = json.loads(line)
                 except json.JSONDecodeError:
+                    stripped = line.strip()
+                    if stripped:
+                        diagnostics.append(stripped[-1000:])
                     continue
-                if not isinstance(event, dict) or event.get("type") != "result":
+                if not isinstance(event, dict):
                     continue
-                found = "failure" if event.get("is_error") else "success"
+                if event.get("type") == "result":
+                    found = "failure" if event.get("is_error") else "success"
+                    for key in ("error", "result", "subtype"):
+                        value = event.get(key)
+                        if isinstance(value, str) and value.strip():
+                            diagnostics.append(value[-2000:])
+                        elif key == "error" and isinstance(value, (dict, list)):
+                            diagnostics.append(json.dumps(value, ensure_ascii=False)[-2000:])
+                elif isinstance(event.get("error"), (str, dict, list)):
+                    value = event["error"]
+                    diagnostics.append(
+                        (value if isinstance(value, str) else json.dumps(value, ensure_ascii=False))[-2000:]
+                    )
     except OSError:
-        return "missing"
-    return found
+        return "missing", ""
+    return found, "\n".join(diagnostics[-10:])
+
+
+def stream_result_state(log_path: Path) -> str:
+    """Keep the historical state-only interface for callers and tests."""
+    return stream_result_details(log_path)[0]
+
+
+def classify_failure(status: str, error: str, diagnostics: str = "") -> FailureClassification:
+    text = "\n".join(value for value in (error, diagnostics) if value)
+    without_catalog_warning = "\n".join(
+        line for line in text.splitlines() if UNRECOGNIZED_MODEL_WARNING not in line
+    )
+    if status == "timeout":
+        return FailureClassification("model_timeout", True)
+    if "effective trajectory gate rejected run" in error:
+        return FailureClassification("trajectory_gate", True)
+    if PERMANENT_AUTH_RE.search(without_catalog_warning):
+        return FailureClassification("permanent_auth", False)
+    if MODEL_CONFIG_RE.search(without_catalog_warning):
+        return FailureClassification("model_config", False)
+    if TRANSIENT_GATEWAY_RE.search(without_catalog_warning):
+        return FailureClassification("transient_gateway", True)
+    if any(marker in error for marker in (
+        "failed before worker launch", "cannot start docker worker", "missing worker configuration",
+    )):
+        return FailureClassification("environment", False)
+    return FailureClassification("worker_failure", True)
+
+
+def retry_delay_seconds(failure_number: int, base: int, maximum: int) -> int:
+    raw = min(maximum, max(1, base) * (3 ** max(0, failure_number - 1)))
+    if raw >= maximum:
+        return max(1, maximum)
+    return max(1, min(maximum, round(raw * random.SystemRandom().uniform(1.0, 1.5))))
 
 
 def update_run_heartbeat(db: Path, question_id: int, run_id: str) -> None:
@@ -260,11 +394,16 @@ def run_one(
 
     def fail_setup(message: str) -> tuple[str, int, str]:
         finished = now()
+        classification = classify_failure("failed", f"failed before worker launch: {message}")
         with connect(db) as connection:
             connection.execute(
-                "UPDATE runs SET status='failed',finished_at=?,exit_code=78,error_message=? "
+                "UPDATE runs SET status='failed',finished_at=?,exit_code=78,error_message=?,"
+                "failure_kind=?,retryable=? "
                 "WHERE batch_run_id=? AND question_id=?",
-                (finished, message, run_id, row["id"]),
+                (
+                    finished, message, classification.kind, int(classification.retryable),
+                    run_id, row["id"],
+                ),
             )
             connection.execute(
                 "UPDATE questions SET status='approved',updated_at=? WHERE id=?",
@@ -335,7 +474,7 @@ def run_one(
                 start_timeout, stalled_timeout, initial_activity,
             )
         if not status:
-            result_state = stream_result_state(log_path)
+            result_state, stream_diagnostics = stream_result_details(log_path)
             task_state = claude_task_state(trajectory_root)
             if code != 0:
                 status, error = "failed", f"docker worker exited with code {code}"
@@ -346,7 +485,24 @@ def run_one(
                 code, status = 1, "failed"
                 error = "Claude exited while structured tasks were still incomplete"
             else:
-                status, error = "succeeded", ""
+                try:
+                    evidence = validate_effective_trajectory(
+                        trajectory_root,
+                        str(row["prompt"]),
+                        Path(str(row["folder_path"])).resolve(strict=True),
+                        str(row["local_initial_sha"] or "").strip(),
+                    )
+                except (OSError, TrajectoryGateError) as exc:
+                    code, status = 1, "failed"
+                    error = f"effective trajectory gate rejected run: {exc}"
+                else:
+                    status, error = "succeeded", ""
+                    with connect(db) as connection:
+                        connection.execute(
+                            "UPDATE runs SET session_id=? WHERE batch_run_id=? AND question_id=?",
+                            (evidence.session_id, run_id, row["id"]),
+                        )
+                        connection.commit()
     except subprocess.TimeoutExpired:
         code, status, error = -9, "timeout", "worker did not stop after container termination"
     except OSError as exc:
@@ -354,11 +510,20 @@ def run_one(
     finally:
         worker_env.unlink(missing_ok=True)
     finished = now()
+    classification = (
+        FailureClassification("", False)
+        if status == "succeeded"
+        else classify_failure(status, error, locals().get("stream_diagnostics", ""))
+    )
     with connect(db) as connection:
         connection.execute(
-            "UPDATE runs SET status=?,finished_at=?,exit_code=?,error_message=?,heartbeat_at=? "
+            "UPDATE runs SET status=?,finished_at=?,exit_code=?,error_message=?,heartbeat_at=?,"
+            "failure_kind=?,retryable=? "
             "WHERE batch_run_id=? AND question_id=?",
-            (status, finished, code, error, finished, run_id, row["id"]),
+            (
+                status, finished, code, error, finished, classification.kind,
+                int(classification.retryable), run_id, row["id"],
+            ),
         )
         connection.execute(
             "UPDATE questions SET status=?,updated_at=? WHERE id=?",
@@ -369,11 +534,47 @@ def run_one(
 
 
 def failed_attempts(db: Path, question_id: int) -> int:
+    """Count model/content attempts; transient gateway failures have a separate budget."""
     with connect(db) as connection:
         return int(connection.execute(
-            "SELECT COUNT(*) FROM runs WHERE question_id=? AND status IN ('failed','timeout')",
+            "SELECT COUNT(*) FROM runs WHERE question_id=? AND status IN ('failed','timeout') "
+            "AND COALESCE(failure_kind,'')!='transient_gateway'",
             (question_id,),
         ).fetchone()[0])
+
+
+def gateway_failed_attempts(db: Path, question_id: int) -> int:
+    with connect(db) as connection:
+        return int(connection.execute(
+            "SELECT COUNT(*) FROM runs WHERE question_id=? AND status='failed' "
+            "AND failure_kind='transient_gateway'",
+            (question_id,),
+        ).fetchone()[0])
+
+
+def latest_failure(db: Path, question_id: int, fallback: str) -> FailureClassification:
+    with connect(db) as connection:
+        row = connection.execute(
+            "SELECT status,error_message,failure_kind,retryable FROM runs "
+            "WHERE question_id=? AND status IN ('failed','timeout') ORDER BY id DESC LIMIT 1",
+            (question_id,),
+        ).fetchone()
+    if row is None:
+        return classify_failure("failed", fallback)
+    kind = str(row["failure_kind"] or "")
+    if kind:
+        return FailureClassification(kind, bool(row["retryable"]))
+    return classify_failure(str(row["status"]), str(row["error_message"] or fallback))
+
+
+def record_retry_delay(db: Path, question_id: int, seconds: int) -> None:
+    with connect(db) as connection:
+        connection.execute(
+            "UPDATE runs SET retry_delay_seconds=? WHERE id=("
+            "SELECT id FROM runs WHERE question_id=? ORDER BY id DESC LIMIT 1)",
+            (seconds, question_id),
+        )
+        connection.commit()
 
 
 def has_unsuccessful_attempt(db: Path, question_id: int) -> bool:
@@ -407,13 +608,20 @@ def run_with_retries(
     heartbeat_seconds: int = DEFAULT_HEARTBEAT_SECONDS,
     start_timeout: int = DEFAULT_START_TIMEOUT,
     stalled_timeout: int = DEFAULT_STALLED_TIMEOUT,
+    gateway_max_attempts: int = DEFAULT_GATEWAY_MAX_ATTEMPTS,
+    gateway_backoff_base: int = DEFAULT_GATEWAY_BACKOFF_BASE,
+    gateway_backoff_max: int = DEFAULT_GATEWAY_BACKOFF_MAX,
+    circuit_breaker: GatewayCircuitBreaker | None = None,
 ) -> tuple[str, int, str]:
     question_id = int(row["id"])
     task_id = str(row["task_id"])
     last_message = ""
-    attempts = failed_attempts(db, question_id)
+    model_attempts = failed_attempts(db, question_id)
+    gateway_attempts = gateway_failed_attempts(db, question_id)
     restore_before_run = has_unsuccessful_attempt(db, question_id)
-    while attempts < max_attempts:
+    while model_attempts < max_attempts and gateway_attempts < gateway_max_attempts:
+        if circuit_breaker is not None:
+            circuit_breaker.wait_until_allowed()
         if restore_before_run:
             try:
                 restore_question_workspace(row)
@@ -421,19 +629,44 @@ def run_with_retries(
                 block_question(db, question_id)
                 return task_id, 1, f"blocked: retry baseline restore failed: {exc}"
         try:
+            raised = False
             task_id, code, last_message = run_one(
                 db, row, env_file, data_root, image, cpus, memory, timeout,
                 heartbeat_seconds, start_timeout, stalled_timeout,
             )
         except Exception as exc:
+            raised = True
             code = 1
             last_message = str(exc)
         if code == 0:
+            if circuit_breaker is not None:
+                circuit_breaker.record_recovery()
             return task_id, code, last_message
-        attempts = max(attempts + 1, failed_attempts(db, question_id))
+        classification = (
+            classify_failure("failed", last_message)
+            if raised else latest_failure(db, question_id, last_message)
+        )
+        if classification.kind == "transient_gateway":
+            gateway_attempts = max(gateway_attempts + 1, gateway_failed_attempts(db, question_id))
+            if circuit_breaker is not None:
+                circuit_breaker.record_transient_failure()
+            if gateway_attempts < gateway_max_attempts:
+                delay = retry_delay_seconds(
+                    gateway_attempts, gateway_backoff_base, gateway_backoff_max,
+                )
+                record_retry_delay(db, question_id, delay)
+                time.sleep(delay)
+        else:
+            model_attempts = max(model_attempts + 1, failed_attempts(db, question_id))
+            if circuit_breaker is not None:
+                circuit_breaker.record_recovery()
+            if classification.kind in {"permanent_auth", "model_config", "environment"}:
+                model_attempts = max_attempts
         restore_before_run = True
     block_question(db, question_id)
-    return task_id, 1, f"blocked after {max_attempts} attempts: {last_message}"
+    if gateway_attempts >= gateway_max_attempts:
+        return task_id, 1, f"blocked after {gateway_max_attempts} transient gateway attempts: {last_message}"
+    return task_id, 1, f"blocked after {max_attempts} model attempts: {last_message}"
 
 
 def codex_command(codex: str, prompt: str) -> list[str]:
@@ -586,6 +819,18 @@ def finalize_batch(
 
 def run_delivery_pipeline(args: argparse.Namespace) -> int:
     database = args.db.resolve()
+    gateway_max_attempts = getattr(args, "gateway_max_attempts", DEFAULT_GATEWAY_MAX_ATTEMPTS)
+    gateway_backoff_base = getattr(args, "gateway_backoff_base", DEFAULT_GATEWAY_BACKOFF_BASE)
+    gateway_backoff_max = getattr(args, "gateway_backoff_max", DEFAULT_GATEWAY_BACKOFF_MAX)
+    gateway_circuit_threshold = getattr(
+        args, "gateway_circuit_threshold", DEFAULT_GATEWAY_CIRCUIT_THRESHOLD,
+    )
+    gateway_circuit_window = getattr(
+        args, "gateway_circuit_window", DEFAULT_GATEWAY_CIRCUIT_WINDOW,
+    )
+    gateway_circuit_cooldown = getattr(
+        args, "gateway_circuit_cooldown", DEFAULT_GATEWAY_CIRCUIT_COOLDOWN,
+    )
     with connect(database) as connection:
         rows = question_rows(connection, args.batch)
         candidates = []
@@ -595,7 +840,13 @@ def run_delivery_pipeline(args: argparse.Namespace) -> int:
                 (row["id"],),
             ).fetchone() is not None
             attempts = connection.execute(
-                "SELECT COUNT(*) FROM runs WHERE question_id=? AND status IN ('failed','timeout')",
+                "SELECT COUNT(*) FROM runs WHERE question_id=? AND status IN ('failed','timeout') "
+                "AND COALESCE(failure_kind,'')!='transient_gateway'",
+                (row["id"],),
+            ).fetchone()[0]
+            gateway_attempts = connection.execute(
+                "SELECT COUNT(*) FROM runs WHERE question_id=? AND status='failed' "
+                "AND failure_kind='transient_gateway'",
                 (row["id"],),
             ).fetchone()[0]
             if succeeded:
@@ -603,7 +854,10 @@ def run_delivery_pipeline(args: argparse.Namespace) -> int:
                     "UPDATE questions SET status='completed',updated_at=? WHERE id=?",
                     (now(), row["id"]),
                 )
-            elif ready(row) and attempts < args.max_attempts:
+            elif (
+                ready(row) and attempts < args.max_attempts
+                and gateway_attempts < gateway_max_attempts
+            ):
                 candidates.append(row)
             elif row["status"] != "blocked":
                 connection.execute(
@@ -614,6 +868,9 @@ def run_delivery_pipeline(args: argparse.Namespace) -> int:
 
     errors: list[str] = []
     scheduled_delivery: set[int] = set()
+    circuit_breaker = GatewayCircuitBreaker(
+        gateway_circuit_threshold, gateway_circuit_window, gateway_circuit_cooldown,
+    )
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.concurrency) as model_pool, concurrent.futures.ThreadPoolExecutor(
         max_workers=args.codex_concurrency,
     ) as delivery_pool:
@@ -638,6 +895,8 @@ def run_delivery_pipeline(args: argparse.Namespace) -> int:
                 getattr(args, "heartbeat_seconds", DEFAULT_HEARTBEAT_SECONDS),
                 getattr(args, "start_timeout", DEFAULT_START_TIMEOUT),
                 getattr(args, "stalled_timeout", DEFAULT_STALLED_TIMEOUT),
+                gateway_max_attempts, gateway_backoff_base,
+                gateway_backoff_max, circuit_breaker,
             ): row
             for row in candidates
         }
@@ -707,6 +966,30 @@ def main() -> int:
         default=env_seconds("CC_CLAUDE_STALLED_TIMEOUT", DEFAULT_STALLED_TIMEOUT),
     )
     parser.add_argument("--max-attempts", type=int, default=2)
+    parser.add_argument(
+        "--gateway-max-attempts", type=int,
+        default=env_seconds("CC_GATEWAY_MAX_ATTEMPTS", DEFAULT_GATEWAY_MAX_ATTEMPTS),
+    )
+    parser.add_argument(
+        "--gateway-backoff-base", type=int,
+        default=env_seconds("CC_GATEWAY_BACKOFF_BASE", DEFAULT_GATEWAY_BACKOFF_BASE),
+    )
+    parser.add_argument(
+        "--gateway-backoff-max", type=int,
+        default=env_seconds("CC_GATEWAY_BACKOFF_MAX", DEFAULT_GATEWAY_BACKOFF_MAX),
+    )
+    parser.add_argument(
+        "--gateway-circuit-threshold", type=int,
+        default=env_seconds("CC_GATEWAY_CIRCUIT_THRESHOLD", DEFAULT_GATEWAY_CIRCUIT_THRESHOLD),
+    )
+    parser.add_argument(
+        "--gateway-circuit-window", type=int,
+        default=env_seconds("CC_GATEWAY_CIRCUIT_WINDOW", DEFAULT_GATEWAY_CIRCUIT_WINDOW),
+    )
+    parser.add_argument(
+        "--gateway-circuit-cooldown", type=int,
+        default=env_seconds("CC_GATEWAY_CIRCUIT_COOLDOWN", DEFAULT_GATEWAY_CIRCUIT_COOLDOWN),
+    )
     parser.add_argument("--deliver", action="store_true")
     parser.add_argument("--codex", default="codex")
     parser.add_argument("--codex-concurrency", type=int, default=1)
@@ -718,20 +1001,28 @@ def main() -> int:
         parser.error("--concurrency must be positive")
     if args.codex_concurrency < 1:
         parser.error("--codex-concurrency must be positive")
-    if min(args.heartbeat_seconds, args.start_timeout, args.stalled_timeout, args.timeout) < 1:
+    if min(
+        args.heartbeat_seconds, args.start_timeout, args.stalled_timeout, args.timeout,
+        args.gateway_max_attempts, args.gateway_backoff_base, args.gateway_backoff_max,
+        args.gateway_circuit_threshold, args.gateway_circuit_window,
+        args.gateway_circuit_cooldown,
+    ) < 1:
         parser.error("worker monitoring timeouts must be positive")
     if args.deliver:
         return run_delivery_pipeline(args)
     while True:
+        circuit_breaker = GatewayCircuitBreaker(
+            args.gateway_circuit_threshold,
+            args.gateway_circuit_window,
+            args.gateway_circuit_cooldown,
+        )
         with connect(args.db.resolve()) as connection:
             candidates = [row for row in question_rows(connection, args.batch) if ready(row)]
             rows = []
             for row in candidates:
-                attempts = connection.execute(
-                    "SELECT COUNT(*) FROM runs WHERE question_id=? AND status IN ('failed','timeout')",
-                    (row["id"],),
-                ).fetchone()[0]
-                if attempts < args.max_attempts:
+                attempts = failed_attempts(args.db.resolve(), int(row["id"]))
+                gateway_attempts = gateway_failed_attempts(args.db.resolve(), int(row["id"]))
+                if attempts < args.max_attempts and gateway_attempts < args.gateway_max_attempts:
                     rows.append(row)
                 else:
                     connection.execute(
@@ -752,6 +1043,8 @@ def main() -> int:
                 args.data_root.resolve(), args.image, args.cpus, args.memory,
                 args.timeout, args.max_attempts, args.heartbeat_seconds,
                 args.start_timeout, args.stalled_timeout,
+                args.gateway_max_attempts, args.gateway_backoff_base,
+                args.gateway_backoff_max, circuit_breaker,
             ) for row in rows]
             for future in concurrent.futures.as_completed(futures):
                 task_id, code, message = future.result()

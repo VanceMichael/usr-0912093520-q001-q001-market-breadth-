@@ -67,7 +67,13 @@ class OrchestratorTest(unittest.TestCase):
                 kwargs["stdout"].flush()
                 return mock.Mock(wait=mock.Mock(return_value=0))
 
-            with mock.patch.object(orchestrator.subprocess, "Popen", side_effect=fake_popen):
+            gate_evidence = mock.Mock(
+                session_id="session-test", assistant_messages=2,
+                tool_uses=1, changed_files=1,
+            )
+            with mock.patch.object(orchestrator.subprocess, "Popen", side_effect=fake_popen), mock.patch.object(
+                orchestrator, "validate_effective_trajectory", return_value=gate_evidence
+            ):
                 orchestrator.main_args = None
                 with mock.patch("sys.argv", ["orchestrator", "--db", str(db), "--batch", "b", "--env-file", str(env), "--data-root", str(root / "runs"), "--image", "fake", "--concurrency", "2"]):
                     self.assertEqual(orchestrator.main(), 0)
@@ -113,6 +119,93 @@ class OrchestratorTest(unittest.TestCase):
             self.assertEqual(orchestrator.claude_task_state(root / "claude"), "incomplete")
             task.write_text(json.dumps({"status": "completed"}), encoding="utf-8")
             self.assertEqual(orchestrator.claude_task_state(root / "claude"), "complete")
+
+    def test_failure_classifier_separates_gateway_auth_and_catalog_warning(self):
+        self.assertEqual(
+            orchestrator.classify_failure("failed", "API Error: 504 Gateway Time-out").kind,
+            "transient_gateway",
+        )
+        self.assertEqual(
+            orchestrator.classify_failure("failed", "API Error: 403 unauthorized").kind,
+            "permanent_auth",
+        )
+        warning = (
+            '"auto_model/urm" is not described by this version catalog '
+            "[claude-code:unrecognized_model]"
+        )
+        self.assertEqual(
+            orchestrator.classify_failure("failed", "worker failed", warning).kind,
+            "worker_failure",
+        )
+
+    def test_gateway_backoff_has_independent_budget(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            db = root / "production.sqlite3"
+            row = self.make_question(root, db)[0]
+            calls = 0
+
+            def run_one(*_args, **_kwargs):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    with connect(db) as connection:
+                        connection.execute(
+                            "INSERT INTO runs(question_id,batch_run_id,launched_at,status,error_message,failure_kind,retryable) "
+                            "VALUES(?,?,'now','failed','API Error: 504 Gateway Time-out','transient_gateway',1)",
+                            (row["id"], "gateway-1"),
+                        )
+                        connection.commit()
+                    return "b-001", 1, "failed: 504 Gateway Time-out"
+                return "b-001", 0, "succeeded"
+
+            with mock.patch.object(orchestrator, "run_one", side_effect=run_one), mock.patch.object(
+                orchestrator, "restore_question_workspace"
+            ), mock.patch.object(orchestrator.time, "sleep") as sleep:
+                result = orchestrator.run_with_retries(
+                    db, row, root / ".env", root / "runs", "image", 1.0, "2g", 60,
+                    1, gateway_max_attempts=3, gateway_backoff_base=30,
+                    gateway_backoff_max=300,
+                )
+            self.assertEqual(result[1], 0)
+            self.assertEqual(calls, 2)
+            sleep.assert_called_once()
+            with connect(db) as connection:
+                run = connection.execute(
+                    "SELECT retry_delay_seconds FROM runs WHERE batch_run_id='gateway-1'"
+                ).fetchone()
+            self.assertGreaterEqual(run[0], 30)
+            self.assertLessEqual(run[0], 45)
+
+    def test_permanent_auth_failure_is_not_retried(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            db = root / "production.sqlite3"
+            row = self.make_question(root, db)[0]
+
+            def run_one(*_args, **_kwargs):
+                with connect(db) as connection:
+                    connection.execute(
+                        "INSERT INTO runs(question_id,batch_run_id,launched_at,status,error_message,failure_kind) "
+                        "VALUES(?,'auth-1','now','failed','API Error: 401 unauthorized','permanent_auth')",
+                        (row["id"],),
+                    )
+                    connection.commit()
+                return "b-001", 1, "failed: 401 unauthorized"
+
+            with mock.patch.object(orchestrator, "run_one", side_effect=run_one) as runner:
+                result = orchestrator.run_with_retries(
+                    db, row, root / ".env", root / "runs", "image", 1.0, "2g", 60, 2,
+                )
+            self.assertEqual(result[1], 1)
+            runner.assert_called_once()
+
+    def test_gateway_circuit_opens_after_threshold(self):
+        breaker = orchestrator.GatewayCircuitBreaker(2, 120, 180)
+        breaker.record_transient_failure()
+        self.assertFalse(breaker.snapshot()["open"])
+        breaker.record_transient_failure()
+        self.assertTrue(breaker.snapshot()["open"])
 
     def test_monitor_reclaims_worker_that_never_produces_output(self):
         with tempfile.TemporaryDirectory() as raw:

@@ -19,7 +19,7 @@ from datetime import datetime
 from pathlib import Path
 
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 DEFAULT_NEWS_FEEDS = (
     "https://channel.chinanews.com.cn/cns/cl/gn-js.shtml",
     "https://channel.chinanews.com.cn/cns/cl/gn-kjww.shtml",
@@ -198,6 +198,9 @@ CREATE TABLE IF NOT EXISTS runs (
     log_path TEXT NOT NULL DEFAULT '',
     retry_count INTEGER NOT NULL DEFAULT 0,
     heartbeat_at TEXT NOT NULL DEFAULT '',
+    failure_kind TEXT NOT NULL DEFAULT '',
+    retryable INTEGER NOT NULL DEFAULT 0,
+    retry_delay_seconds INTEGER NOT NULL DEFAULT 0,
     UNIQUE (question_id, batch_run_id)
 );
 
@@ -465,6 +468,9 @@ def connect(database: Path) -> sqlite3.Connection:
         "log_path": "TEXT NOT NULL DEFAULT ''",
         "retry_count": "INTEGER NOT NULL DEFAULT 0",
         "heartbeat_at": "TEXT NOT NULL DEFAULT ''",
+        "failure_kind": "TEXT NOT NULL DEFAULT ''",
+        "retryable": "INTEGER NOT NULL DEFAULT 0",
+        "retry_delay_seconds": "INTEGER NOT NULL DEFAULT 0",
     }
     for name, definition in run_migrations.items():
         if name not in run_columns:
@@ -608,6 +614,25 @@ def prompt_style_issues(prompt: str) -> list[str]:
         issues.append("User Prompt 不能把背景、功能、技术、验收等标签串成模板")
     if re.search(r"评测模型|测试模型能力|用于评测|用于测评|标注数据", stripped):
         issues.append("User Prompt 不能暴露评测或标注用途")
+    if re.search(
+        r"(?:作为|身为)\s*(?:一名)?\s*(?:AI|Codex|Claude|ChatGPT|模型|智能体)"
+        r"|(?:由|使用|借助)\s*(?:AI|Codex|Claude|ChatGPT|模型)\s*(?:生成|撰写|创建)"
+        r"|(?:根据|按照)\s*(?:评测|测评|评分|质检|标注|数据生产)(?:要求|规范|标准|流程)"
+        r"|(?:模型|智能体|助手)(?:的)?(?:表现|回答|输出|轨迹|生成过程)"
+        r"|(?:对话|模型)(?:的)?轨迹"
+        r"|(?:User\s*)?Prompt(?:ID)?(?=$|[^A-Za-z0-9_])",
+        stripped,
+        re.IGNORECASE,
+    ):
+        issues.append("User Prompt 不能包含 AI 自述、内部出题过程或评价模型的口吻")
+    prose = re.sub(r"```.*?```|`[^`]*`|https?://\S+", " ", stripped, flags=re.DOTALL)
+    if re.search(
+        r"(?<![/\\._'\"\w])(?:rationale|overall|generally|basically|summary|conclusion)"
+        r"\b(?!\s*[:=])",
+        prose,
+        re.IGNORECASE,
+    ):
+        issues.append("User Prompt 不能使用可由中文直接表达的英文评价或衔接词")
     for sentence in re.split(r"[。！？!?\n]+", stripped):
         if (
             sentence.count("、") >= 2

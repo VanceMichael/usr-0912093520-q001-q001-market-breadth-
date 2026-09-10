@@ -8,6 +8,7 @@ import re
 import sqlite3
 from collections import Counter, defaultdict
 from datetime import datetime, time, timedelta, timezone
+from difflib import SequenceMatcher
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
@@ -60,6 +61,13 @@ DESCRIPTION_META_PATTERNS = (
     re.compile(r"(?:评分|打分|评测|质检|评价者|审核人员|生成过程)"),
     re.compile(r"(?:轨迹|日志)(?:显示|表明|可见)"),
     re.compile(r"(?:模型|智能体|助手)(?:的)?(?:表现|回答|输出|生成过程)"),
+    re.compile(r"(?:作为|身为)\s*(?:AI|Codex|Claude|ChatGPT|模型|智能体)", re.IGNORECASE),
+    re.compile(r"(?:由|使用|借助)\s*(?:AI|Codex|Claude|ChatGPT|模型)\s*(?:生成|撰写|创建)", re.IGNORECASE),
+)
+UNNECESSARY_ENGLISH_RE = re.compile(
+    r"(?<![/\\._'\"\w])(?:rationale|overall|generally|basically|summary|conclusion)"
+    r"\b(?!\s*[:=])",
+    re.IGNORECASE,
 )
 DESCRIPTION_TEMPLATE_PATTERNS = (
     re.compile(r"(?:^|[\s；;。])(?:When|What|Impact)\s*[:：]", re.IGNORECASE),
@@ -128,6 +136,9 @@ def _description_style_errors(description: str) -> list[str]:
         errors.append("不得包含评价者自述、评分质检、模型表现或生成过程措辞")
     if any(pattern.search(description) for pattern in DESCRIPTION_TEMPLATE_PATTERNS):
         errors.append("不得使用固定标签、套话开头、箭头或占位模板")
+    prose = re.sub(r"```.*?```|`[^`]*`|https?://\S+", " ", description, flags=re.DOTALL)
+    if UNNECESSARY_ENGLISH_RE.search(prose):
+        errors.append("不得使用可由中文直接表达的英文评价或衔接词")
     return errors
 
 
@@ -200,6 +211,15 @@ def validate_one(
     if isinstance(other_issues, str) and other_issues.strip():
         for style_error in _description_style_errors(other_issues):
             errors.append(f"{record_id}: other_issues {style_error}")
+        normalized_other = re.sub(r"\s+", "", other_issues)
+        for description in descriptions:
+            if normalized_other == description or SequenceMatcher(
+                None, normalized_other, description,
+            ).ratio() >= 0.9:
+                errors.append(
+                    f"{record_id}: other_issues must contain only issues outside the five score dimensions"
+                )
+                break
     if not isinstance(record.get("human_authored"), bool):
         errors.append(f"{record_id}: human_authored must be boolean")
     if not isinstance(record.get("human_qc_approved"), bool):

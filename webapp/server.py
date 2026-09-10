@@ -60,6 +60,9 @@ PIPELINE_ENV_KEYS = (
     "CC_PIPELINE_CODEX_CONCURRENCY", "CC_CLAUDE_HEARTBEAT_SECONDS",
     "CC_CLAUDE_START_TIMEOUT", "CC_CLAUDE_STALLED_TIMEOUT",
     "CC_PIPELINE_WORKER_TIMEOUT",
+    "CC_GATEWAY_MAX_ATTEMPTS", "CC_GATEWAY_BACKOFF_BASE",
+    "CC_GATEWAY_BACKOFF_MAX", "CC_GATEWAY_CIRCUIT_THRESHOLD",
+    "CC_GATEWAY_CIRCUIT_WINDOW", "CC_GATEWAY_CIRCUIT_COOLDOWN",
 )
 NEWS_URL_MAX = 20
 AUTHOR_DIFFICULTIES = ("中等", "困难", "地狱")
@@ -1761,6 +1764,11 @@ class ConsoleData:
                 return max(1, min(int(values.get(name, str(default))), 8))
             except ValueError:
                 return default
+        def env_bounded(name: str, default: int, maximum: int = 3600) -> int:
+            try:
+                return max(1, min(int(values.get(name, str(default))), maximum))
+            except ValueError:
+                return default
         with closing(self.connect()) as connection:
             news_feeds = [
                 {**dict(row), "enabled": bool(row["enabled"])}
@@ -1785,6 +1793,12 @@ class ConsoleData:
             "qc_concurrency": env_int("CC_PIPELINE_QC_CONCURRENCY", 2),
             "model_concurrency": env_int("CC_PIPELINE_MODEL_CONCURRENCY", 2),
             "codex_concurrency": env_int("CC_PIPELINE_CODEX_CONCURRENCY", 2),
+            "gateway_max_attempts": env_bounded("CC_GATEWAY_MAX_ATTEMPTS", 3, 10),
+            "gateway_backoff_base": env_bounded("CC_GATEWAY_BACKOFF_BASE", 30),
+            "gateway_backoff_max": env_bounded("CC_GATEWAY_BACKOFF_MAX", 300),
+            "gateway_circuit_threshold": env_bounded("CC_GATEWAY_CIRCUIT_THRESHOLD", 2, 20),
+            "gateway_circuit_window": env_bounded("CC_GATEWAY_CIRCUIT_WINDOW", 120),
+            "gateway_circuit_cooldown": env_bounded("CC_GATEWAY_CIRCUIT_COOLDOWN", 180),
             "news_feeds": news_feeds,
         }
 
@@ -2056,6 +2070,29 @@ class ConsoleData:
             if not 1 <= value <= 8:
                 raise ValueError(f"{field} 必须是 1-8")
             concurrency_values[env_key] = str(value)
+        gateway_values = {}
+        for field, env_key, default, maximum in (
+            ("gateway_max_attempts", "CC_GATEWAY_MAX_ATTEMPTS", 3, 10),
+            ("gateway_backoff_base", "CC_GATEWAY_BACKOFF_BASE", 30, 3600),
+            ("gateway_backoff_max", "CC_GATEWAY_BACKOFF_MAX", 300, 3600),
+            ("gateway_circuit_threshold", "CC_GATEWAY_CIRCUIT_THRESHOLD", 2, 20),
+            ("gateway_circuit_window", "CC_GATEWAY_CIRCUIT_WINDOW", 120, 3600),
+            ("gateway_circuit_cooldown", "CC_GATEWAY_CIRCUIT_COOLDOWN", 180, 3600),
+        ):
+            raw = body.get(field, current.get(env_key, str(default)))
+            if raw in (None, ""):
+                raw = str(default)
+            if isinstance(raw, bool) or not isinstance(raw, (int, str)):
+                raise ValueError(f"{field} 配置无效")
+            try:
+                value = int(raw)
+            except ValueError as exc:
+                raise ValueError(f"{field} 配置无效") from exc
+            if not 1 <= value <= maximum:
+                raise ValueError(f"{field} 必须是 1-{maximum}")
+            gateway_values[env_key] = str(value)
+        if int(gateway_values["CC_GATEWAY_BACKOFF_BASE"]) > int(gateway_values["CC_GATEWAY_BACKOFF_MAX"]):
+            raise ValueError("网关退避初始秒数不能大于上限秒数")
         if not values["api_key"]:
             values["api_key"] = current["CC_SWITCH_API_KEY"]
         if not values["api_key"]:
@@ -2073,6 +2110,7 @@ class ConsoleData:
             "CC_CLAUDE_DOCKER_COMMAND": values["docker_command"],
             "CC_PIPELINE_MODEL_MODE": values["model_mode"],
             **concurrency_values,
+            **gateway_values,
         }
         for key, default in (
             ("CC_CLAUDE_HEARTBEAT_SECONDS", "5"),

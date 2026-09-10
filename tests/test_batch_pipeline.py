@@ -312,6 +312,14 @@ class BatchPipelineTests(unittest.TestCase):
         self.assertIn("User Prompt 不能使用“列举多个场景 + 统一验证”的模板化验收尾句", issues)
         self.assertIn("User Prompt 不能追加“项目不设置 Docker 环境”式通用尾句", issues)
 
+    def test_prompt_style_rejects_evaluator_english_but_allows_technical_tokens(self):
+        issues = prompt_style_issues("Overall，这个模型的表现基本符合预期，请完成后台服务。")
+        self.assertIn("User Prompt 不能使用可由中文直接表达的英文评价或衔接词", issues)
+        technical = prompt_style_issues(
+            "为后端增加 /summary 路由，并让 SummaryService 返回 JSON 字段 `summary`，完成后执行 pytest。"
+        )
+        self.assertNotIn("User Prompt 不能使用可由中文直接表达的英文评价或衔接词", technical)
+
     def test_repeated_terminal_sentence_rejects_shared_tail(self):
         common_tail = "沿用仓库现有的启动方式，不增加额外的容器编排配置。"
         self.assertTrue(

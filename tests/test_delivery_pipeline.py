@@ -91,6 +91,39 @@ def automated_record(number: int = 1) -> dict:
     return values
 
 
+def valid_trajectory(question: object, number: int = 1) -> str:
+    session_id = f"session-{number:03d}"
+    turn_id = f"turn-{number:03d}"
+    tool_id = f"tool-{number:03d}"
+    events = [
+        {
+            "type": "user", "sessionId": session_id, "promptId": turn_id,
+            "cwd": question["folder_path"],
+            "message": {"role": "user", "content": question["prompt"]},
+        },
+        {
+            "type": "assistant", "sessionId": session_id,
+            "message": {"role": "assistant", "content": [{
+                "type": "tool_use", "id": tool_id, "name": "Read",
+                "input": {"file_path": str(Path(question["folder_path"]) / "README.md")},
+            }]},
+        },
+        {
+            "type": "user", "sessionId": session_id, "promptId": turn_id,
+            "message": {"role": "user", "content": [{
+                "type": "tool_result", "tool_use_id": tool_id, "content": "ok",
+            }]},
+        },
+        {
+            "type": "assistant", "sessionId": session_id,
+            "message": {"role": "assistant", "content": [{
+                "type": "text", "text": "实现与验证均已完成。",
+            }]},
+        },
+    ]
+    return "\n".join(json.dumps(event, ensure_ascii=False) for event in events) + "\n"
+
+
 class DeliveryPipelineTests(unittest.TestCase):
     def prepare(self, root: Path, count: int = 1) -> Path:
         database = root / "production.sqlite3"
@@ -115,10 +148,13 @@ class DeliveryPipelineTests(unittest.TestCase):
         )
         for question in questions:
             connection.execute(
-                "INSERT INTO runs(question_id, batch_run_id, launched_at, harness, harness_version) "
+                "INSERT INTO runs(question_id, batch_run_id, launched_at, harness, harness_version,status) "
                 "VALUES(?, ?, '2026-09-07T09:00:00+08:00', "
-                "'Claude Code', '2.1.259')",
+                "'Claude Code', '2.1.259','succeeded')",
                 (question["id"], f"run-{question['question_no']:03d}"),
+            )
+            (root / "0911" / f"session-{question['question_no']:03d}.jsonl").write_text(
+                valid_trajectory(question, question["question_no"]), encoding="utf-8",
             )
         connection.commit()
         connection.close()
@@ -247,6 +283,32 @@ class DeliveryPipelineTests(unittest.TestCase):
                 len(list((root / "0911").glob("轨迹_0911_第1题_session-001*.jsonl"))),
                 2,
             )
+
+    def test_later_failed_retry_does_not_hide_successful_session_trajectory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = self.prepare(root)
+            input_path = root / "score.json"
+            input_path.write_text(json.dumps(automated_record(), ensure_ascii=False), encoding="utf-8")
+            result = self.run_command([
+                sys.executable, str(COLLECTOR), "--db", str(database), "--batch", "0911",
+                "--question", "1", "--turn", "1", "--from-json", str(input_path),
+            ])
+            self.assertEqual(result.returncode, 0, result.stdout)
+            connection = connect(database)
+            question_id = connection.execute("SELECT id FROM questions").fetchone()[0]
+            connection.execute(
+                "INSERT INTO runs(question_id,batch_run_id,launched_at,status,session_id,trajectory_root) "
+                "VALUES(?,'later-failed','2026-09-07T12:00:00+08:00','failed','failed-session',?)",
+                (question_id, str(root / "missing-failed-trajectory")),
+            )
+            connection.commit()
+            connection.close()
+
+            result = self.run_command([
+                sys.executable, str(QC), "--db", str(database), "--batch", "0911",
+            ])
+            self.assertEqual(result.returncode, 0, result.stdout)
 
     def test_excel_export_selects_questions_and_all_their_turns(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -405,7 +467,7 @@ class DeliveryPipelineTests(unittest.TestCase):
             ])
             self.assertEqual(result.returncode, 0, result.stdout)
             connection = connect(database)
-            question = connection.execute("SELECT prompt FROM questions").fetchone()
+            question = connection.execute("SELECT * FROM questions").fetchone()
             trajectory_root = root / "worker-state" / "claude"
             trajectory_root.mkdir(parents=True)
             connection.execute(
@@ -414,21 +476,12 @@ class DeliveryPipelineTests(unittest.TestCase):
             )
             connection.commit()
             connection.close()
+            events = [json.loads(line) for line in valid_trajectory(question).splitlines()]
+            events[1]["message"]["content"][0]["input"] = {
+                "file_path": "/workspace/../project/.agents/skills/other/SKILL.md",
+            }
             (trajectory_root / "session-001.jsonl").write_text(
-                "\n".join((
-                    json.dumps({
-                        "type": "user", "sessionId": "session-001",
-                        "message": {"role": "user", "content": question["prompt"]},
-                    }, ensure_ascii=False),
-                    json.dumps({
-                        "type": "assistant", "sessionId": "session-001",
-                        "message": {"role": "assistant", "content": [{
-                            "type": "tool_use", "name": "Read",
-                            "input": {"file_path": "/workspace/../project/.agents/skills/other/SKILL.md"},
-                        }]},
-                    }, ensure_ascii=False),
-                )) + "\n",
-                encoding="utf-8",
+                "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in events), encoding="utf-8",
             )
 
             result = self.run_command([
@@ -494,6 +547,44 @@ class DeliveryPipelineTests(unittest.TestCase):
             ])
             self.assertNotEqual(result.returncode, 0, result.stdout)
             self.assertIn("must not repeat verbatim", result.stdout)
+
+    def test_other_issues_rejects_evaluator_english_and_repeated_dimension(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = self.prepare(root)
+            values = automated_record()
+            values["other_issues"] = "Overall，错误提示没有指出具体失败字段，排查请求时仍需读取服务端日志。"
+            input_path = root / "score.json"
+            input_path.write_text(json.dumps(values, ensure_ascii=False), encoding="utf-8")
+            result = self.run_command([
+                sys.executable, str(COLLECTOR), "--db", str(database), "--batch", "0911",
+                "--question", "1", "--turn", "1", "--from-json", str(input_path),
+            ])
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("英文评价", result.stdout)
+
+            values["other_issues"] = values["delivery_description"]
+            input_path.write_text(json.dumps(values, ensure_ascii=False), encoding="utf-8")
+            result = self.run_command([
+                sys.executable, str(COLLECTOR), "--db", str(database), "--batch", "0911",
+                "--question", "1", "--turn", "1", "--from-json", str(input_path),
+            ])
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("outside the five score dimensions", result.stdout)
+
+    def test_description_allows_summary_technical_identifiers(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = self.prepare(root)
+            values = automated_record()
+            values["other_issues"] = "服务保留了 /summary 路由和 SummaryService 类，JSON 字段 `summary` 的命名与现有协议一致。"
+            input_path = root / "score.json"
+            input_path.write_text(json.dumps(values, ensure_ascii=False), encoding="utf-8")
+            result = self.run_command([
+                sys.executable, str(COLLECTOR), "--db", str(database), "--batch", "0911",
+                "--question", "1", "--turn", "1", "--from-json", str(input_path),
+            ])
+            self.assertEqual(result.returncode, 0, result.stdout)
 
     def test_automated_record_rejects_tool_as_submitter(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -1,4 +1,5 @@
 .env
+.idea/
 09*/
 .tmp-*-spec.json
 production.sqlite3
