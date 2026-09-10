@@ -3049,8 +3049,12 @@ def main() -> int:
     parser.add_argument("--port", type=int, default=4173)
     parser.add_argument("--db", type=Path, default=DEFAULT_DATABASE)
     parser.add_argument("--no-open", action="store_true")
+    parser.add_argument(
+        "--allow-public", action="store_true",
+        help="明确允许绑定非回环地址；仅用于已配置防火墙白名单的 VPS",
+    )
     args = parser.parse_args()
-    if args.host not in {"127.0.0.1", "localhost", "::1"}:
+    if args.host not in {"127.0.0.1", "localhost", "::1"} and not args.allow_public:
         print("为保护本地数据，控制台只允许绑定本机地址。", file=sys.stderr)
         return 2
     data = ConsoleData(args.db)

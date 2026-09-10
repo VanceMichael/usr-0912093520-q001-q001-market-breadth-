@@ -62,6 +62,12 @@ ssh -N -L 18787:127.0.0.1:8787 ubuntu@43.161.250.107
 
 认证成功后终端持续无输出是正常状态。浏览器打开 `http://127.0.0.1:18787/`；本机 `4173` 控制台也会通过该地址聚合 VPS 调度状态、事件、原始日志和交付包。
 
+如确实需要通过 VPS 公网 IP 直接打开控制台，必须同时使用 `--allow-public` 启动参数，并在云安全组和系统防火墙中只放行固定管理 IP。不要只修改监听地址：
+
+```ini
+ExecStart=/usr/bin/python3 /home/ubuntu/UserSatisfactionRating-codex/webapp/server.py --host 0.0.0.0 --port 18787 --allow-public --db /home/ubuntu/UserSatisfactionRating-codex/production.sqlite3 --no-open
+```
+
 ## macOS 本机常驻
 
 本机和 VPS 完全独立抓取各自配置的新闻来源。安装本机 `launchd` 服务后，控制台和调度器会在登录时启动，并在异常退出后自动拉起：
