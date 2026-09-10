@@ -11,6 +11,7 @@ import platform
 import random
 import re
 import secrets
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -18,7 +19,7 @@ import threading
 import time
 from collections import deque
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -26,6 +27,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from tools.batch_pipeline import SNAPSHOT_RE, connect, prompt_hash, question_rows
+from tools.capacity import adaptive_model_limit, detect_capacity
 from tools.text_encoding import read_portable_text
 from tools.trajectory_gate import TrajectoryGateError, validate_effective_trajectory
 
@@ -715,6 +717,129 @@ def delivery_needed(db: Path, row: sqlite3.Row) -> bool:
     return succeeded is not None and (total == 0 or passed != total)
 
 
+def release_question_lease(db: Path, question_id: int, kind: str, owner: str) -> None:
+    if kind not in {"model", "delivery"}:
+        raise ValueError("unknown lease kind")
+    with connect(db) as connection:
+        connection.execute(
+            f"UPDATE questions SET {kind}_lease_owner='',{kind}_lease_expires_at='' "
+            f"WHERE id=? AND {kind}_lease_owner=?",
+            (question_id, owner),
+        )
+        connection.commit()
+
+
+def clear_question_leases(db: Path) -> None:
+    with connect(db) as connection:
+        connection.execute(
+            "UPDATE questions SET model_lease_owner='',model_lease_expires_at='',"
+            "delivery_lease_owner='',delivery_lease_expires_at=''"
+        )
+        connection.commit()
+
+
+def _claim_rows(
+    db: Path,
+    owner: str,
+    kind: str,
+    limit: int,
+    lease_seconds: int,
+    max_attempts: int = 2,
+    gateway_max_attempts: int = DEFAULT_GATEWAY_MAX_ATTEMPTS,
+) -> list[sqlite3.Row]:
+    if limit <= 0:
+        return []
+    if kind not in {"model", "delivery"}:
+        raise ValueError("unknown lease kind")
+    current = now()
+    expires = (datetime.now().astimezone() + timedelta(seconds=max(60, lease_seconds))).isoformat(
+        timespec="seconds"
+    )
+    with connect(db) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        if kind == "model":
+            rows = connection.execute(
+                "SELECT q.* FROM questions q JOIN batches b ON b.id=q.batch_id "
+                "WHERE b.status NOT IN ('completed','partial','failed') "
+                "AND q.status='approved' AND q.mechanical_qc='pass' AND q.qc_decision='pass' "
+                "AND q.qc_prompt_sha256=q.prompt_sha256 "
+                "AND (q.model_lease_owner='' OR julianday(q.model_lease_expires_at)<julianday(?)) "
+                "AND NOT EXISTS(SELECT 1 FROM runs s WHERE s.question_id=q.id AND s.status='succeeded') "
+                "AND (SELECT COUNT(*) FROM runs f WHERE f.question_id=q.id "
+                "AND f.status IN ('failed','timeout') AND COALESCE(f.failure_kind,'')!='transient_gateway')<? "
+                "AND (SELECT COUNT(*) FROM runs g WHERE g.question_id=q.id "
+                "AND g.status='failed' AND g.failure_kind='transient_gateway')<? "
+                "ORDER BY b.created_at,q.question_no LIMIT ?",
+                (current, max_attempts, gateway_max_attempts, limit * 4),
+            ).fetchall()
+            rows = [row for row in rows if ready(row)][:limit]
+        else:
+            candidates = connection.execute(
+                "SELECT q.* FROM questions q JOIN batches b ON b.id=q.batch_id "
+                "WHERE b.status NOT IN ('completed','partial','failed') "
+                "AND q.status='completed' "
+                "AND (q.delivery_lease_owner='' OR julianday(q.delivery_lease_expires_at)<julianday(?)) "
+                "AND EXISTS(SELECT 1 FROM runs s WHERE s.question_id=q.id AND s.status='succeeded') "
+                "AND ((SELECT COUNT(*) FROM records r WHERE r.question_id=q.id)=0 "
+                "OR (SELECT COUNT(*) FROM records r WHERE r.question_id=q.id "
+                "AND r.delivery_qc_passed=1 AND r.delivery_qc_note='质检通过') "
+                "!=(SELECT COUNT(*) FROM records r WHERE r.question_id=q.id)) "
+                "ORDER BY b.created_at,q.question_no LIMIT ?",
+                (current, limit * 8),
+            ).fetchall()
+            rows = list(candidates[:limit])
+        claimed: list[int] = []
+        for row in rows:
+            cursor = connection.execute(
+                f"UPDATE questions SET {kind}_lease_owner=?,{kind}_lease_expires_at=? "
+                f"WHERE id=? AND ({kind}_lease_owner='' "
+                f"OR julianday({kind}_lease_expires_at)<julianday(?))",
+                (owner, expires, row["id"], current),
+            )
+            if cursor.rowcount:
+                claimed.append(int(row["id"]))
+        connection.commit()
+        if not claimed:
+            return []
+        placeholders = ",".join("?" for _value in claimed)
+        return connection.execute(
+            f"SELECT q.* FROM questions q JOIN batches b ON b.id=q.batch_id "
+            f"WHERE q.id IN ({placeholders}) ORDER BY b.created_at,q.question_no",
+            claimed,
+        ).fetchall()
+
+
+def active_batch_names(db: Path) -> list[str]:
+    with connect(db) as connection:
+        return [
+            str(row["name"])
+            for row in connection.execute(
+                "SELECT name FROM batches WHERE status NOT IN ('completed','partial','failed') "
+                "ORDER BY created_at,id"
+            )
+        ]
+
+
+def batch_ready_to_finalize(db: Path, batch: str) -> bool:
+    with connect(db) as connection:
+        rows = connection.execute(
+            "SELECT q.status,COUNT(r.id) AS records,"
+            "SUM(CASE WHEN r.delivery_qc_passed=1 AND r.delivery_qc_note='质检通过' THEN 1 ELSE 0 END) passed "
+            "FROM questions q JOIN batches b ON b.id=q.batch_id "
+            "LEFT JOIN records r ON r.question_id=q.id WHERE b.name=? GROUP BY q.id",
+            (batch,),
+        ).fetchall()
+    return bool(rows) and all(
+        row["status"] == "blocked"
+        or (
+            row["status"] == "completed"
+            and int(row["records"] or 0) > 0
+            and int(row["records"] or 0) == int(row["passed"] or 0)
+        )
+        for row in rows
+    )
+
+
 def deliver_one(
     db: Path, row: sqlite3.Row, codex: str, data_root: Path, timeout: int,
 ) -> tuple[str, int, str]:
@@ -936,6 +1061,165 @@ def run_delivery_pipeline(args: argparse.Namespace) -> int:
     return 0 if terminal else (1 if errors else 0)
 
 
+def run_global_delivery_pipeline(args: argparse.Namespace) -> int:
+    """Continuously drain model and delivery work across every active batch."""
+    database = args.db.resolve()
+    owner = f"{socket.gethostname()}-{os.getpid()}-{secrets.token_hex(4)}"
+    sentinel = args.producer_sentinel.resolve() if args.producer_sentinel else None
+    model_lease_seconds = (
+        args.timeout * (args.max_attempts + args.gateway_max_attempts)
+        + args.gateway_backoff_max * max(0, args.gateway_max_attempts - 1)
+        + 600
+    )
+    delivery_lease_seconds = args.agent_timeout * 2 + 600
+    circuit_breaker = GatewayCircuitBreaker(
+        args.gateway_circuit_threshold,
+        args.gateway_circuit_window,
+        args.gateway_circuit_cooldown,
+    )
+    scheduled_exports: set[str] = set()
+    export_attempts: dict[str, int] = {}
+    delivery_attempts: dict[int, int] = {}
+    fatal_configuration = False
+    idle_since = time.monotonic()
+    adaptive_reason = ""
+    memory_match = re.fullmatch(r"([0-9]+)([mg])", args.memory.strip().lower())
+    worker_memory_gb = (
+        int(memory_match.group(1)) / 1024
+        if memory_match and memory_match.group(2) == "m"
+        else float(memory_match.group(1)) if memory_match else 2.0
+    )
+    machine_capacity = detect_capacity()
+
+    def leased_model(row: sqlite3.Row) -> tuple[str, int, str]:
+        try:
+            return run_with_retries(
+                database, row, args.env_file.resolve(), args.data_root.resolve(),
+                args.image, args.cpus, args.memory, args.timeout, args.max_attempts,
+                args.heartbeat_seconds, args.start_timeout, args.stalled_timeout,
+                args.gateway_max_attempts, args.gateway_backoff_base,
+                args.gateway_backoff_max, circuit_breaker,
+            )
+        finally:
+            release_question_lease(database, int(row["id"]), "model", owner)
+
+    def leased_delivery(row: sqlite3.Row) -> tuple[str, int, str]:
+        question_id = int(row["id"])
+        try:
+            result = deliver_one(
+                database, row, args.codex, args.data_root.resolve(), args.agent_timeout,
+            )
+            if result[1]:
+                delivery_attempts[question_id] = delivery_attempts.get(question_id, 0) + 1
+                if delivery_attempts[question_id] >= args.delivery_max_attempts:
+                    block_question(database, question_id)
+            else:
+                delivery_attempts.pop(question_id, None)
+            return result
+        finally:
+            release_question_lease(database, question_id, "delivery", owner)
+
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=args.concurrency, thread_name_prefix="global-model"
+    ) as model_pool, concurrent.futures.ThreadPoolExecutor(
+        max_workers=args.codex_concurrency, thread_name_prefix="global-delivery"
+    ) as delivery_pool, concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="global-export"
+    ) as export_pool:
+        model_futures: dict[concurrent.futures.Future, sqlite3.Row] = {}
+        delivery_futures: dict[concurrent.futures.Future, sqlite3.Row] = {}
+        export_futures: dict[concurrent.futures.Future, str] = {}
+
+        while not fatal_configuration:
+            producer_done = sentinel is not None and sentinel.exists()
+            admission_limit, reason = adaptive_model_limit(
+                args.concurrency, len(model_futures), worker_memory_gb,
+                machine_capacity,
+            )
+            if reason != adaptive_reason:
+                adaptive_reason = reason
+                print(
+                    f"adaptive model limit={admission_limit}/{args.concurrency}: {reason}",
+                    flush=True,
+                )
+            model_slots = admission_limit - len(model_futures)
+            for row in _claim_rows(
+                database, owner, "model", model_slots, model_lease_seconds,
+                args.max_attempts, args.gateway_max_attempts,
+            ):
+                model_futures[model_pool.submit(leased_model, row)] = row
+                print(f"{row['task_id']}: leased by global model pool", flush=True)
+
+            delivery_slots = args.codex_concurrency - len(delivery_futures)
+            for row in _claim_rows(
+                database, owner, "delivery", delivery_slots, delivery_lease_seconds,
+            ):
+                delivery_futures[delivery_pool.submit(leased_delivery, row)] = row
+                print(f"{row['task_id']}: leased by global delivery pool", flush=True)
+
+            for batch in active_batch_names(database):
+                if (
+                    batch not in scheduled_exports
+                    and batch_ready_to_finalize(database, batch)
+                    and not export_futures
+                ):
+                    scheduled_exports.add(batch)
+                    export_futures[export_pool.submit(
+                        finalize_batch, database, batch, args.codex,
+                        args.data_root.resolve(), args.agent_timeout,
+                    )] = batch
+                    break
+
+            futures = set(model_futures) | set(delivery_futures) | set(export_futures)
+            if not futures:
+                if producer_done or time.monotonic() - idle_since >= args.idle_timeout:
+                    break
+                time.sleep(min(5, max(1, args.poll_seconds)))
+                continue
+
+            idle_since = time.monotonic()
+            done, _pending = concurrent.futures.wait(
+                futures, timeout=max(1, args.poll_seconds),
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            for future in done:
+                if future in model_futures:
+                    row = model_futures.pop(future)
+                    try:
+                        task_id, code, message = future.result()
+                    except Exception as exc:
+                        task_id, code, message = str(row["task_id"]), 1, str(exc)
+                    print(f"{task_id}: {message}", flush=True)
+                    if code:
+                        classification = latest_failure(database, int(row["id"]), message)
+                        if classification.kind in {"permanent_auth", "model_config", "environment"}:
+                            fatal_configuration = True
+                            print(
+                                f"global model pool stopped after non-retryable {classification.kind} failure",
+                                file=sys.stderr, flush=True,
+                            )
+                elif future in delivery_futures:
+                    row = delivery_futures.pop(future)
+                    try:
+                        task_id, _code, message = future.result()
+                    except Exception as exc:
+                        task_id, message = str(row["task_id"]), str(exc)
+                    print(f"{task_id}: {message}", flush=True)
+                else:
+                    batch = export_futures.pop(future)
+                    try:
+                        code, message = future.result()
+                    except Exception as exc:
+                        code, message = 1, str(exc)
+                    print(f"{batch}: {message}", flush=True)
+                    if code:
+                        export_attempts[batch] = export_attempts.get(batch, 0) + 1
+                        if export_attempts[batch] < 2:
+                            scheduled_exports.discard(batch)
+
+    return 1 if fatal_configuration else 0
+
+
 def main() -> int:
     def env_seconds(name: str, default: int) -> int:
         try:
@@ -945,7 +1229,7 @@ def main() -> int:
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--db", type=Path, default=Path("production.sqlite3"))
-    parser.add_argument("--batch", required=True)
+    parser.add_argument("--batch", default="")
     parser.add_argument("--env-file", type=Path, default=Path(".env"))
     parser.add_argument("--data-root", type=Path, default=Path("runs"))
     parser.add_argument("--image", default="ccusr-claude-worker:local")
@@ -991,16 +1275,24 @@ def main() -> int:
         default=env_seconds("CC_GATEWAY_CIRCUIT_COOLDOWN", DEFAULT_GATEWAY_CIRCUIT_COOLDOWN),
     )
     parser.add_argument("--deliver", action="store_true")
+    parser.add_argument("--all-active", action="store_true")
+    parser.add_argument("--producer-sentinel", type=Path)
+    parser.add_argument("--idle-timeout", type=int, default=30)
+    parser.add_argument("--delivery-max-attempts", type=int, default=2)
     parser.add_argument("--codex", default="codex")
     parser.add_argument("--codex-concurrency", type=int, default=1)
     parser.add_argument("--agent-timeout", type=int, default=3600)
     parser.add_argument("--loop", action="store_true")
     parser.add_argument("--poll-seconds", type=int, default=15)
     args = parser.parse_args()
+    if not args.all_active and not args.batch:
+        parser.error("--batch is required unless --all-active is used")
     if args.concurrency < 1:
         parser.error("--concurrency must be positive")
     if args.codex_concurrency < 1:
         parser.error("--codex-concurrency must be positive")
+    if args.concurrency > 32 or args.codex_concurrency > 32:
+        parser.error("concurrency must not exceed 32")
     if min(
         args.heartbeat_seconds, args.start_timeout, args.stalled_timeout, args.timeout,
         args.gateway_max_attempts, args.gateway_backoff_base, args.gateway_backoff_max,
@@ -1009,6 +1301,8 @@ def main() -> int:
     ) < 1:
         parser.error("worker monitoring timeouts must be positive")
     if args.deliver:
+        if args.all_active:
+            return run_global_delivery_pipeline(args)
         return run_delivery_pipeline(args)
     while True:
         circuit_breaker = GatewayCircuitBreaker(

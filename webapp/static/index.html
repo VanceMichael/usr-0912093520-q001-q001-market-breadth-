@@ -244,11 +244,18 @@
           <div class="pipeline-config-fields" aria-label="Claude 流水线配置">
             <label class="settings-field"><span>Claude Docker 镜像</span><input id="config-docker-image" placeholder="claude-cli:latest"></label>
             <label class="settings-field"><span>容器内命令</span><input id="config-docker-command" placeholder="claude"></label>
+            <div class="concurrency-heading"><strong>流水线容量</strong><button class="button secondary compact" type="button" id="detect-capacity"><i data-lucide="cpu"></i>读取本机配置</button></div>
             <div class="pipeline-concurrency-fields">
-              <label class="settings-field"><span>题目质检并发</span><input id="config-qc-concurrency" type="number" min="1" max="8" value="2"></label>
-              <label class="settings-field"><span>模型跑题并发</span><input id="config-model-concurrency" type="number" min="1" max="8" value="2"></label>
-              <label class="settings-field"><span>Codex 交付并发</span><input id="config-codex-concurrency" type="number" min="1" max="8" value="2"></label>
+              <label class="settings-field"><span>题目质检并发</span><input id="config-qc-concurrency" type="number" min="1" max="32" value="2"></label>
+              <label class="settings-field"><span>模型跑题并发</span><input id="config-model-concurrency" type="number" min="1" max="32" value="2"></label>
+              <label class="settings-field"><span>Codex 交付并发</span><input id="config-codex-concurrency" type="number" min="1" max="32" value="2"></label>
             </div>
+            <div class="pipeline-concurrency-fields">
+              <label class="settings-field"><span>已质检题目缓冲水位</span><input id="config-ready-target" type="number" min="1" max="200" value="40"></label>
+              <label class="settings-field"><span>单容器 CPU</span><input id="config-worker-cpus" type="number" min="0.25" max="4" step="0.25" value="1"></label>
+              <label class="settings-field"><span>单容器内存</span><input id="config-worker-memory" value="2g" placeholder="2g"></label>
+            </div>
+            <div id="capacity-result" class="capacity-result" hidden></div>
             <div class="pipeline-concurrency-fields" aria-label="网关重试配置">
               <label class="settings-field"><span>网关最大尝试</span><input id="config-gateway-max-attempts" type="number" min="1" max="10" value="3"></label>
               <label class="settings-field"><span>退避初始秒数</span><input id="config-gateway-backoff-base" type="number" min="1" max="3600" value="30"></label>

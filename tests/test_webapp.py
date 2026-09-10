@@ -35,6 +35,21 @@ def question_spec(batch: str) -> dict:
 
 
 class WebConsoleTests(unittest.TestCase):
+    def test_console_initializes_a_new_database(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "production.sqlite3"
+            data = ConsoleData(database, root)
+            try:
+                self.assertTrue(database.is_file())
+                with sqlite3.connect(database) as connection:
+                    version = connection.execute(
+                        "SELECT value FROM schema_meta WHERE key='schema_version'"
+                    ).fetchone()
+                self.assertIsNotNone(version)
+            finally:
+                data.shutdown()
+
     def test_event_message_accepts_scalar_json_output(self):
         self.assertEqual(ConsoleData._event_message('"plain output"'), '"plain output"')
 
@@ -187,6 +202,17 @@ class WebConsoleTests(unittest.TestCase):
             self.assertEqual(len(result["config"]["news_feeds"]), 3)
             if os.name != "nt":
                 self.assertEqual(env_file.stat().st_mode & 0o777, 0o600)
+
+    def test_capacity_recommendation_exposes_both_profiles(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = ConsoleData(self.make_database(root), root)
+            try:
+                expected = {"recommended": {"model_concurrency": 12}, "maximum": {"model_concurrency": 14}}
+                with mock.patch("webapp.server.scheduler_capacity", return_value=expected):
+                    self.assertEqual(data.concurrency_recommendation(), expected)
+            finally:
+                data.shutdown()
 
     def test_news_feed_configuration_is_persisted_and_validated(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -1101,7 +1101,7 @@ def main() -> int:
                 print("流水线任务已不再处于可运行状态", file=sys.stderr)
                 return 130
         runner = Pipeline(args.db, args.batch, args.job_id, print)
-        runner.execute(args.image, args.claude_command, max(1, min(args.qc_concurrency, 8)), max(1, min(args.model_concurrency, 8)), max(1, min(args.codex_concurrency, 8)), args.model_mode)
+        runner.execute(args.image, args.claude_command, max(1, min(args.qc_concurrency, 32)), max(1, min(args.model_concurrency, 32)), max(1, min(args.codex_concurrency, 32)), args.model_mode)
         runner.set_job(status="completed", finished_at=timestamp(), last_message="全流程完成")
         return 0
     except PipelineInterrupted as exc:

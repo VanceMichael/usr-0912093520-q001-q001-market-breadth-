@@ -19,7 +19,7 @@ from datetime import datetime
 from pathlib import Path
 
 
-SCHEMA_VERSION = 13
+SCHEMA_VERSION = 14
 DEFAULT_NEWS_FEEDS = (
     "https://channel.chinanews.com.cn/cns/cl/gn-js.shtml",
     "https://channel.chinanews.com.cn/cns/cl/gn-kjww.shtml",
@@ -167,6 +167,10 @@ CREATE TABLE IF NOT EXISTS questions (
     human_reviewer TEXT NOT NULL DEFAULT '',
     approved_at TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'draft',
+    model_lease_owner TEXT NOT NULL DEFAULT '',
+    model_lease_expires_at TEXT NOT NULL DEFAULT '',
+    delivery_lease_owner TEXT NOT NULL DEFAULT '',
+    delivery_lease_expires_at TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE (batch_id, question_no),
@@ -384,6 +388,23 @@ def connect(database: Path) -> sqlite3.Connection:
         connection.execute("ALTER TABLE questions ADD COLUMN author_mode TEXT NOT NULL DEFAULT '0-1'")
     if "mother_id" not in question_columns:
         connection.execute("ALTER TABLE questions ADD COLUMN mother_id INTEGER")
+    question_lease_columns = {
+        "model_lease_owner": "TEXT NOT NULL DEFAULT ''",
+        "model_lease_expires_at": "TEXT NOT NULL DEFAULT ''",
+        "delivery_lease_owner": "TEXT NOT NULL DEFAULT ''",
+        "delivery_lease_expires_at": "TEXT NOT NULL DEFAULT ''",
+    }
+    for name, definition in question_lease_columns.items():
+        if name not in question_columns:
+            connection.execute(f"ALTER TABLE questions ADD COLUMN {name} {definition}")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_questions_model_lease "
+        "ON questions(status, model_lease_expires_at, batch_id, question_no)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_questions_delivery_lease "
+        "ON questions(status, delivery_lease_expires_at, batch_id, question_no)"
+    )
     # Backfill the mother catalog for databases created before the catalog existed.
     connection.execute(
         "INSERT OR IGNORE INTO mother_library(source_question_id, source_batch, source_task_id, title, prompt, workspace_path, "

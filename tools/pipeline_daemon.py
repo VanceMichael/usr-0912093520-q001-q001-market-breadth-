@@ -13,10 +13,12 @@ from contextlib import contextmanager
 import json
 import math
 import os
+import re
 import signal
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -31,6 +33,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from tools.batch_pipeline import connect  # noqa: E402
 from tools.authoring_policy import backend_only_requirement  # noqa: E402
 from tools.news_topics import DEFAULT_FEEDS, configured_feeds, ingest  # noqa: E402
+from tools.orchestrator import clear_question_leases  # noqa: E402
 from tools.scheduler_state import SchedulerStore  # noqa: E402
 from tools.text_encoding import read_portable_text  # noqa: E402
 
@@ -127,8 +130,6 @@ def recover_interrupted_runs(database: Path) -> int:
         rows = connection.execute(
             "SELECT r.id,r.question_id,r.container_id FROM runs r WHERE r.status='running'"
         ).fetchall()
-        if not rows:
-            return 0
         for row in rows:
             container = str(row["container_id"] or "").strip()
             if container:
@@ -147,6 +148,10 @@ def recover_interrupted_runs(database: Path) -> int:
                 "UPDATE questions SET status='approved',updated_at=? WHERE id=? AND status='running'",
                 (now(), row["question_id"]),
             )
+        connection.execute(
+            "UPDATE questions SET model_lease_owner='',model_lease_expires_at='',"
+            "delivery_lease_owner='',delivery_lease_expires_at=''"
+        )
         connection.commit()
     return len(rows)
 
@@ -199,6 +204,7 @@ def cleanup_logs(log_dir: Path, retention_days: int, max_log_gb: float) -> tuple
 def run_command(
     command: list[str], cwd: Path, log: Path, timeout: int,
     store: SchedulerStore | None = None,
+    drain_sentinel: Path | None = None,
 ) -> int:
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.open("a", encoding="utf-8") as handle:
@@ -213,12 +219,15 @@ def run_command(
             if store is not None:
                 state = store.heartbeat()
                 desired = str(state.get("desired_state") or "running")
+                if desired == "draining" and drain_sentinel is not None:
+                    drain_sentinel.parent.mkdir(parents=True, exist_ok=True)
+                    drain_sentinel.write_text("draining", encoding="utf-8")
                 if desired in {"stopped", "restarting"}:
                     handle.write(f"[{now()}] scheduler requested {desired}; terminating child\n")
                     handle.flush()
                     _terminate_process(process)
                     raise SchedulerInterrupted(desired)
-            if time.monotonic() - started >= timeout:
+            if timeout > 0 and time.monotonic() - started >= timeout:
                 _terminate_process(process)
                 raise subprocess.TimeoutExpired(command, timeout)
             time.sleep(1)
@@ -255,6 +264,8 @@ def load_runtime_env(path: Path) -> None:
             os.environ["CC_AUTHOR_BATCH_SIZE"] = value
         elif key in {
             "CC_PIPELINE_MODEL_CONCURRENCY", "CC_PIPELINE_CODEX_CONCURRENCY",
+            "CC_PIPELINE_READY_TARGET", "CC_CLAUDE_WORKER_CPUS",
+            "CC_CLAUDE_WORKER_MEMORY",
             "CC_CLAUDE_DOCKER_IMAGE", "CC_CLAUDE_HEARTBEAT_SECONDS",
             "CC_CLAUDE_START_TIMEOUT", "CC_CLAUDE_STALLED_TIMEOUT",
             "CC_PIPELINE_WORKER_TIMEOUT",
@@ -564,24 +575,156 @@ def run_batch(database: Path, args: argparse.Namespace, batch: str, store: Sched
     )
 
 
+def run_global_queue(
+    database: Path,
+    args: argparse.Namespace,
+    sentinel: Path,
+    store: SchedulerStore,
+) -> int:
+    store.heartbeat(
+        phase="model", batch="", detail="全局模型池、交付池和导出池正在跨批次处理",
+    )
+    store.event("phase_started", "开始跨批次全局流水线", phase="model")
+    return run_command(
+        [
+            sys.executable, str(PROJECT_ROOT / "tools" / "orchestrator.py"),
+            "--db", str(database), "--all-active", "--deliver",
+            "--producer-sentinel", str(sentinel),
+            "--idle-timeout", str(args.global_idle_timeout),
+            "--poll-seconds", "5",
+            "--env-file", str(args.env_file.resolve()),
+            "--data-root", str(args.data_root.resolve()),
+            "--image", args.worker_image,
+            "--concurrency", str(args.concurrency),
+            "--cpus", str(args.worker_cpus),
+            "--memory", args.worker_memory,
+            "--codex", args.codex,
+            "--codex-concurrency", str(args.codex_concurrency),
+            "--agent-timeout", str(args.agent_timeout),
+            "--max-attempts", str(args.max_attempts),
+            "--gateway-max-attempts", str(args.gateway_max_attempts),
+            "--gateway-backoff-base", str(args.gateway_backoff_base),
+            "--gateway-backoff-max", str(args.gateway_backoff_max),
+            "--gateway-circuit-threshold", str(args.gateway_circuit_threshold),
+            "--gateway-circuit-window", str(args.gateway_circuit_window),
+            "--gateway-circuit-cooldown", str(args.gateway_circuit_cooldown),
+            "--heartbeat-seconds", str(args.heartbeat_seconds),
+            "--start-timeout", str(args.start_timeout),
+            "--stalled-timeout", str(args.stalled_timeout),
+            "--timeout", str(args.worker_timeout),
+        ],
+        PROJECT_ROOT,
+        args.log_dir.resolve() / "workers-global.log",
+        0,
+        store,
+        sentinel,
+    )
+
+
+def maintain_ready_buffer(
+    database: Path,
+    args: argparse.Namespace,
+    store: SchedulerStore,
+    stop_event: threading.Event,
+    sentinel: Path,
+    outcome: dict[str, object],
+) -> None:
+    """Keep authoring in parallel until control state asks the global pool to drain."""
+    try:
+        while not stop_event.is_set():
+            desired = str(store.state().get("desired_state") or "running")
+            if desired != "running":
+                break
+            if count_ready(database) >= args.ready_watermark:
+                stop_event.wait(2)
+                continue
+            if not has_new_topics(database):
+                feeds = configured_feeds(database) if args.dynamic_feeds else args.feeds
+                added, errors = ingest(database, feeds, args.feed_timeout)
+                if errors and not added:
+                    stop_event.wait(min(60, max(5, args.poll_seconds)))
+                    continue
+                if not has_new_topics(database):
+                    stop_event.wait(min(60, max(5, args.poll_seconds)))
+                    continue
+            code, batch = create_next_batch(database, args, store)
+            if code:
+                outcome.update(code=code, batch=batch)
+                break
+            if batch:
+                store.event(
+                    "buffer_batch_created",
+                    f"题目缓冲池新增批次 {batch}",
+                    phase="author", batch=batch,
+                    details={"ready_target": args.ready_watermark},
+                )
+    except Exception as exc:
+        outcome.update(code=1, error=f"{type(exc).__name__}: {exc}")
+    finally:
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.write_text("producer stopped", encoding="utf-8")
+
+
 def cycle(args: argparse.Namespace, store: SchedulerStore | None = None) -> tuple[int, str]:
     load_runtime_env(args.env_file.resolve())
     database = args.db.resolve()
+    args.ready_watermark = getattr(args, "ready_watermark", 40)
+    args.worker_cpus = getattr(args, "worker_cpus", 1.0)
+    args.worker_memory = getattr(args, "worker_memory", "2g")
+    args.heartbeat_seconds = getattr(args, "heartbeat_seconds", 5)
+    args.start_timeout = getattr(args, "start_timeout", 300)
+    args.stalled_timeout = getattr(args, "stalled_timeout", 900)
+    args.global_idle_timeout = getattr(args, "global_idle_timeout", 1800)
+    args.worker_timeout = getattr(args, "worker_timeout", 3600)
+    args.max_attempts = getattr(args, "max_attempts", 2)
+    for field, default in (
+        ("gateway_max_attempts", 3),
+        ("gateway_backoff_base", 30),
+        ("gateway_backoff_max", 300),
+        ("gateway_circuit_threshold", 2),
+        ("gateway_circuit_window", 120),
+        ("gateway_circuit_cooldown", 180),
+    ):
+        setattr(args, field, getattr(args, field, default))
     feeds = configured_feeds(database) if args.dynamic_feeds else args.feeds
     try:
-        args.concurrency = max(1, min(8, int(os.environ.get("CC_PIPELINE_MODEL_CONCURRENCY", args.concurrency))))
+        args.concurrency = max(1, min(32, int(os.environ.get("CC_PIPELINE_MODEL_CONCURRENCY", args.concurrency))))
     except ValueError:
         pass
     try:
-        args.codex_concurrency = max(1, min(8, int(os.environ.get("CC_PIPELINE_CODEX_CONCURRENCY", args.codex_concurrency))))
+        args.codex_concurrency = max(1, min(32, int(os.environ.get("CC_PIPELINE_CODEX_CONCURRENCY", args.codex_concurrency))))
     except ValueError:
         pass
+    try:
+        args.ready_watermark = max(
+            1, min(200, int(os.environ.get("CC_PIPELINE_READY_TARGET", args.ready_watermark)))
+        )
+    except ValueError:
+        pass
+    try:
+        args.worker_cpus = max(
+            0.25, min(4.0, float(os.environ.get("CC_CLAUDE_WORKER_CPUS", args.worker_cpus)))
+        )
+    except ValueError:
+        pass
+    worker_memory = os.environ.get("CC_CLAUDE_WORKER_MEMORY", args.worker_memory).strip().lower()
+    if re.fullmatch(r"[1-9][0-9]*(?:[mg])", worker_memory):
+        args.worker_memory = worker_memory
     try:
         args.worker_timeout = max(
             1, int(os.environ.get("CC_PIPELINE_WORKER_TIMEOUT", args.worker_timeout))
         )
     except ValueError:
         pass
+    for field, key in (
+        ("heartbeat_seconds", "CC_CLAUDE_HEARTBEAT_SECONDS"),
+        ("start_timeout", "CC_CLAUDE_START_TIMEOUT"),
+        ("stalled_timeout", "CC_CLAUDE_STALLED_TIMEOUT"),
+    ):
+        try:
+            setattr(args, field, max(1, int(os.environ.get(key, getattr(args, field)))))
+        except ValueError:
+            pass
     for field, key in (
         ("gateway_max_attempts", "CC_GATEWAY_MAX_ATTEMPTS"),
         ("gateway_backoff_base", "CC_GATEWAY_BACKOFF_BASE"),
@@ -612,6 +755,32 @@ def cycle(args: argparse.Namespace, store: SchedulerStore | None = None) -> tupl
     )
     if run_mode == "author_only":
         return create_next_batch(database, args, store)
+    if store is not None:
+        if not active_batches(database):
+            code, created = create_next_batch(database, args, store)
+            if code or not created:
+                return code, created
+        sentinel = args.log_dir.resolve() / f"producer-{os.getpid()}.done"
+        sentinel.unlink(missing_ok=True)
+        stop_event = threading.Event()
+        outcome: dict[str, object] = {"code": 0, "batch": ""}
+        producer = threading.Thread(
+            target=maintain_ready_buffer,
+            args=(database, args, store, stop_event, sentinel, outcome),
+            name="question-buffer-producer", daemon=True,
+        )
+        producer.start()
+        try:
+            code = run_global_queue(database, args, sentinel, store)
+        finally:
+            stop_event.set()
+            producer.join()
+            sentinel.unlink(missing_ok=True)
+        producer_code = int(outcome.get("code") or 0)
+        if producer_code:
+            error = str(outcome.get("error") or "题目缓冲池生产失败")
+            store.event("buffer_failed", error, level="error", phase="author")
+        return code or producer_code, str(outcome.get("batch") or "")
     for existing_batch in active_batches(database):
         if run_batch(database, args, existing_batch, store):
             return 1, existing_batch
@@ -646,7 +815,13 @@ def main() -> int:
     parser.add_argument("--gateway-circuit-window", type=int, default=120)
     parser.add_argument("--gateway-circuit-cooldown", type=int, default=180)
     parser.add_argument("--worker-timeout", type=int, default=3600)
-    parser.add_argument("--ready-watermark", type=int, default=4)
+    parser.add_argument("--worker-cpus", type=float, default=1.0)
+    parser.add_argument("--worker-memory", default="2g")
+    parser.add_argument("--heartbeat-seconds", type=int, default=5)
+    parser.add_argument("--start-timeout", type=int, default=300)
+    parser.add_argument("--stalled-timeout", type=int, default=900)
+    parser.add_argument("--global-idle-timeout", type=int, default=1800)
+    parser.add_argument("--ready-watermark", type=int, default=40)
     parser.add_argument("--feed-timeout", type=int, default=20)
     parser.add_argument("--agent-timeout", type=int, default=3600)
     parser.add_argument("--loop", action="store_true")
@@ -676,6 +851,7 @@ def main() -> int:
     try:
         store.startup()
         recovered = recover_interrupted_runs(args.db.resolve())
+        clear_question_leases(args.db.resolve())
         if recovered:
             store.event(
                 "runs_recovered", f"已回收 {recovered} 个中断的 Claude 任务",

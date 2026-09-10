@@ -37,6 +37,30 @@ class OrchestratorTest(unittest.TestCase):
             connection.commit()
             return connection.execute("SELECT * FROM questions ORDER BY question_no").fetchall()
 
+    def test_clear_question_leases_reclaims_model_and_delivery_claims(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            db = root / "production.sqlite3"
+            rows = self.make_question(root, db)
+            with connect(db) as connection:
+                connection.execute(
+                    "UPDATE questions SET model_lease_owner='old-model',"
+                    "model_lease_expires_at='2999-01-01T00:00:00+00:00',"
+                    "delivery_lease_owner='old-delivery',"
+                    "delivery_lease_expires_at='2999-01-01T00:00:00+00:00' WHERE id=?",
+                    (rows[0]["id"],),
+                )
+                connection.commit()
+
+            orchestrator.clear_question_leases(db)
+
+            with connect(db) as connection:
+                row = connection.execute(
+                    "SELECT model_lease_owner,model_lease_expires_at,"
+                    "delivery_lease_owner,delivery_lease_expires_at FROM questions"
+                ).fetchone()
+            self.assertEqual(tuple(row), ("", "", "", ""))
+
     def test_two_workers_create_independent_runs_and_logs(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -206,6 +230,55 @@ class OrchestratorTest(unittest.TestCase):
         self.assertFalse(breaker.snapshot()["open"])
         breaker.record_transient_failure()
         self.assertTrue(breaker.snapshot()["open"])
+
+    def test_global_model_claims_span_batches_without_duplicate_leases(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            db = root / "production.sqlite3"
+            with connect(db) as connection:
+                for batch_index in (1, 2):
+                    batch = f"b{batch_index}"
+                    connection.execute(
+                        "INSERT INTO batches(name,folder_path,markdown_path,question_count,status,created_at,updated_at) "
+                        "VALUES(?,?,?,?, 'ready','now','now')",
+                        (batch, str(root / batch), str(root / f"{batch}.md"), 1),
+                    )
+                    batch_id = connection.execute(
+                        "SELECT id FROM batches WHERE name=?", (batch,)
+                    ).fetchone()[0]
+                    prompt = f"实现后端服务 {batch_index}"
+                    digest = orchestrator.prompt_hash(prompt)
+                    connection.execute(
+                        "INSERT INTO questions(batch_id,question_no,task_id,folder_name,folder_path,title,prompt,prompt_sha256,"
+                        "task_type,difficulty,languages,reproducibility,mechanical_qc,qc_decision,qc_prompt_sha256,status,created_at,updated_at) "
+                        "VALUES(?,1,?,?,?,'title',?,?,'0-1 代码生成','中等','Python','无外部依赖','pass','pass',?,'approved','now','now')",
+                        (batch_id, f"{batch}-001", "q001", str(root / batch / "q001"), prompt, digest, digest),
+                    )
+                connection.commit()
+
+            first = orchestrator._claim_rows(db, "owner-a", "model", 1, 3600)
+            second = orchestrator._claim_rows(db, "owner-b", "model", 2, 3600)
+            self.assertEqual([row["task_id"] for row in first], ["b1-001"])
+            self.assertEqual([row["task_id"] for row in second], ["b2-001"])
+            orchestrator.release_question_lease(db, int(first[0]["id"]), "model", "owner-a")
+            reclaimed = orchestrator._claim_rows(db, "owner-c", "model", 1, 3600)
+            self.assertEqual([row["task_id"] for row in reclaimed], ["b1-001"])
+
+    def test_global_delivery_claim_requires_successful_model_run(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            db = root / "production.sqlite3"
+            row = self.make_question(root, db)[0]
+            with connect(db) as connection:
+                connection.execute("UPDATE questions SET status='completed' WHERE id=?", (row["id"],))
+                connection.execute(
+                    "INSERT INTO runs(question_id,batch_run_id,launched_at,status) "
+                    "VALUES(?,'success','now','succeeded')",
+                    (row["id"],),
+                )
+                connection.commit()
+            claimed = orchestrator._claim_rows(db, "delivery", "delivery", 1, 3600)
+            self.assertEqual([item["task_id"] for item in claimed], [row["task_id"]])
 
     def test_monitor_reclaims_worker_that_never_produces_output(self):
         with tempfile.TemporaryDirectory() as raw:

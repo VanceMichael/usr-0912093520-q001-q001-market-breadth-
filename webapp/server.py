@@ -57,7 +57,9 @@ PIPELINE_ENV_KEYS = (
     "CC_CLAUDE_DOCKER_IMAGE", "CC_CLAUDE_DOCKER_COMMAND",
     "CC_PIPELINE_MODEL_MODE",
     "CC_PIPELINE_QC_CONCURRENCY", "CC_PIPELINE_MODEL_CONCURRENCY",
-    "CC_PIPELINE_CODEX_CONCURRENCY", "CC_CLAUDE_HEARTBEAT_SECONDS",
+    "CC_PIPELINE_CODEX_CONCURRENCY", "CC_PIPELINE_READY_TARGET",
+    "CC_CLAUDE_WORKER_CPUS", "CC_CLAUDE_WORKER_MEMORY",
+    "CC_CLAUDE_HEARTBEAT_SECONDS",
     "CC_CLAUDE_START_TIMEOUT", "CC_CLAUDE_STALLED_TIMEOUT",
     "CC_PIPELINE_WORKER_TIMEOUT",
     "CC_GATEWAY_MAX_ATTEMPTS", "CC_GATEWAY_BACKOFF_BASE",
@@ -71,6 +73,7 @@ AUTHOR_JOB_STATUSES = {"queued", "running", "completed", "failed", "interrupted"
 
 sys.path.insert(0, str(PROJECT_ROOT))
 from tools.runtime_environment import docker_info, repair_docker_engine  # noqa: E402
+from tools.capacity import concurrency_recommendation as scheduler_capacity  # noqa: E402
 from tools.batch_pipeline import SCHEMA_VERSION, connect as initialize_database  # noqa: E402
 from tools.authoring_policy import backend_only_requirement  # noqa: E402
 from tools.scheduler_state import SchedulerStore  # noqa: E402
@@ -237,9 +240,8 @@ class ConsoleData:
         self.pipeline_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pipeline")
         self._pipeline_processes: dict[int, subprocess.Popen[str]] = {}
         self._pipeline_process_lock = threading.Lock()
-        if self.database.is_file():
-            connection = initialize_database(self.database)
-            connection.close()
+        connection = initialize_database(self.database)
+        connection.close()
         self.scheduler_store = SchedulerStore(self.database)
         self._initialize_author_jobs()
         self._initialize_pipeline_jobs()
@@ -779,7 +781,7 @@ class ConsoleData:
                 raise ValueError("模型运行方式必须是 local 或 docker")
             def concurrency(key: str, default: int) -> int:
                 try:
-                    return max(1, min(int(values.get(key, str(default))), 8))
+                    return max(1, min(int(values.get(key, str(default))), 32))
                 except ValueError:
                     return default
             qc_concurrency = concurrency("CC_PIPELINE_QC_CONCURRENCY", 2)
@@ -1542,6 +1544,9 @@ class ConsoleData:
                 "model_concurrency": config["model_concurrency"],
                 "qc_concurrency": config["qc_concurrency"],
                 "codex_concurrency": config["codex_concurrency"],
+                "ready_target": config["ready_target"],
+                "worker_cpus": config["worker_cpus"],
+                "worker_memory": config["worker_memory"],
                 "news_feeds": config["news_feeds"],
             },
             "server_time": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -1761,7 +1766,7 @@ class ConsoleData:
         )
         def env_int(name: str, default: int) -> int:
             try:
-                return max(1, min(int(values.get(name, str(default))), 8))
+                return max(1, min(int(values.get(name, str(default))), 32))
             except ValueError:
                 return default
         def env_bounded(name: str, default: int, maximum: int = 3600) -> int:
@@ -1793,6 +1798,9 @@ class ConsoleData:
             "qc_concurrency": env_int("CC_PIPELINE_QC_CONCURRENCY", 2),
             "model_concurrency": env_int("CC_PIPELINE_MODEL_CONCURRENCY", 2),
             "codex_concurrency": env_int("CC_PIPELINE_CODEX_CONCURRENCY", 2),
+            "ready_target": env_bounded("CC_PIPELINE_READY_TARGET", 40, 200),
+            "worker_cpus": values.get("CC_CLAUDE_WORKER_CPUS", "1").strip() or "1",
+            "worker_memory": values.get("CC_CLAUDE_WORKER_MEMORY", "2g").strip().lower() or "2g",
             "gateway_max_attempts": env_bounded("CC_GATEWAY_MAX_ATTEMPTS", 3, 10),
             "gateway_backoff_base": env_bounded("CC_GATEWAY_BACKOFF_BASE", 30),
             "gateway_backoff_max": env_bounded("CC_GATEWAY_BACKOFF_MAX", 300),
@@ -1801,6 +1809,10 @@ class ConsoleData:
             "gateway_circuit_cooldown": env_bounded("CC_GATEWAY_CIRCUIT_COOLDOWN", 180),
             "news_feeds": news_feeds,
         }
+
+    @staticmethod
+    def concurrency_recommendation() -> dict[str, object]:
+        return scheduler_capacity()
 
     @staticmethod
     def _validate_news_feeds(raw: object) -> list[tuple[str, int]]:
@@ -2067,9 +2079,32 @@ class ConsoleData:
                 value = int(raw)
             except ValueError as exc:
                 raise ValueError(f"{field} 配置无效") from exc
-            if not 1 <= value <= 8:
-                raise ValueError(f"{field} 必须是 1-8")
+            if not 1 <= value <= 32:
+                raise ValueError(f"{field} 必须是 1-32")
             concurrency_values[env_key] = str(value)
+        raw_ready_target = body.get(
+            "ready_target", current.get("CC_PIPELINE_READY_TARGET", "40") or "40"
+        )
+        try:
+            ready_target = int(raw_ready_target)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("题目缓冲水位配置无效") from exc
+        if not 1 <= ready_target <= 200:
+            raise ValueError("题目缓冲水位必须是 1-200")
+        raw_worker_cpus = body.get(
+            "worker_cpus", current.get("CC_CLAUDE_WORKER_CPUS", "1") or "1"
+        )
+        try:
+            worker_cpus = float(raw_worker_cpus)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("单容器 CPU 配置无效") from exc
+        if not 0.25 <= worker_cpus <= 4:
+            raise ValueError("单容器 CPU 必须是 0.25-4")
+        worker_memory = str(body.get(
+            "worker_memory", current.get("CC_CLAUDE_WORKER_MEMORY", "2g") or "2g"
+        )).strip().lower()
+        if not re.fullmatch(r"[1-9][0-9]*[mg]", worker_memory):
+            raise ValueError("单容器内存必须使用正整数加 m 或 g，例如 2g")
         gateway_values = {}
         for field, env_key, default, maximum in (
             ("gateway_max_attempts", "CC_GATEWAY_MAX_ATTEMPTS", 3, 10),
@@ -2109,6 +2144,9 @@ class ConsoleData:
             "CC_CLAUDE_DOCKER_IMAGE": values["docker_image"],
             "CC_CLAUDE_DOCKER_COMMAND": values["docker_command"],
             "CC_PIPELINE_MODEL_MODE": values["model_mode"],
+            "CC_PIPELINE_READY_TARGET": str(ready_target),
+            "CC_CLAUDE_WORKER_CPUS": str(worker_cpus).rstrip("0").rstrip("."),
+            "CC_CLAUDE_WORKER_MEMORY": worker_memory,
             **concurrency_values,
             **gateway_values,
         }
@@ -2677,6 +2715,9 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/environment":
                 self.send_json(self.data.environment_status())
+                return
+            if parsed.path == "/api/capacity-recommendation":
+                self.send_json(self.data.concurrency_recommendation())
                 return
             if parsed.path == "/api/author-jobs":
                 self.send_json({"jobs": self.data.author_jobs()})

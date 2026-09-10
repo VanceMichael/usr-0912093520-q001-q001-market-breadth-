@@ -10,6 +10,7 @@ const state = {
   view: "production",
   pendingAction: null,
   config: null,
+  capacity: null,
   environment: null,
   authorJobs: [],
   mothers: [],
@@ -573,6 +574,9 @@ function renderSettings() {
   $("#config-qc-concurrency").value = state.config.qc_concurrency || 2;
   $("#config-model-concurrency").value = state.config.model_concurrency || 2;
   $("#config-codex-concurrency").value = state.config.codex_concurrency || 2;
+  $("#config-ready-target").value = state.config.ready_target || 40;
+  $("#config-worker-cpus").value = state.config.worker_cpus || 1;
+  $("#config-worker-memory").value = state.config.worker_memory || "2g";
   $("#config-gateway-max-attempts").value = state.config.gateway_max_attempts || 3;
   $("#config-gateway-backoff-base").value = state.config.gateway_backoff_base || 30;
   $("#config-gateway-backoff-max").value = state.config.gateway_backoff_max || 300;
@@ -580,6 +584,52 @@ function renderSettings() {
   $("#config-gateway-circuit-window").value = state.config.gateway_circuit_window || 120;
   $("#config-gateway-circuit-cooldown").value = state.config.gateway_circuit_cooldown || 180;
   renderNewsFeeds();
+}
+
+function renderCapacityRecommendation() {
+  const container = $("#capacity-result");
+  const data = state.capacity;
+  if (!data) {
+    container.hidden = true;
+    container.innerHTML = "";
+    return;
+  }
+  const machine = data.machine || {};
+  const effectiveMemory = formatBytes(machine.effective_memory_bytes || 0);
+  const dockerLabel = machine.docker_available ? "Docker 实际配额" : "宿主机估算";
+  const profile = (name, label) => {
+    const value = data[name] || {};
+    return `<div class="capacity-profile"><header><strong>${escapeHtml(label)}</strong><button class="button secondary compact" type="button" data-apply-capacity="${escapeHtml(name)}"><i data-lucide="gauge"></i>应用</button></header><span>模型 ${value.model_concurrency || 1} · 交付 ${value.codex_concurrency || 1} · 缓冲 ${value.ready_target || 40} · 每批 ${value.batch_size || 10}</span></div>`;
+  };
+  container.innerHTML = `<div class="capacity-machine"><span>${escapeHtml(machine.platform || "未知系统")}</span><span>${machine.effective_cpu || 1} 核</span><span>${escapeHtml(effectiveMemory)}</span><span>${escapeHtml(dockerLabel)}</span></div><div class="capacity-profiles">${profile("recommended", "推荐配置")}${profile("maximum", "最大性能配置")}</div>${(data.warnings || []).map((warning) => `<p class="capacity-warning">${escapeHtml(warning)}</p>`).join("")}`;
+  container.hidden = false;
+  refreshIcons();
+}
+
+function applyCapacityProfile(name) {
+  const profile = state.capacity?.[name];
+  if (!profile) return;
+  $("#config-qc-concurrency").value = profile.qc_concurrency;
+  $("#config-model-concurrency").value = profile.model_concurrency;
+  $("#config-codex-concurrency").value = profile.codex_concurrency;
+  $("#config-ready-target").value = profile.ready_target;
+  $("#config-author-batch-size").value = profile.batch_size;
+  $("#config-worker-cpus").value = state.capacity.worker_limits?.cpus || 1;
+  $("#config-worker-memory").value = state.capacity.worker_limits?.memory || "2g";
+  toast(name === "maximum" ? "已填入最大性能配置，保存后生效" : "已填入推荐配置，保存后生效");
+}
+
+async function detectCapacity() {
+  const button = $("#detect-capacity");
+  button.disabled = true;
+  try {
+    state.capacity = await api("/api/capacity-recommendation");
+    renderCapacityRecommendation();
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    button.disabled = false;
+  }
 }
 
 function renderDifficultyWeights(weights) {
@@ -1314,6 +1364,9 @@ $("#settings-form").addEventListener("submit", async (event) => {
         qc_concurrency: Number($("#config-qc-concurrency").value),
         model_concurrency: Number($("#config-model-concurrency").value),
         codex_concurrency: Number($("#config-codex-concurrency").value),
+        ready_target: Number($("#config-ready-target").value),
+        worker_cpus: Number($("#config-worker-cpus").value),
+        worker_memory: $("#config-worker-memory").value,
         gateway_max_attempts: Number($("#config-gateway-max-attempts").value),
         gateway_backoff_base: Number($("#config-gateway-backoff-base").value),
         gateway_backoff_max: Number($("#config-gateway-backoff-max").value),
@@ -1335,6 +1388,11 @@ $("#settings-form").addEventListener("submit", async (event) => {
   }
 });
 $("#environment-repair").addEventListener("click", () => loadEnvironment(true));
+$("#detect-capacity").addEventListener("click", detectCapacity);
+$("#capacity-result").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-apply-capacity]");
+  if (button) applyCapacityProfile(button.dataset.applyCapacity);
+});
 $("#toggle-api-key").addEventListener("click", () => {
   const input = $("#config-api-key");
   const showing = input.type === "text";
