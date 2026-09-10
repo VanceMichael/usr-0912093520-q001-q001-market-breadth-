@@ -97,7 +97,7 @@ class OrchestratorTest(unittest.TestCase):
             )
             with mock.patch.object(orchestrator.subprocess, "Popen", side_effect=fake_popen), mock.patch.object(
                 orchestrator, "validate_effective_trajectory", return_value=gate_evidence
-            ):
+            ), mock.patch.object(orchestrator, "worker_harness_version", return_value="2.1.263"):
                 orchestrator.main_args = None
                 with mock.patch("sys.argv", ["orchestrator", "--db", str(db), "--batch", "b", "--env-file", str(env), "--data-root", str(root / "runs"), "--image", "fake", "--concurrency", "2"]):
                     self.assertEqual(orchestrator.main(), 0)
@@ -114,10 +114,11 @@ class OrchestratorTest(unittest.TestCase):
                 self.assertIn("--disable-slash-commands", command)
             with connect(db) as connection:
                 metadata = connection.execute(
-                    "SELECT container_cwd,operating_system,model FROM runs ORDER BY id"
+                    "SELECT container_cwd,operating_system,model,harness_version FROM runs ORDER BY id"
                 ).fetchall()
             self.assertTrue(all(row[0] == "/workspace" for row in metadata))
-            self.assertTrue(all(row[1].startswith("Linux (Docker container on ") for row in metadata))
+            self.assertTrue(all(row[1] == "MacOS/Linux" for row in metadata))
+            self.assertTrue(all(row[3] == "2.1.263" for row in metadata))
             self.assertEqual([row[2] for row in metadata], ["model", "model"])
 
     def test_stream_result_and_structured_task_state_are_required(self):

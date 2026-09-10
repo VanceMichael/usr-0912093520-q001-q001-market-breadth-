@@ -58,6 +58,9 @@ MODEL_CONFIG_RE = re.compile(
     r"model .* does not exist|unknown model provider)"
 )
 UNRECOGNIZED_MODEL_WARNING = "[claude-code:unrecognized_model]"
+HARNESS_VERSION_RE = re.compile(r"\d+(?:\.\d+)+")
+_WORKER_VERSION_LOCK = threading.Lock()
+_WORKER_VERSIONS: dict[str, str] = {}
 
 
 @dataclass(frozen=True)
@@ -116,6 +119,26 @@ class GatewayCircuitBreaker:
                 "open_until": self._open_until,
                 "half_open_in_flight": self._half_open_in_flight,
             }
+
+
+def worker_harness_version(image: str) -> str:
+    """Read and cache the Claude Code version embedded in a worker image."""
+    with _WORKER_VERSION_LOCK:
+        cached = _WORKER_VERSIONS.get(image)
+        if cached:
+            return cached
+        result = subprocess.run(
+            ["docker", "run", "--rm", image, "claude", "--version"],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            timeout=30, check=False,
+        )
+        match = HARNESS_VERSION_RE.search(result.stdout or "")
+        if result.returncode or match is None:
+            detail = (result.stdout or "").strip()[-500:]
+            raise RuntimeError(f"cannot read Claude Code version from worker image: {detail}")
+        version = match.group(0)
+        _WORKER_VERSIONS[image] = version
+        return version
 
 
 def now() -> str:
@@ -387,7 +410,7 @@ def run_one(
             (
                 row["id"], run_id, timestamp, "", "", "", "", "", "Claude Code", "",
                 "running", timestamp, str(log_path), str(trajectory_root), timestamp,
-                "/workspace", f"Linux (Docker container on {platform.system()})",
+                "/workspace", "MacOS/Linux",
             ),
         )
         connection.execute(
@@ -435,10 +458,15 @@ def run_one(
         missing = [key for key in required if not env_values.get(key)]
         if missing:
             raise ValueError("missing worker configuration: " + ", ".join(missing))
+        harness_version = worker_harness_version(image)
         with closing(connect(db)) as connection:
             connection.execute(
-                "UPDATE runs SET model=? WHERE batch_run_id=? AND question_id=?",
-                (env_values["CC_SWITCH_MODEL"], run_id, row["id"]),
+                "UPDATE runs SET model=?,harness_version=?,operating_system=? "
+                "WHERE batch_run_id=? AND question_id=?",
+                (
+                    env_values["CC_SWITCH_MODEL"], harness_version, "MacOS/Linux",
+                    run_id, row["id"],
+                ),
             )
             connection.commit()
         worker_env.write_text(
