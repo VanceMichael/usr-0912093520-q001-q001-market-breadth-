@@ -419,7 +419,7 @@ def author_prompt(topics: list[dict], batch: str, batch_size: int, distribution:
 难度分配：{distribution}
 出题要求：业务关键词：从 {sources} 读取主题来进行出题，本轮必须按下方新闻主题清单的 question_no 将主题与题目一一绑定，每条新闻必须且只能生成一道题，不得遗漏、复用、合并主题或从同一主题派生多道题；技术关键词：需要 Docker，每道题的初始工程必须提供 Dockerfile，有外部依赖时同时提供 Docker Compose，并支持通过命令完成构建和验收；补充要求：在整批中合理覆盖 Node.js（JavaScript 或 TypeScript）、Python、Go、Java，每道题只选择其中一种主要后端技术栈。{backend_only_requirement()}每道题的 difficulty 字段必须严格按上述题数分配，不得擅自改变题数或难度。新闻只作为业务背景种子，不要复制新闻标题，不要把新闻事实当成实现要求，也不要使用新闻网站代码或受版权保护的正文。先检查 production.sqlite3 中已有题目，发现重复或模板化表达必须重写。
 新闻主题清单：{context}
-严格遵守 项目规范.md。完成真实初始工程、GitHub 可访问快照和登记后，运行出题机械质检，并使用 $cc-usr-question-qc 完成重复、自然度和反模板质检；不要启动目标模型。全过程只修改本项目和题目工作区，完成后输出批次名、每题状态和任何阻塞原因。"""
+严格遵守 项目规范.md。完成真实初始工程、GitHub 可访问快照和登记后，运行出题机械质检，并使用 $cc-usr-question-qc 完成重复、自然度和反模板质检；不要亲自调用或启动 Claude 目标模型，出题会话正常结束后将由调度器自动接管后续模型流水线。不得读取、调用或修改 SchedulerStore、scheduler_state、scheduler_controls、调度器控制接口、守护进程状态或服务启停状态，也不得为了阻止目标模型而暂停、停止或重启调度器。全过程只修改本项目和题目工作区，完成后直接输出批次名、每题状态和任何阻塞原因。"""
 
 
 def create_batch(database: Path, codex: str, topics: list[dict], batch: str, log: Path, timeout: int, store: SchedulerStore | None = None) -> int:

@@ -114,6 +114,9 @@ def test_automatic_author_prompt_is_backend_only() -> None:
     assert "每道题的 difficulty 字段必须严格按上述题数分配" in prompt
     assert "使用 $cc-usr-question-qc 完成重复、自然度和反模板质检" in prompt
     assert "不要启动目标模型" in prompt
+    assert "不得读取、调用或修改 SchedulerStore" in prompt
+    assert "不得为了阻止目标模型而暂停、停止或重启调度器" in prompt
+    assert "由调度器自动接管后续模型流水线" in prompt
 
 
 def test_author_prompt_lists_each_configured_news_source_once() -> None:
