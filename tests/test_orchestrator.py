@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import subprocess
 import tempfile
@@ -58,11 +59,15 @@ class OrchestratorTest(unittest.TestCase):
             env = root / ".env"
             env.write_text("CC_SWITCH_BASE_URL=https://relay.example\nCC_SWITCH_API_KEY=secret\nCC_SWITCH_MODEL=model\n", encoding="utf-8")
 
-            def fake_run(command, **kwargs):
-                Path(kwargs["stdout"].name).write_text("ok\n", encoding="utf-8")
-                return mock.Mock(returncode=0)
+            commands = []
 
-            with mock.patch.object(orchestrator.subprocess, "run", side_effect=fake_run):
+            def fake_popen(command, **kwargs):
+                commands.append(command)
+                kwargs["stdout"].write(json.dumps({"type": "result", "is_error": False}) + "\n")
+                kwargs["stdout"].flush()
+                return mock.Mock(wait=mock.Mock(return_value=0))
+
+            with mock.patch.object(orchestrator.subprocess, "Popen", side_effect=fake_popen):
                 orchestrator.main_args = None
                 with mock.patch("sys.argv", ["orchestrator", "--db", str(db), "--batch", "b", "--env-file", str(env), "--data-root", str(root / "runs"), "--image", "fake", "--concurrency", "2"]):
                     self.assertEqual(orchestrator.main(), 0)
@@ -70,6 +75,67 @@ class OrchestratorTest(unittest.TestCase):
                 statuses = connection.execute("SELECT status FROM runs ORDER BY id").fetchall()
             self.assertEqual([row[0] for row in statuses], ["succeeded", "succeeded"])
             self.assertEqual(len(list((root / "runs" / "b").glob("b-*/docker-*.log"))), 2)
+            self.assertEqual(len(commands), 2)
+            for command in commands:
+                self.assertEqual(command[command.index("--output-format") + 1], "stream-json")
+                self.assertIn("--verbose", command)
+                self.assertIn("--include-partial-messages", command)
+                self.assertIn("--safe-mode", command)
+                self.assertIn("--disable-slash-commands", command)
+            with connect(db) as connection:
+                metadata = connection.execute(
+                    "SELECT container_cwd,operating_system,model FROM runs ORDER BY id"
+                ).fetchall()
+            self.assertTrue(all(row[0] == "/workspace" for row in metadata))
+            self.assertTrue(all(row[1].startswith("Linux (Docker container on ") for row in metadata))
+            self.assertEqual([row[2] for row in metadata], ["model", "model"])
+
+    def test_stream_result_and_structured_task_state_are_required(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            log = root / "worker.log"
+            log.write_text("docker noise\n", encoding="utf-8")
+            self.assertEqual(orchestrator.stream_result_state(log), "missing")
+            log.write_text(
+                json.dumps({"type": "result", "is_error": True}) + "\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(orchestrator.stream_result_state(log), "failure")
+            log.write_text(
+                json.dumps({"type": "result", "is_error": False}) + "\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(orchestrator.stream_result_state(log), "success")
+
+            task = root / "claude" / "tasks" / "session" / "1.json"
+            task.parent.mkdir(parents=True)
+            task.write_text(json.dumps({"status": "in_progress"}), encoding="utf-8")
+            self.assertEqual(orchestrator.claude_task_state(root / "claude"), "incomplete")
+            task.write_text(json.dumps({"status": "completed"}), encoding="utf-8")
+            self.assertEqual(orchestrator.claude_task_state(root / "claude"), "complete")
+
+    def test_monitor_reclaims_worker_that_never_produces_output(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            process = mock.Mock()
+            process.wait.side_effect = [subprocess.TimeoutExpired(["docker"], 1), 0]
+            with mock.patch.object(
+                orchestrator.time, "monotonic", side_effect=[0.0, 6.0]
+            ), mock.patch.object(
+                orchestrator, "activity_signature", return_value=(0, 0, 0)
+            ), mock.patch.object(
+                orchestrator, "update_run_heartbeat"
+            ) as heartbeat, mock.patch.object(
+                orchestrator, "stop_worker_container"
+            ) as stop:
+                code, status, error = orchestrator.monitor_worker(
+                    process, root / "db", 1, "run", "container",
+                    root / "log", root / "claude", 100, 1, 5, 20, (0, 0, 0),
+                )
+            self.assertEqual((code, status), (-9, "timeout"))
+            self.assertIn("no output", error)
+            heartbeat.assert_called_once()
+            stop.assert_called_once_with("container")
 
     def test_exhausted_question_is_blocked_without_another_container(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -110,6 +176,26 @@ class OrchestratorTest(unittest.TestCase):
             with connect(db) as connection:
                 status = connection.execute("SELECT status FROM questions").fetchone()[0]
             self.assertEqual(status, "blocked")
+
+    def test_invalid_worker_configuration_is_recorded_before_launch(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            db = root / "production.sqlite3"
+            row = self.make_question(root, db)[0]
+            env = root / ".env"
+            env.write_text("CC_SWITCH_MODEL=model\n", encoding="utf-8")
+            with mock.patch.object(orchestrator.subprocess, "Popen") as popen:
+                task_id, code, message = orchestrator.run_one(
+                    db, row, env, root / "runs", "image", 1.0, "2g", 60,
+                )
+            self.assertEqual((task_id, code), ("b-001", 78))
+            self.assertIn("missing worker configuration", message)
+            popen.assert_not_called()
+            with connect(db) as connection:
+                run = connection.execute("SELECT status,exit_code FROM runs").fetchone()
+                question = connection.execute("SELECT status FROM questions").fetchone()
+            self.assertEqual(tuple(run), ("failed", 78))
+            self.assertEqual(question[0], "approved")
 
     def test_retry_restores_registered_git_baseline_before_running_again(self):
         with tempfile.TemporaryDirectory() as raw:

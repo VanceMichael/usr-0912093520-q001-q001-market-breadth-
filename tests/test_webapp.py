@@ -305,6 +305,87 @@ class WebConsoleTests(unittest.TestCase):
             finally:
                 data.shutdown()
 
+    def test_remote_scheduler_run_output_is_proxied_to_selected_vps(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = ConsoleData(self.make_database(root), root)
+            try:
+                response = {"run_id": 7, "source": "log:7", "events": []}
+                with mock.patch.object(
+                    data, "_vps_request", return_value=(json.dumps(response).encode(), {})
+                ) as request:
+                    result = data.vps_scheduler_run_output(1, 7, "after=42&source=log%3A7")
+                self.assertEqual(result, response)
+                self.assertEqual(
+                    request.call_args.args[1],
+                    "/api/scheduler/runs/7/output?after=42&source=log%3A7",
+                )
+            finally:
+                data.shutdown()
+
+    def test_scheduler_run_output_streams_complete_lines_and_retries_partial_tail(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = self.make_database(root)
+            run_root = root / "runs" / "0911" / "0911-001"
+            run_root.mkdir(parents=True)
+            log_path = run_root / "docker-test.log"
+            first = json.dumps({
+                "type": "stream_event",
+                "timestamp": "2026-09-10T10:00:00+08:00",
+                "event": {"type": "content_block_delta", "delta": {"type": "text_delta", "text": "开始分析"}},
+            }, ensure_ascii=False)
+            second = json.dumps({
+                "type": "assistant",
+                "message": {"content": [{"type": "tool_use", "name": "Bash", "input": {"command": "API_KEY=secret pytest"}}]},
+            }, ensure_ascii=False)
+            split = len(second.encode("utf-8")) // 2
+            encoded_second = second.encode("utf-8")
+            log_path.write_bytes(first.encode("utf-8") + b"\n" + encoded_second[:split])
+            with connect(database) as connection:
+                question_id = connection.execute("SELECT id FROM questions").fetchone()[0]
+                connection.execute(
+                    "INSERT INTO runs(question_id,batch_run_id,launched_at,status,started_at,log_path,trajectory_root) "
+                    "VALUES(?,'docker-test','now','running','now',?,'')",
+                    (question_id, str(log_path)),
+                )
+                run_id = connection.execute("SELECT id FROM runs").fetchone()[0]
+                connection.commit()
+            data = ConsoleData(database, root)
+            try:
+                initial = data.scheduler_run_output(run_id, {"after": ["0"]})
+                self.assertEqual([event["text"] for event in initial["events"]], ["开始分析"])
+                self.assertEqual(initial["next_after"], len(first.encode("utf-8")) + 1)
+
+                with log_path.open("ab") as handle:
+                    handle.write(encoded_second[split:] + b"\n")
+                continued = data.scheduler_run_output(
+                    run_id,
+                    {"after": [str(initial["next_after"])], "source": [initial["source"]]},
+                )
+                self.assertEqual(len(continued["events"]), 1)
+                self.assertEqual(continued["events"][0]["kind"], "tool")
+                self.assertIn("API_KEY=[REDACTED]", continued["events"][0]["text"])
+                self.assertNotIn("secret", continued["events"][0]["text"])
+            finally:
+                data.shutdown()
+
+    def test_scheduler_run_artifacts_must_stay_under_registered_runs_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = self.make_database(root)
+            (root / "runs").mkdir()
+            outside = root / "private.log"
+            outside.write_text("do not expose", encoding="utf-8")
+            data = ConsoleData(database, root)
+            try:
+                self.assertIsNone(data._registered_run_artifact(outside))
+                allowed = root / "runs" / "worker.log"
+                allowed.write_text("ok", encoding="utf-8")
+                self.assertEqual(data._registered_run_artifact(allowed), allowed.resolve())
+            finally:
+                data.shutdown()
+
     def test_env_config_keeps_existing_key_when_blank(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -312,12 +393,14 @@ class WebConsoleTests(unittest.TestCase):
                 "CC_SWITCH_BASE_URL=https://relay.example.com/v1\n"
                 "CC_SWITCH_MODEL=claude-test\n"
                 "CC_SWITCH_API_KEY=keep-secret\n"
-                "CC_USR_SUBMITTER=提交人\n",
+                "CC_USR_SUBMITTER=提交人\n"
+                "CC_CLAUDE_STALLED_TIMEOUT=1200\n",
                 encoding="utf-8",
             )
             data = ConsoleData(self.make_database(root), root)
             data.update_env({"base_url": "https://relay.example.com/v2", "model": "claude-v2", "api_key": "", "submitter": "提交人"})
             self.assertIn('CC_SWITCH_API_KEY="keep-secret"', (root / ".env").read_text(encoding="utf-8"))
+            self.assertIn('CC_CLAUDE_STALLED_TIMEOUT="1200"', (root / ".env").read_text(encoding="utf-8"))
 
     def test_runtime_config_stores_github_token_and_author_difficulty_safely(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -391,6 +391,52 @@ class DeliveryPipelineTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0, result.stdout)
             self.assertIn("0911-002: launched question has no delivery record", result.stdout)
 
+    def test_delivery_qc_rejects_absolute_container_skill_traversal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = self.prepare(root)
+            input_path = root / "score.json"
+            input_path.write_text(
+                json.dumps(automated_record(), ensure_ascii=False), encoding="utf-8"
+            )
+            result = self.run_command([
+                sys.executable, str(COLLECTOR), "--db", str(database), "--batch", "0911",
+                "--question", "1", "--turn", "1", "--from-json", str(input_path),
+            ])
+            self.assertEqual(result.returncode, 0, result.stdout)
+            connection = connect(database)
+            question = connection.execute("SELECT prompt FROM questions").fetchone()
+            trajectory_root = root / "worker-state" / "claude"
+            trajectory_root.mkdir(parents=True)
+            connection.execute(
+                "UPDATE runs SET batch_run_id='docker-test',trajectory_root=?,container_cwd='/workspace'",
+                (str(trajectory_root),),
+            )
+            connection.commit()
+            connection.close()
+            (trajectory_root / "session-001.jsonl").write_text(
+                "\n".join((
+                    json.dumps({
+                        "type": "user", "sessionId": "session-001",
+                        "message": {"role": "user", "content": question["prompt"]},
+                    }, ensure_ascii=False),
+                    json.dumps({
+                        "type": "assistant", "sessionId": "session-001",
+                        "message": {"role": "assistant", "content": [{
+                            "type": "tool_use", "name": "Read",
+                            "input": {"file_path": "/workspace/../project/.agents/skills/other/SKILL.md"},
+                        }]},
+                    }, ensure_ascii=False),
+                )) + "\n",
+                encoding="utf-8",
+            )
+
+            result = self.run_command([
+                sys.executable, str(QC), "--db", str(database), "--batch", "0911",
+            ])
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("external skill path", result.stdout)
+
     def test_delivery_qc_rejects_nonconsecutive_dialogue_order(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

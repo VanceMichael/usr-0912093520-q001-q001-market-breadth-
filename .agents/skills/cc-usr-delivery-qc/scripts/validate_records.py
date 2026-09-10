@@ -5,6 +5,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import ntpath
+import posixpath
+import re
 import sqlite3
 import sys
 from datetime import datetime
@@ -23,6 +26,153 @@ from tools.delivery_records import (  # noqa: E402
 
 
 FIXABLE_FIELDS = frozenset(EXPORT_KEYS) - {"turn_no", "delivery_qc_note"}
+SKILL_PATH_RE = re.compile(
+    r"(?i)(?:\.agents[/\\]+skills[/\\]+|\.claude[/\\]+skills[/\\]+|"
+    r"\.codex[/\\]+skills[/\\]+|[/\\]skills[/\\][^\s'\"`]+[/\\]SKILL\.md)"
+)
+
+
+def _event_strings(value: object):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for nested in value.values():
+            yield from _event_strings(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            yield from _event_strings(nested)
+
+
+def _event_session_id(event: dict) -> str:
+    return str(event.get("sessionId") or event.get("session_id") or "")
+
+
+def _event_user_prompt(event: dict) -> str:
+    if event.get("type") != "user" or event.get("isMeta") is True:
+        return ""
+    message = event.get("message")
+    if not isinstance(message, dict) or message.get("role") != "user":
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            str(block.get("text", ""))
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+    return ""
+
+
+def _path_is_within(path_text: str, allowed: tuple[Path, ...], workspace: Path) -> bool:
+    normalized = path_text.replace("\\", "/")
+    if "://" in normalized:
+        return False
+    if re.match(r"^[A-Za-z]:/", normalized):
+        normalized = ntpath.normpath(normalized).replace("\\", "/")
+    elif normalized.startswith("/"):
+        normalized = posixpath.normpath(normalized)
+    if not normalized.startswith("/") and not re.match(r"^[A-Za-z]:/", normalized):
+        try:
+            candidate = (workspace / normalized).resolve()
+            return any(candidate == root or root in candidate.parents for root in allowed)
+        except OSError:
+            return False
+    for root in allowed:
+        root_text = str(root).replace("\\", "/").rstrip("/")
+        if (
+            normalized.casefold() == root_text.casefold()
+            or normalized.casefold().startswith(root_text.casefold() + "/")
+        ):
+            return True
+    return False
+
+
+def _trajectory_events(path: Path) -> list[dict]:
+    events: list[dict] = []
+    with path.open(encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"{path}:{line_number}: invalid JSONL: {exc}") from exc
+            if isinstance(event, dict):
+                events.append(event)
+    return events
+
+
+def trajectory_integrity_issues(record: dict, source_row: sqlite3.Row) -> list[str]:
+    """Reject target sessions that loaded instructions outside their workspace."""
+    trajectory_name = str(record.get("trajectory_file") or "")
+    if not trajectory_name.endswith(".jsonl") or "/" in trajectory_name or "\\" in trajectory_name:
+        return []
+    root_value = str(source_row["source_trajectory_root"] or "").strip()
+    roots = [Path(root_value).resolve()] if root_value else [Path(str(source_row["batch_folder"])).resolve()]
+    candidates: list[tuple[Path, list[dict]]] = []
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for path in root.rglob("*.jsonl"):
+            if path.name != trajectory_name and not path.name.endswith("_" + trajectory_name):
+                continue
+            if not path.is_file():
+                continue
+            try:
+                events = _trajectory_events(path)
+            except (OSError, ValueError):
+                continue
+            if any(
+                _event_session_id(event) == str(record.get("session_id"))
+                and _event_user_prompt(event).strip() == str(record.get("user_prompt", "")).strip()
+                for event in events
+            ):
+                candidates.append((path, events))
+    if not candidates:
+        return []
+
+    record_id = str(record.get("record_id") or "<unknown>")
+    folder = Path(str(source_row["question_folder"])).resolve()
+    alternate = str(source_row["container_cwd"] or "").strip()
+    allowed = (folder,) + ((Path(alternate),) if alternate.startswith("/") else ())
+    issues: list[str] = []
+    seen: set[str] = set()
+    for _path, events in candidates:
+        for event in events:
+            if _event_session_id(event) not in {"", str(record.get("session_id"))}:
+                continue
+            message = event.get("message")
+            if isinstance(message, dict) and isinstance(message.get("content"), list):
+                for block in message["content"]:
+                    if (
+                        isinstance(block, dict) and block.get("type") == "tool_use"
+                        and str(block.get("name") or "").casefold() in {"skill", "slashcommand"}
+                    ):
+                        key = f"{record_id}: trajectory invoked a Skill tool"
+                        if key not in seen:
+                            seen.add(key)
+                            issues.append(key)
+            for text in _event_strings(event):
+                match = SKILL_PATH_RE.search(text)
+                if not match:
+                    continue
+                marker_start = match.start()
+                prefix_start = marker_start
+                while prefix_start > 0 and text[prefix_start - 1] not in " \t\r\n'\"`()[]{}=:":
+                    prefix_start -= 1
+                referenced = text[prefix_start:]
+                if _path_is_within(referenced, allowed, folder):
+                    continue
+                key = (
+                    f"{record_id}: trajectory read an external skill path "
+                    f"({text[marker_start:marker_start + 120]})"
+                )
+                if key not in seen:
+                    seen.add(key)
+                    issues.append(key)
+    return issues
 
 
 def now() -> str:
@@ -72,7 +222,12 @@ def build_report(
         "(SELECT x.harness FROM runs x WHERE x.question_id=q.id "
         " ORDER BY x.launched_at DESC, x.id DESC LIMIT 1) AS source_harness, "
         "(SELECT x.harness_version FROM runs x WHERE x.question_id=q.id "
-        " ORDER BY x.launched_at DESC, x.id DESC LIMIT 1) AS source_harness_version "
+        " ORDER BY x.launched_at DESC, x.id DESC LIMIT 1) AS source_harness_version, "
+        "(SELECT x.trajectory_root FROM runs x WHERE x.question_id=q.id "
+        " ORDER BY x.launched_at DESC, x.id DESC LIMIT 1) AS source_trajectory_root, "
+        "(SELECT x.container_cwd FROM runs x WHERE x.question_id=q.id "
+        " ORDER BY x.launched_at DESC, x.id DESC LIMIT 1) AS container_cwd, "
+        "q.folder_path AS question_folder, b.folder_path AS batch_folder "
         "FROM records r JOIN questions q ON q.id=r.question_id "
         "JOIN batches b ON b.id=q.batch_id WHERE b.name=?"
     )
@@ -109,6 +264,7 @@ def build_report(
                     errors.append(
                         f"{row['record_id']}: first-turn {field} does not match the question"
                     )
+        errors.extend(trajectory_integrity_issues(dict(row), row))
     return {
         "checked_records": len(records),
         "passed": not errors and not warnings,

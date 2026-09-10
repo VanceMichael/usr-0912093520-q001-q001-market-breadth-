@@ -32,6 +32,7 @@ from tools.batch_pipeline import connect  # noqa: E402
 from tools.authoring_policy import backend_only_requirement  # noqa: E402
 from tools.news_topics import DEFAULT_FEEDS, configured_feeds, ingest  # noqa: E402
 from tools.scheduler_state import SchedulerStore  # noqa: E402
+from tools.text_encoding import read_portable_text  # noqa: E402
 
 
 def now() -> str:
@@ -229,7 +230,7 @@ def load_runtime_env(path: Path) -> None:
     """Load the GitHub token and authoring preferences for child CLI processes."""
     if not path.is_file():
         return
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in read_portable_text(path).splitlines():
         stripped = line.strip()
         if not stripped or stripped.startswith("#") or "=" not in stripped:
             continue
@@ -254,7 +255,9 @@ def load_runtime_env(path: Path) -> None:
             os.environ["CC_AUTHOR_BATCH_SIZE"] = value
         elif key in {
             "CC_PIPELINE_MODEL_CONCURRENCY", "CC_PIPELINE_CODEX_CONCURRENCY",
-            "CC_CLAUDE_DOCKER_IMAGE",
+            "CC_CLAUDE_DOCKER_IMAGE", "CC_CLAUDE_HEARTBEAT_SECONDS",
+            "CC_CLAUDE_START_TIMEOUT", "CC_CLAUDE_STALLED_TIMEOUT",
+            "CC_PIPELINE_WORKER_TIMEOUT",
         } and value:
             os.environ[key] = value
 
@@ -354,7 +357,12 @@ def release_topics(database: Path, topic_ids: list[int], status: str, batch: str
 
 def count_ready(database: Path) -> int:
     with connect(database.resolve()) as connection:
-        return int(connection.execute("SELECT COUNT(*) FROM questions WHERE status='approved' AND mechanical_qc='pass' AND qc_decision='pass' AND qc_prompt_sha256=prompt_sha256").fetchone()[0])
+        return int(connection.execute(
+            "SELECT COUNT(*) FROM questions q JOIN batches b ON b.id=q.batch_id "
+            "WHERE b.status NOT IN ('completed','partial','failed') "
+            "AND q.status='approved' AND q.mechanical_qc='pass' AND q.qc_decision='pass' "
+            "AND q.qc_prompt_sha256=q.prompt_sha256"
+        ).fetchone()[0])
 
 
 def active_batches(database: Path) -> list[str]:
@@ -461,7 +469,7 @@ def create_next_batch(
             )
         return 0, ""
     topic_ids = [int(topic["id"]) for topic in topics]
-    batch = f"news{datetime.now().strftime('%m%d%H%M%S')}"
+    batch = datetime.now().strftime('%m%d%H%M%S')
     if store:
         store.heartbeat(phase="author", batch=batch, detail="Codex 正在生成并质检题目")
         store.event(
@@ -551,6 +559,12 @@ def cycle(args: argparse.Namespace, store: SchedulerStore | None = None) -> tupl
         pass
     try:
         args.codex_concurrency = max(1, min(8, int(os.environ.get("CC_PIPELINE_CODEX_CONCURRENCY", args.codex_concurrency))))
+    except ValueError:
+        pass
+    try:
+        args.worker_timeout = max(
+            1, int(os.environ.get("CC_PIPELINE_WORKER_TIMEOUT", args.worker_timeout))
+        )
     except ValueError:
         pass
     args.worker_image = os.environ.get("CC_CLAUDE_DOCKER_IMAGE", args.worker_image).strip() or args.worker_image

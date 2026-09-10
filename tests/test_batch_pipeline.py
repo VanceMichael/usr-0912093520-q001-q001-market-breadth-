@@ -22,7 +22,9 @@ from tools.batch_pipeline import (  # noqa: E402
     set_repository,
     set_semantic_qc,
     prompt_style_issues,
+    repeated_terminal_sentence,
     snapshot_content_issues,
+    technology_diversity_issues,
 )
 
 
@@ -51,6 +53,35 @@ def make_question(index: int, *, difficulty: str = "困难") -> dict:
 
 
 class BatchPipelineTests(unittest.TestCase):
+    def test_technology_diversity_rejects_go_sqlite_monoculture(self):
+        issues = technology_diversity_issues([["Go", "SQLite"] for _ in range(10)])
+        self.assertTrue(any("完整技术组合" in issue for issue in issues))
+        self.assertTrue(any("主要编程语言" in issue for issue in issues))
+        self.assertTrue(any("sqlite" in issue for issue in issues))
+
+    def test_technology_diversity_accepts_supported_backend_batch(self):
+        stacks = [
+            ["Go", "Gin", "PostgreSQL"],
+            ["Go", "Fiber", "Redis"],
+            ["Python", "FastAPI", "PostgreSQL"],
+            ["Python", "Django", "SQLite"],
+            ["TypeScript", "NestJS", "MongoDB"],
+            ["JavaScript", "Fastify", "Redis"],
+            ["Java", "Spring Boot", "MySQL"],
+            ["Java", "Quarkus", "PostgreSQL"],
+        ]
+        self.assertEqual(technology_diversity_issues(stacks), [])
+
+    def test_fixed_technology_policy_requires_explicit_reason(self):
+        stacks = [["Go", "SQLite"] for _ in range(10)]
+        self.assertTrue(technology_diversity_issues(stacks, "fixed", ""))
+        self.assertEqual(
+            technology_diversity_issues(
+                stacks, "fixed", "用户明确要求全部使用 Go 和 SQLite"
+            ),
+            [],
+        )
+
     def write_spec(self, root: Path, count: int = 3, *, difficulty: str = "困难") -> Path:
         spec = {
             "batch": "0911",
@@ -271,6 +302,24 @@ class BatchPipelineTests(unittest.TestCase):
         )
         self.assertIn("User Prompt 使用了“从零构建一套”式固定开头", issues)
         self.assertIn("User Prompt 不能把背景、功能、技术、验收等标签串成模板", issues)
+
+    def test_prompt_style_rejects_scenario_checklist_and_no_docker_tail(self):
+        issues = prompt_style_issues(
+            "检索接口需要反查全部权利依据，也能从一份授权定位受影响渠道；"
+            "SQLite 要保存文件元数据、作业队列和不可改写的决策历史，请用重复上传、"
+            "撤回级联、并发放行、越权下载与重启续作场景验证，项目不设置 Docker 环境。"
+        )
+        self.assertIn("User Prompt 不能使用“列举多个场景 + 统一验证”的模板化验收尾句", issues)
+        self.assertIn("User Prompt 不能追加“项目不设置 Docker 环境”式通用尾句", issues)
+
+    def test_repeated_terminal_sentence_rejects_shared_tail(self):
+        common_tail = "沿用仓库现有的启动方式，不增加额外的容器编排配置。"
+        self.assertTrue(
+            repeated_terminal_sentence(
+                "调度员需要恢复中断的排班记录。" + common_tail,
+                "管理员需要迁移仍在生效的目录。" + common_tail,
+            )
+        )
 
     def test_snapshot_documents_must_be_chinese_and_project_only(self):
         with tempfile.TemporaryDirectory() as directory:

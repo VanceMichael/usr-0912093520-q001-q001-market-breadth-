@@ -31,6 +31,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from tools.batch_pipeline import SNAPSHOT_RE, connect, prompt_hash, question_rows  # noqa: E402
 from tools.runtime_environment import docker_info, repair_docker_engine  # noqa: E402
+from tools.text_encoding import read_portable_text  # noqa: E402
 
 
 class PipelineInterrupted(RuntimeError):
@@ -43,7 +44,7 @@ def timestamp() -> str:
 
 def parse_env(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
-    for line_number, raw in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+    for line_number, raw in enumerate(read_portable_text(path).splitlines(), 1):
         line = raw.strip()
         if not line or line.startswith("#"):
             continue
@@ -91,13 +92,15 @@ def build_docker_claude_command(
         "-w", "/workspace",
         "-e", "HOME=/home/node",
         "-e", "ANTHROPIC_BASE_URL", "-e", "ANTHROPIC_AUTH_TOKEN", "-e", "ANTHROPIC_MODEL",
-        image, claude_command, "--dangerously-skip-permissions", prompt,
+        image, claude_command, "--safe-mode", "--disable-slash-commands",
+        "--dangerously-skip-permissions", prompt,
     ]
 
 
 def build_local_claude_command(claude: str, prompt: str) -> list[str]:
     return [
-        claude, "--print", "--dangerously-skip-permissions",
+        claude, "--print", "--safe-mode", "--disable-slash-commands",
+        "--dangerously-skip-permissions",
         "--permission-mode", "bypassPermissions", "--permission-prompts", "none", prompt,
     ]
 

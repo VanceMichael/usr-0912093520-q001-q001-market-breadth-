@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import argparse
 import ast
+from collections import Counter
 import difflib
 import hashlib
 import json
+import math
 import re
 import shutil
 import sqlite3
@@ -73,6 +75,18 @@ PROMPT_LABEL_RE = re.compile(
 PROMPT_CANNED_OPENING_RE = re.compile(
     r"^\s*(?:请(?:你)?\s*)?从零(?:开始)?(?:构建|实现|开发|搭建|创建)一套"
 )
+PRIMARY_TECH_ALIASES = {
+    "golang": "go", "go": "go", "python": "python",
+    "node.js": "nodejs", "nodejs": "nodejs",
+    "typescript": "nodejs", "javascript": "nodejs", "java": "java",
+}
+PERSISTENCE_TECH_ALIASES = {
+    "sqlite3": "sqlite", "sqlite": "sqlite", "postgres": "postgresql",
+    "postgresql": "postgresql", "mysql": "mysql", "mariadb": "mysql",
+    "mongodb": "mongodb", "mongo": "mongodb", "redis": "redis",
+    "clickhouse": "clickhouse", "elasticsearch": "elasticsearch",
+    "opensearch": "elasticsearch", "duckdb": "duckdb", "cassandra": "cassandra",
+}
 
 
 SCHEMA = """
@@ -493,6 +507,93 @@ def chinese_character_count(text: str) -> int:
     return len(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]", text))
 
 
+def normalized_technology(value: str) -> str:
+    return re.sub(r"\s+", " ", value.strip().casefold())
+
+
+def technology_stack(languages: list[str]) -> tuple[str, ...]:
+    return tuple(sorted({normalized_technology(value) for value in languages}))
+
+
+def primary_technology(languages: list[str]) -> str:
+    normalized = [normalized_technology(value) for value in languages]
+    for value in normalized:
+        if value in PRIMARY_TECH_ALIASES:
+            return PRIMARY_TECH_ALIASES[value]
+        if re.search(r"(?:^|[^a-z])python(?:\s*\d|$)", value):
+            return "python"
+        if re.search(r"(?:^|[^a-z])(?:golang|go)(?:\s*\d|$)", value):
+            return "go"
+        if re.search(r"(?:node(?:\.js)?|javascript|typescript)", value):
+            return "nodejs"
+        if re.search(r"(?:^|[^a-z])java(?:\s*\d|$)", value):
+            return "java"
+    return normalized[0]
+
+
+def persistence_technologies(languages: list[str]) -> set[str]:
+    result: set[str] = set()
+    for value in languages:
+        normalized = normalized_technology(value)
+        for alias, canonical in PERSISTENCE_TECH_ALIASES.items():
+            if normalized == alias or re.search(
+                rf"(?:^|[^a-z0-9]){re.escape(alias)}(?:$|[^a-z0-9])", normalized
+            ):
+                result.add(canonical)
+    return result
+
+
+def technology_diversity_issues(
+    language_sets: list[list[str]], policy: str = "diverse", fixed_reason: str = "",
+) -> list[str]:
+    """Enforce batch-level variety across the supported backend runtimes."""
+    if policy not in {"diverse", "fixed"}:
+        return ["technology_policy must be diverse or fixed"]
+    if policy == "fixed":
+        return [] if len(fixed_reason.strip()) >= 8 else [
+            "fixed technology policy requires the user's explicit fixed_stack_reason"
+        ]
+    count = len(language_sets)
+    if count < 5:
+        return []
+    stacks = Counter(technology_stack(values) for values in language_sets)
+    primary = Counter(primary_technology(values) for values in language_sets)
+    persistence = Counter(
+        technology for values in language_sets
+        for technology in persistence_technologies(values)
+    )
+    required_stacks = 4 if count >= 8 else 3
+    required_primary = 3 if count >= 8 else 2
+    issues: list[str] = []
+    if len(stacks) < required_stacks:
+        issues.append(f"0-1 批次至少需要 {required_stacks} 种不同的完整技术组合")
+    if len(primary) < required_primary:
+        issues.append(f"0-1 批次至少需要 {required_primary} 种不同的主要编程语言")
+    max_stack = math.ceil(count * 0.4)
+    dominant_stack, dominant_stack_count = stacks.most_common(1)[0]
+    if dominant_stack_count > max_stack:
+        issues.append(
+            f"同一技术组合最多只能占 {max_stack}/{count}，当前 "
+            f"{', '.join(dominant_stack)} 占 {dominant_stack_count}/{count}"
+        )
+    max_primary = math.ceil(count * 0.5)
+    dominant_primary, dominant_primary_count = primary.most_common(1)[0]
+    if dominant_primary_count > max_primary:
+        issues.append(
+            f"同一主要编程语言最多只能占 {max_primary}/{count}，当前 "
+            f"{dominant_primary} 占 {dominant_primary_count}/{count}"
+        )
+    max_persistence = math.ceil(count * 0.6)
+    if persistence:
+        dominant_store, dominant_store_count = persistence.most_common(1)[0]
+        if dominant_store_count > max_persistence:
+            issues.append(
+                f"同一存储技术最多只能占 {max_persistence}/{count}，当前 "
+                f"{dominant_store} 占 {dominant_store_count}/{count}"
+            )
+    return issues
+
+
 def prompt_style_issues(prompt: str) -> list[str]:
     """Return objective style failures; semantic naturalness remains a QC judgment."""
     issues: list[str] = []
@@ -507,7 +608,40 @@ def prompt_style_issues(prompt: str) -> list[str]:
         issues.append("User Prompt 不能把背景、功能、技术、验收等标签串成模板")
     if re.search(r"评测模型|测试模型能力|用于评测|用于测评|标注数据", stripped):
         issues.append("User Prompt 不能暴露评测或标注用途")
+    for sentence in re.split(r"[。！？!?\n]+", stripped):
+        if (
+            sentence.count("、") >= 2
+            and re.search(r"(?:请用|通过).*(?:场景|用例)(?:进行)?验证", sentence)
+        ):
+            issues.append("User Prompt 不能使用“列举多个场景 + 统一验证”的模板化验收尾句")
+            break
+    if re.search(
+        r"(?:项目|工程|仓库)\s*(?:不设置|无需|不需要|不要(?:增加|使用)|未设置)\s*Docker\s*(?:环境|配置)?",
+        stripped,
+        re.IGNORECASE,
+    ):
+        issues.append("User Prompt 不能追加“项目不设置 Docker 环境”式通用尾句")
     return issues
+
+
+def terminal_sentence(prompt: str) -> str:
+    sentences = [
+        part.strip() for part in re.split(r"[。！？!?；;\n]+", prompt.strip()) if part.strip()
+    ]
+    if not sentences:
+        return ""
+    return re.sub(r"[^0-9a-z\u3400-\u4dbf\u4e00-\u9fff]+", "", sentences[-1].casefold())
+
+
+def repeated_terminal_sentence(left: str, right: str) -> bool:
+    left_tail = terminal_sentence(left)
+    right_tail = terminal_sentence(right)
+    if min(len(left_tail), len(right_tail)) < 16:
+        return False
+    if left_tail == right_tail:
+        return True
+    matcher = difflib.SequenceMatcher(None, left_tail, right_tail)
+    return matcher.ratio() >= 0.88 and matcher.find_longest_match().size >= 16
 
 
 def tracked_workspace_files(folder: Path) -> list[Path]:
@@ -806,6 +940,15 @@ def create_batch(connection: sqlite3.Connection, workspace: Path, spec_path: Pat
             raise ValueError(f"question {index} has invalid reproducibility")
         prepared.append((index, item, folder_name, title, prompt, task_type, difficulty, languages, reproducibility))
 
+    if author_mode == "0-1":
+        technology_policy = str(spec.get("technology_policy", "diverse")).strip() or "diverse"
+        fixed_reason = str(spec.get("fixed_stack_reason", "")).strip()
+        technology_issues = technology_diversity_issues(
+            [item[7] for item in prepared], technology_policy, fixed_reason,
+        )
+        if technology_issues:
+            raise ValueError("technology diversity gate failed: " + "; ".join(technology_issues))
+
     batch_dir.mkdir(parents=True)
     timestamp = now()
     markdown_path = batch_dir / f"题目_{name}.md"
@@ -972,6 +1115,8 @@ def check_duplicates(connection: sqlite3.Connection, row: sqlite3.Row) -> dict:
             reasons.append("longest_common_substring")
         if same_repo and tag_overlap >= 0.75:
             reasons.append("same_repo_tag_overlap")
+        if repeated_terminal_sentence(prompt, other["prompt"]):
+            reasons.append("repeated_terminal_sentence")
         comparisons.append({
             "task_id": other["task_id"],
             "overall_similarity": round(ratio, 4),
@@ -1020,11 +1165,25 @@ def run_mechanical_qc(connection: sqlite3.Connection, batch: str, selection: str
         report = check_question(connection, row)
         reports.append(report)
         state = "pass" if not report["errors"] else "reject"
-        connection.execute(
-            "UPDATE questions SET mechanical_qc=?, qc_decision=CASE WHEN ?='reject' THEN 'reject' ELSE 'pending' END, "
-            "qc_report=?, qc_prompt_sha256='', human_approved=0, status='draft', updated_at=? WHERE id=?",
-            (state, state, json.dumps(report, ensure_ascii=False), now(), row["id"]),
+        # A mechanical recheck is often run after semantic QC by an authoring
+        # agent. Preserve a still-valid semantic pass so command ordering
+        # cannot accidentally make an unchanged question unrunnable.
+        semantic_current = (
+            state == "pass"
+            and row["qc_decision"] == "pass"
+            and row["qc_prompt_sha256"] == prompt_hash(row["prompt"])
         )
+        if semantic_current:
+            connection.execute(
+                "UPDATE questions SET mechanical_qc='pass', updated_at=? WHERE id=?",
+                (now(), row["id"]),
+            )
+        else:
+            connection.execute(
+                "UPDATE questions SET mechanical_qc=?, qc_decision=CASE WHEN ?='reject' THEN 'reject' ELSE 'pending' END, "
+                "qc_report=?, qc_prompt_sha256='', human_approved=0, status='draft', updated_at=? WHERE id=?",
+                (state, state, json.dumps(report, ensure_ascii=False), now(), row["id"]),
+            )
     connection.commit()
     render_batch(connection, batch)
     print(json.dumps({"batch": batch, "questions": reports}, ensure_ascii=False, indent=2))
@@ -1044,6 +1203,20 @@ def set_semantic_qc(
     for row in rows:
         if decision == "pass" and row["mechanical_qc"] != "pass":
             raise ValueError(f"{row['task_id']}: mechanical QC has not passed")
+        if decision == "pass":
+            style_issues = prompt_style_issues(row["prompt"])
+            if style_issues:
+                raise ValueError(
+                    f"{row['task_id']}: prompt style QC has not passed; {style_issues[0]}"
+                )
+            duplicate_report = check_duplicates(connection, row)
+            if duplicate_report["duplicates"]:
+                first = duplicate_report["duplicates"][0]
+                reasons = ", ".join(first["duplicate_reasons"])
+                raise ValueError(
+                    f"{row['task_id']}: duplicate/template QC has not passed; "
+                    f"matched {first['task_id']} ({reasons})"
+                )
         connection.execute(
             "UPDATE questions SET qc_decision=?, qc_report=?, qc_prompt_sha256=?, "
             "human_approved=0, human_reviewer='', approved_at='', status=?, updated_at=? WHERE id=?",

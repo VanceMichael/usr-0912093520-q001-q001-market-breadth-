@@ -225,7 +225,7 @@ def test_author_only_cycle_creates_batch_without_running_model_pipeline() -> Non
         ), mock.patch("tools.pipeline_daemon.run_batch") as run_batch:
             code, batch = cycle(args)
         assert code == 0
-        assert batch.startswith("news")
+        assert len(batch) == 10 and batch.isdigit()
         author.assert_called_once()
         assert len(author.call_args.args[2]) == 10
         run_batch.assert_not_called()

@@ -19,6 +19,11 @@ const state = {
   schedulerLogMode: "events",
   schedulerEvents: [],
   schedulerRawLogs: [],
+  selectedSchedulerRun: null,
+  schedulerRunEvents: [],
+  schedulerRunCursor: 0,
+  schedulerRunSource: "",
+  schedulerFollowOutput: true,
 };
 let drawerCloseTimer = null;
 let authorJobsTimer = null;
@@ -26,6 +31,9 @@ let authorJobsSignature = "";
 let pipelineJobsSignature = "";
 let schedulerTimer = null;
 let schedulerEventSource = null;
+let schedulerRunTimer = null;
+let schedulerRunLoading = null;
+let schedulerRunRequest = 0;
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
@@ -370,7 +378,80 @@ function renderScheduler() {
   $("#scheduler-containers").innerHTML = containers.length ? containers.map((container) => `<div class="scheduler-container"><i data-lucide="box"></i><div><strong>${escapeHtml(container.name)}</strong><span>${escapeHtml(container.image)} · ${escapeHtml(container.status)}</span></div></div>`).join("") : `<div class="empty-state compact-empty"><strong>当前没有运行中的容器</strong></div>`;
   const cycles = snapshot.cycles || [];
   $("#scheduler-cycles").innerHTML = cycles.length ? cycles.map((cycle) => `<div class="scheduler-cycle"><span class="cycle-state ${escapeHtml(cycle.status)}"></span><div><strong>#${cycle.id} ${escapeHtml(cycle.batch_name || "常规巡检")}</strong><span>${formatDate(cycle.started_at)} · ${escapeHtml(cycle.status)}</span></div></div>`).join("") : `<div class="empty-state compact-empty"><strong>暂无运行周期</strong></div>`;
+  renderSchedulerLive();
   refreshIcons();
+}
+
+function schedulerActiveRuns() {
+  return schedulerSelection()?.snapshot?.active_runs || [];
+}
+
+function renderSchedulerLive() {
+  const runs = schedulerActiveRuns();
+  if (!runs.some((run) => Number(run.id) === Number(state.selectedSchedulerRun))) {
+    state.selectedSchedulerRun = runs[0]?.id || null;
+    state.schedulerRunEvents = [];
+    state.schedulerRunCursor = 0;
+    state.schedulerRunSource = "";
+  }
+  $("#scheduler-live-runs").innerHTML = runs.length ? runs.map((run) => `<button class="scheduler-live-run ${Number(run.id) === Number(state.selectedSchedulerRun) ? "active" : ""}" type="button" data-live-run="${run.id}"><strong>${escapeHtml(run.task_id)}</strong><span>${escapeHtml(run.languages || "未知技术栈")} · ${escapeHtml(run.difficulty || "未标难度")}</span><em>运行中 · ${escapeHtml(formatDate(run.activity_at))}</em></button>`).join("") : `<div class="empty-state compact-empty"><strong>当前没有运行中的题目</strong></div>`;
+  const current = runs.find((run) => Number(run.id) === Number(state.selectedSchedulerRun));
+  $("#scheduler-live-status").textContent = current ? `${current.task_id} · ${formatBytes(current.output_bytes || 0)}` : "等待运行任务";
+  $("#scheduler-live-follow").classList.toggle("active", state.schedulerFollowOutput);
+  $("#scheduler-live-download").disabled = !current;
+  const terminal = $("#scheduler-live-terminal");
+  if (!state.schedulerRunEvents.length) {
+    terminal.innerHTML = `<div class="terminal-empty"><i data-lucide="square-terminal"></i><strong>${current ? "等待 Claude 输出" : "当前没有活动会话"}</strong></div>`;
+    return;
+  }
+  const nearBottom = terminal.scrollHeight - terminal.scrollTop - terminal.clientHeight < 48;
+  terminal.innerHTML = state.schedulerRunEvents.map((event) => {
+    const stamp = event.timestamp ? new Date(event.timestamp).toLocaleTimeString("zh-CN", { hour12: false }) : "";
+    return `<span class="scheduler-live-line ${escapeHtml(event.kind || "output")}">${stamp ? `<time>${escapeHtml(stamp)}</time>` : ""}${escapeHtml(event.text || "")}</span>`;
+  }).join("");
+  if (state.schedulerFollowOutput || nearBottom) terminal.scrollTop = terminal.scrollHeight;
+}
+
+async function loadSchedulerRunOutput({ reset = false } = {}) {
+  const selected = schedulerSelection();
+  const runId = state.selectedSchedulerRun;
+  if (reset) {
+    state.schedulerRunEvents = [];
+    state.schedulerRunCursor = 0;
+    state.schedulerRunSource = "";
+    schedulerRunRequest += 1;
+  }
+  if (
+    (schedulerRunLoading === schedulerRunRequest && !reset)
+    || state.view !== "scheduler" || !selected?.online || !runId
+  ) return;
+  const requestId = schedulerRunRequest;
+  const selectionKey = selected.key;
+  const base = selected.kind === "local"
+    ? `/api/scheduler/runs/${runId}/output`
+    : `/api/vps-nodes/${selected.id}/scheduler/runs/${runId}/output`;
+  const params = new URLSearchParams({ after: String(state.schedulerRunCursor) });
+  if (state.schedulerRunSource) params.set("source", state.schedulerRunSource);
+  schedulerRunLoading = requestId;
+  try {
+    const result = await api(`${base}?${params}`);
+    if (
+      requestId !== schedulerRunRequest
+      || schedulerSelection()?.key !== selectionKey
+      || Number(state.selectedSchedulerRun) !== Number(runId)
+    ) return;
+    if (state.schedulerRunSource && result.source !== state.schedulerRunSource) state.schedulerRunEvents = [];
+    state.schedulerRunSource = result.source || "";
+    state.schedulerRunCursor = Number(result.next_after || 0);
+    state.schedulerRunEvents.push(...(result.events || []));
+    state.schedulerRunEvents = state.schedulerRunEvents.slice(-1200);
+    renderSchedulerLive();
+    refreshIcons();
+  } catch (error) {
+    $("#scheduler-live-status").textContent = `输出读取失败 · ${error.message}`;
+  } finally {
+    if (schedulerRunLoading === requestId) schedulerRunLoading = null;
+  }
 }
 
 async function loadSchedulers({ quiet = false } = {}) {
@@ -391,7 +472,15 @@ async function loadSchedulers({ quiet = false } = {}) {
     state.schedulers = [{ key: "local", name: local.node?.name || "本机", kind: "local", online: true, snapshot: local }, ...remote];
     renderScheduler();
     if (state.view === "scheduler") await loadSchedulerLogs();
+    if (state.view === "scheduler") await loadSchedulerRunOutput();
   } catch (error) {
+    state.schedulers = [];
+    state.selectedSchedulerRun = null;
+    state.schedulerRunEvents = [];
+    state.schedulerRunCursor = 0;
+    state.schedulerRunSource = "";
+    schedulerRunRequest += 1;
+    renderSchedulerLive();
     if (!quiet) toast(error.message, true);
   }
 }
@@ -1185,11 +1274,14 @@ $(".nav-list").addEventListener("click", (event) => {
   if (state.view === "scheduler") {
     loadSchedulers();
     if (!schedulerTimer) schedulerTimer = setInterval(() => loadSchedulers({ quiet: true }), 5000);
+    if (!schedulerRunTimer) schedulerRunTimer = setInterval(() => loadSchedulerRunOutput(), 1000);
   } else {
     if (schedulerTimer) clearInterval(schedulerTimer);
     schedulerTimer = null;
     if (schedulerEventSource) schedulerEventSource.close();
     schedulerEventSource = null;
+    if (schedulerRunTimer) clearInterval(schedulerRunTimer);
+    schedulerRunTimer = null;
   }
   renderView();
 });
@@ -1308,6 +1400,11 @@ $("#scheduler-node-strip").addEventListener("click", async (event) => {
   const button = event.target.closest("[data-scheduler-node]");
   if (!button) return;
   state.selectedScheduler = button.dataset.schedulerNode;
+  state.selectedSchedulerRun = null;
+  state.schedulerRunEvents = [];
+  state.schedulerRunCursor = 0;
+  state.schedulerRunSource = "";
+  schedulerRunRequest += 1;
   renderScheduler();
   await loadSchedulerLogs();
 });
@@ -1316,6 +1413,27 @@ $("#scheduler-controls").addEventListener("click", (event) => {
   if (button) controlScheduler(button.dataset.schedulerAction).catch((error) => toast(error.message, true));
 });
 $("#scheduler-refresh").addEventListener("click", () => loadSchedulers());
+$("#scheduler-live-runs").addEventListener("click", (event) => {
+  const button = event.target.closest("[data-live-run]");
+  if (!button) return;
+  state.selectedSchedulerRun = Number(button.dataset.liveRun);
+  loadSchedulerRunOutput({ reset: true });
+  renderSchedulerLive();
+});
+$("#scheduler-live-follow").addEventListener("click", () => {
+  state.schedulerFollowOutput = !state.schedulerFollowOutput;
+  $("#scheduler-live-follow").classList.toggle("active", state.schedulerFollowOutput);
+  if (state.schedulerFollowOutput) $("#scheduler-live-terminal").scrollTop = $("#scheduler-live-terminal").scrollHeight;
+});
+$("#scheduler-live-download").addEventListener("click", () => {
+  const run = schedulerActiveRuns().find((item) => Number(item.id) === Number(state.selectedSchedulerRun));
+  if (!run) return;
+  const content = state.schedulerRunEvents.map((event) => `${event.timestamp || ""} [${event.kind || "output"}] ${event.text || ""}`).join("\n");
+  const url = URL.createObjectURL(new Blob([content + "\n"], { type: "text/plain;charset=utf-8" }));
+  const anchor = document.createElement("a");
+  anchor.href = url; anchor.download = `${run.task_id}-claude.log`;
+  document.body.append(anchor); anchor.click(); anchor.remove(); URL.revokeObjectURL(url);
+});
 $("#scheduler-log-tabs").addEventListener("click", (event) => {
   const button = event.target.closest("[data-log-mode]");
   if (!button) return;

@@ -5,7 +5,9 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import json
 import os
+import platform
 import re
 import secrets
 import sqlite3
@@ -20,6 +22,12 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from tools.batch_pipeline import SNAPSHOT_RE, connect, prompt_hash, question_rows
+from tools.text_encoding import read_portable_text
+
+
+DEFAULT_HEARTBEAT_SECONDS = 5
+DEFAULT_START_TIMEOUT = 300
+DEFAULT_STALLED_TIMEOUT = 900
 
 
 def now() -> str:
@@ -68,6 +76,144 @@ def restore_question_workspace(row: sqlite3.Row) -> None:
         raise RuntimeError(f"{row['task_id']} 恢复后工作区不是干净初始快照")
 
 
+def activity_signature(log_path: Path, trajectory_root: Path) -> tuple[int, int, int]:
+    """Return a cheap, content-free signature for worker output activity."""
+    newest = 0
+    total_size = 0
+    file_count = 0
+    paths = [log_path]
+    try:
+        paths.extend(path for path in trajectory_root.rglob("*") if path.is_file())
+    except OSError:
+        pass
+    for path in paths:
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        newest = max(newest, stat.st_mtime_ns)
+        total_size += stat.st_size
+        file_count += 1
+    return newest, total_size, file_count
+
+
+def claude_task_state(trajectory_root: Path) -> str:
+    """Read only structured Claude task status, never task descriptions."""
+    observed = False
+    unreadable = False
+    try:
+        paths = list((trajectory_root / "tasks").glob("*/*.json"))
+    except OSError:
+        return "unknown"
+    for path in paths:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            unreadable = True
+            continue
+        if not isinstance(payload, dict):
+            unreadable = True
+            continue
+        status = str(payload.get("status") or payload.get("state") or "").casefold()
+        if not status:
+            unreadable = True
+            continue
+        observed = True
+        if status not in {"completed", "complete", "done", "cancelled", "canceled"}:
+            return "incomplete"
+    if unreadable:
+        return "unknown"
+    return "complete" if observed else "unknown"
+
+
+def stream_result_state(log_path: Path) -> str:
+    """Return success, failure, or missing from Claude's final stream event."""
+    found = "missing"
+    try:
+        with log_path.open(encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(event, dict) or event.get("type") != "result":
+                    continue
+                found = "failure" if event.get("is_error") else "success"
+    except OSError:
+        return "missing"
+    return found
+
+
+def update_run_heartbeat(db: Path, question_id: int, run_id: str) -> None:
+    try:
+        with connect(db) as connection:
+            connection.execute(
+                "UPDATE runs SET heartbeat_at=? WHERE batch_run_id=? AND question_id=?",
+                (now(), run_id, question_id),
+            )
+            connection.commit()
+    except sqlite3.Error:
+        # A transient SQLite writer conflict must not orphan a live container.
+        pass
+
+
+def stop_worker_container(container_name: str) -> None:
+    subprocess.run(
+        ["docker", "rm", "-f", container_name],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        timeout=30,
+        check=False,
+    )
+
+
+def monitor_worker(
+    process: subprocess.Popen,
+    db: Path,
+    question_id: int,
+    run_id: str,
+    container_name: str,
+    log_path: Path,
+    trajectory_root: Path,
+    timeout: int,
+    heartbeat_seconds: int,
+    start_timeout: int,
+    stalled_timeout: int,
+    initial_activity: tuple[int, int, int],
+) -> tuple[int, str, str]:
+    """Supervise one Docker worker without depending on terminal screen state."""
+    started = time.monotonic()
+    last_activity_at = started
+    last_activity = initial_activity
+    activity_seen = False
+    while True:
+        try:
+            code = process.wait(timeout=max(1, heartbeat_seconds))
+        except subprocess.TimeoutExpired:
+            code = None
+        current = time.monotonic()
+        signature = activity_signature(log_path, trajectory_root)
+        if signature != last_activity:
+            activity_seen = True
+            last_activity = signature
+            last_activity_at = current
+        update_run_heartbeat(db, question_id, run_id)
+        if code is not None:
+            return int(code), "", ""
+        if current - started >= timeout:
+            stop_worker_container(container_name)
+            process.wait(timeout=30)
+            return -9, "timeout", f"worker exceeded hard timeout of {timeout}s"
+        if not activity_seen and current - started >= start_timeout:
+            stop_worker_container(container_name)
+            process.wait(timeout=30)
+            return -9, "timeout", f"worker produced no output within {start_timeout}s"
+        if activity_seen and current - last_activity_at >= stalled_timeout:
+            stop_worker_container(container_name)
+            process.wait(timeout=30)
+            return -9, "timeout", f"worker output stalled for {stalled_timeout}s"
+
+
 def run_one(
     db: Path,
     row: sqlite3.Row,
@@ -77,6 +223,9 @@ def run_one(
     cpus: float,
     memory: str,
     timeout: int,
+    heartbeat_seconds: int = DEFAULT_HEARTBEAT_SECONDS,
+    start_timeout: int = DEFAULT_START_TIMEOUT,
+    stalled_timeout: int = DEFAULT_STALLED_TIMEOUT,
 ) -> tuple[str, int, str]:
     task_id = str(row["task_id"])
     batch = Path(str(row["folder_path"])).parent.name
@@ -94,9 +243,13 @@ def run_one(
         connection.execute(
             "INSERT INTO runs(question_id,batch_run_id,launched_at,codex_version,"
             "relay_provider,relay_host,relay_wire_api,model,harness,harness_version,"
-            "status,started_at,log_path,trajectory_root,heartbeat_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (row["id"], run_id, timestamp, "", "", "", "", "", "Claude Code", "", "running", timestamp, str(log_path), str(trajectory_root), timestamp),
+            "status,started_at,log_path,trajectory_root,heartbeat_at,container_cwd,operating_system) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                row["id"], run_id, timestamp, "", "", "", "", "", "Claude Code", "",
+                "running", timestamp, str(log_path), str(trajectory_root), timestamp,
+                "/workspace", f"Linux (Docker container on {platform.system()})",
+            ),
         )
         connection.execute(
             "UPDATE runs SET container_id=? WHERE batch_run_id=? AND question_id=?",
@@ -105,39 +258,54 @@ def run_one(
         connection.execute("UPDATE questions SET status='running',updated_at=? WHERE id=?", (timestamp, row["id"]))
         connection.commit()
 
-    env_values: dict[str, str] = {}
-    for line in env_file.read_text(encoding="utf-8").splitlines():
-        if not line.strip() or line.lstrip().startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        env_values[key.strip()] = value.strip().strip("'\"")
-    required = ("CC_SWITCH_BASE_URL", "CC_SWITCH_API_KEY", "CC_SWITCH_MODEL")
-    missing = [key for key in required if not env_values.get(key)]
-    if missing:
-        message = "missing worker configuration: " + ", ".join(missing)
+    def fail_setup(message: str) -> tuple[str, int, str]:
+        finished = now()
         with connect(db) as connection:
             connection.execute(
                 "UPDATE runs SET status='failed',finished_at=?,exit_code=78,error_message=? "
                 "WHERE batch_run_id=? AND question_id=?",
-                (now(), message, run_id, row["id"]),
+                (finished, message, run_id, row["id"]),
             )
-            connection.execute("UPDATE questions SET status='approved',updated_at=? WHERE id=?", (now(), row["id"]))
+            connection.execute(
+                "UPDATE questions SET status='approved',updated_at=? WHERE id=?",
+                (finished, row["id"]),
+            )
             connection.commit()
-        raise ValueError(message)
+        worker_env.unlink(missing_ok=True)
+        return task_id, 78, f"failed before worker launch: {message}"
 
     def env_line(name: str, value: str) -> str:
         if "\n" in value or "\r" in value:
             raise ValueError(f"{name} contains a newline")
         return f"{name}={value}\n"
 
-    worker_env.write_text(
-        env_line("ANTHROPIC_BASE_URL", env_values["CC_SWITCH_BASE_URL"])
-        + env_line("ANTHROPIC_AUTH_TOKEN", env_values["CC_SWITCH_API_KEY"])
-        + env_line("ANTHROPIC_MODEL", env_values["CC_SWITCH_MODEL"])
-        + "CI=1\nCLAUDE_CONFIG_DIR=/state/claude\nHOME=/state/home\n",
-        encoding="utf-8",
-    )
-    worker_env.chmod(0o600)
+    try:
+        env_values: dict[str, str] = {}
+        for line in read_portable_text(env_file).splitlines():
+            if not line.strip() or line.lstrip().startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            env_values[key.strip()] = value.strip().strip("'\"")
+        required = ("CC_SWITCH_BASE_URL", "CC_SWITCH_API_KEY", "CC_SWITCH_MODEL")
+        missing = [key for key in required if not env_values.get(key)]
+        if missing:
+            raise ValueError("missing worker configuration: " + ", ".join(missing))
+        with connect(db) as connection:
+            connection.execute(
+                "UPDATE runs SET model=? WHERE batch_run_id=? AND question_id=?",
+                (env_values["CC_SWITCH_MODEL"], run_id, row["id"]),
+            )
+            connection.commit()
+        worker_env.write_text(
+            env_line("ANTHROPIC_BASE_URL", env_values["CC_SWITCH_BASE_URL"])
+            + env_line("ANTHROPIC_AUTH_TOKEN", env_values["CC_SWITCH_API_KEY"])
+            + env_line("ANTHROPIC_MODEL", env_values["CC_SWITCH_MODEL"])
+            + "CI=1\nCLAUDE_CONFIG_DIR=/state/claude\nHOME=/state/home\n",
+            encoding="utf-8",
+        )
+        worker_env.chmod(0o600)
+    except (OSError, ValueError, sqlite3.Error) as exc:
+        return fail_setup(str(exc))
     home_root = attempt_root / "home"
     home_root.mkdir(exist_ok=True)
     command = [
@@ -148,25 +316,39 @@ def run_one(
         "-v", f"{trajectory_root.resolve()}:/state/claude",
         "-v", f"{home_root.resolve()}:/state/home",
         "-w", "/workspace", image,
-        "claude", "--print", "--dangerously-skip-permissions",
+        "claude", "--print", "--safe-mode", "--disable-slash-commands",
+        "--dangerously-skip-permissions",
         "--permission-mode", "bypassPermissions", "--permission-prompts", "none",
+        "--output-format", "stream-json", "--verbose", "--include-partial-messages",
         str(row["prompt"]),
     ]
     started = time.monotonic()
     try:
         with log_path.open("w", encoding="utf-8") as log:
-            result = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, timeout=timeout, check=False)
-        code = result.returncode
-        status = "succeeded" if code == 0 else "failed"
-        error = "" if code == 0 else f"docker worker exited with code {code}"
+            initial_activity = activity_signature(log_path, trajectory_root)
+            process = subprocess.Popen(
+                command, stdout=log, stderr=subprocess.STDOUT,
+            )
+            code, status, error = monitor_worker(
+                process, db, int(row["id"]), run_id, container_name,
+                log_path, trajectory_root, timeout, heartbeat_seconds,
+                start_timeout, stalled_timeout, initial_activity,
+            )
+        if not status:
+            result_state = stream_result_state(log_path)
+            task_state = claude_task_state(trajectory_root)
+            if code != 0:
+                status, error = "failed", f"docker worker exited with code {code}"
+            elif result_state != "success":
+                code, status = 1, "failed"
+                error = f"Claude stream ended without a successful result event ({result_state})"
+            elif task_state == "incomplete":
+                code, status = 1, "failed"
+                error = "Claude exited while structured tasks were still incomplete"
+            else:
+                status, error = "succeeded", ""
     except subprocess.TimeoutExpired:
-        code, status, error = -9, "timeout", f"worker exceeded {timeout}s"
-        subprocess.run(
-            ["docker", "rm", "-f", container_name],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
+        code, status, error = -9, "timeout", "worker did not stop after container termination"
     except OSError as exc:
         code, status, error = 127, "failed", f"cannot start docker worker: {exc}"
     finally:
@@ -222,6 +404,9 @@ def run_with_retries(
     memory: str,
     timeout: int,
     max_attempts: int,
+    heartbeat_seconds: int = DEFAULT_HEARTBEAT_SECONDS,
+    start_timeout: int = DEFAULT_START_TIMEOUT,
+    stalled_timeout: int = DEFAULT_STALLED_TIMEOUT,
 ) -> tuple[str, int, str]:
     question_id = int(row["id"])
     task_id = str(row["task_id"])
@@ -238,6 +423,7 @@ def run_with_retries(
         try:
             task_id, code, last_message = run_one(
                 db, row, env_file, data_root, image, cpus, memory, timeout,
+                heartbeat_seconds, start_timeout, stalled_timeout,
             )
         except Exception as exc:
             code = 1
@@ -449,6 +635,9 @@ def run_delivery_pipeline(args: argparse.Namespace) -> int:
             model_pool.submit(
                 run_with_retries, database, row, args.env_file.resolve(), args.data_root.resolve(),
                 args.image, args.cpus, args.memory, args.timeout, args.max_attempts,
+                getattr(args, "heartbeat_seconds", DEFAULT_HEARTBEAT_SECONDS),
+                getattr(args, "start_timeout", DEFAULT_START_TIMEOUT),
+                getattr(args, "stalled_timeout", DEFAULT_STALLED_TIMEOUT),
             ): row
             for row in candidates
         }
@@ -489,6 +678,12 @@ def run_delivery_pipeline(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
+    def env_seconds(name: str, default: int) -> int:
+        try:
+            return max(1, int(os.environ.get(name, str(default))))
+        except ValueError:
+            return default
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--db", type=Path, default=Path("production.sqlite3"))
     parser.add_argument("--batch", required=True)
@@ -499,6 +694,18 @@ def main() -> int:
     parser.add_argument("--cpus", type=float, default=1.0)
     parser.add_argument("--memory", default="2g")
     parser.add_argument("--timeout", type=int, default=14400)
+    parser.add_argument(
+        "--heartbeat-seconds", type=int,
+        default=env_seconds("CC_CLAUDE_HEARTBEAT_SECONDS", DEFAULT_HEARTBEAT_SECONDS),
+    )
+    parser.add_argument(
+        "--start-timeout", type=int,
+        default=env_seconds("CC_CLAUDE_START_TIMEOUT", DEFAULT_START_TIMEOUT),
+    )
+    parser.add_argument(
+        "--stalled-timeout", type=int,
+        default=env_seconds("CC_CLAUDE_STALLED_TIMEOUT", DEFAULT_STALLED_TIMEOUT),
+    )
     parser.add_argument("--max-attempts", type=int, default=2)
     parser.add_argument("--deliver", action="store_true")
     parser.add_argument("--codex", default="codex")
@@ -511,6 +718,8 @@ def main() -> int:
         parser.error("--concurrency must be positive")
     if args.codex_concurrency < 1:
         parser.error("--codex-concurrency must be positive")
+    if min(args.heartbeat_seconds, args.start_timeout, args.stalled_timeout, args.timeout) < 1:
+        parser.error("worker monitoring timeouts must be positive")
     if args.deliver:
         return run_delivery_pipeline(args)
     while True:
@@ -541,7 +750,8 @@ def main() -> int:
             futures = [pool.submit(
                 run_with_retries, args.db.resolve(), row, args.env_file.resolve(),
                 args.data_root.resolve(), args.image, args.cpus, args.memory,
-                args.timeout, args.max_attempts,
+                args.timeout, args.max_attempts, args.heartbeat_seconds,
+                args.start_timeout, args.stalled_timeout,
             ) for row in rows]
             for future in concurrent.futures.as_completed(futures):
                 task_id, code, message = future.result()

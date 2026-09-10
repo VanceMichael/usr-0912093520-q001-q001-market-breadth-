@@ -25,6 +25,18 @@ from tools.batch_pipeline import connect, parse_selection, prompt_hash, question
 from launch_task import load_claude_config  # noqa: E402
 
 
+INTERACTIVE_MODES = {"iterm", "iterm-trusted", "powershell", "powershell-trusted"}
+
+
+def executable_command(command: list[str]) -> list[str]:
+    if platform.system() == "Windows" and os.path.splitext(command[0])[1].lower() in {".cmd", ".bat"}:
+        return [
+            os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c",
+            subprocess.list2cmdline(command),
+        ]
+    return command
+
+
 def find_claude() -> str | None:
     discovered = shutil.which("claude")
     if discovered:
@@ -40,8 +52,8 @@ def find_claude() -> str | None:
 
 def claude_version(claude: str) -> str:
     result = subprocess.run(
-        [claude, "--version"], text=True, stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT, check=False,
+        executable_command([claude, "--version"]), text=True, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, encoding="utf-8", errors="replace", check=False,
     )
     if result.returncode:
         raise RuntimeError(result.stdout.strip() or "claude --version failed")
@@ -52,6 +64,22 @@ def claude_version(claude: str) -> str:
             + (result.stdout.strip() or "<empty output>")
         )
     return match.group(0)
+
+
+def require_clean_mode_support(claude: str) -> None:
+    result = subprocess.run(
+        executable_command([claude, "--help"]), text=True, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, encoding="utf-8", errors="replace", check=False,
+    )
+    missing = [
+        option for option in ("--safe-mode", "--disable-slash-commands")
+        if option not in result.stdout
+    ]
+    if result.returncode or missing:
+        detail = ", ".join(missing) or "claude --help failed"
+        raise RuntimeError(
+            f"Claude Code does not support required clean-session options: {detail}"
+        )
 
 
 def is_ready(row: sqlite3.Row) -> bool:
@@ -277,6 +305,7 @@ def main() -> int:
         if not claude:
             raise RuntimeError("Claude Code is not available")
         version = claude_version(claude)
+        require_clean_mode_support(claude)
     except (OSError, ValueError, RuntimeError) as exc:
         print(f"Preflight failed: {exc}", file=sys.stderr)
         connection.close()
@@ -287,11 +316,13 @@ def main() -> int:
     print("配置: 已读取根目录 .env（URL、模型和 Key 不显示）")
     preview_command = (
         "claude --print --verbose --output-format stream-json "
+        "--safe-mode --disable-slash-commands "
         "--dangerously-skip-permissions "
         "--permission-mode bypassPermissions --permission-prompts none "
         "<SQLite 原始 prompt>"
         if mode == "server"
-        else "claude --dangerously-skip-permissions <SQLite 原始 prompt>"
+        else "claude --safe-mode --disable-slash-commands "
+             "--dangerously-skip-permissions <SQLite 原始 prompt>"
     )
     for row, folder in prepared:
         print(

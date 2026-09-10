@@ -60,7 +60,10 @@ class AutoPipelineTests(unittest.TestCase):
             Path("D:/batch/.runs/claude-home"), "ccusr-1-1", 1, prompt,
         )
 
-        self.assertEqual(command[-3:], ["claude", "--dangerously-skip-permissions", prompt])
+        self.assertEqual(command[-1], prompt)
+        self.assertIn("--safe-mode", command)
+        self.assertIn("--disable-slash-commands", command)
+        self.assertIn("--dangerously-skip-permissions", command)
         self.assertEqual(command.count(prompt), 1)
         self.assertIn("ccusr.pipeline_job=1", command)
         self.assertIn("1000:1000", command)

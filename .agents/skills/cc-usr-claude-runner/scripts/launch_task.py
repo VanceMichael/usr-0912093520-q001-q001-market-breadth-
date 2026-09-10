@@ -20,6 +20,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from tools.batch_pipeline import connect, prompt_hash  # noqa: E402
+from tools.text_encoding import read_portable_text  # noqa: E402
 
 
 KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -55,7 +56,7 @@ def _parse_value(raw: str, line_number: int) -> str:
 
 def parse_dotenv(path: Path) -> dict[str, str]:
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
+        lines = read_portable_text(path).splitlines()
     except OSError as exc:
         raise ValueError(f"cannot read env file {path}: {exc}") from exc
     values: dict[str, str] = {}
@@ -102,11 +103,13 @@ def load_claude_config(path: Path) -> ClaudeConfig:
 
 
 def build_claude_command(claude: str, prompt: str, *, headless: bool = False) -> list[str]:
-    """Build the Claude Code command for an isolated task workspace.
+    """Build the clean Claude Code command for an isolated task workspace.
 
     Interactive launches keep the native session for local macOS runs.  Headless
     launches use print mode, which skips the workspace-trust UI and never waits
-    for a permission answer on servers without a terminal.
+    for a permission answer on servers without a terminal. Safe mode and
+    disabled slash commands keep project skills, plugins, hooks, MCP, memory,
+    and custom instructions out of the model context.
     """
     if headless:
         return [
@@ -115,6 +118,8 @@ def build_claude_command(claude: str, prompt: str, *, headless: bool = False) ->
             "--verbose",
             "--output-format",
             "stream-json",
+            "--safe-mode",
+            "--disable-slash-commands",
             "--dangerously-skip-permissions",
             "--permission-mode",
             "bypassPermissions",
@@ -122,7 +127,13 @@ def build_claude_command(claude: str, prompt: str, *, headless: bool = False) ->
             "none",
             prompt,
         ]
-    return [claude, "--dangerously-skip-permissions", prompt]
+    return [
+        claude,
+        "--safe-mode",
+        "--disable-slash-commands",
+        "--dangerously-skip-permissions",
+        prompt,
+    ]
 
 
 def build_claude_environment(config: ClaudeConfig, *, headless: bool = False) -> dict[str, str]:

@@ -57,7 +57,9 @@ PIPELINE_ENV_KEYS = (
     "CC_CLAUDE_DOCKER_IMAGE", "CC_CLAUDE_DOCKER_COMMAND",
     "CC_PIPELINE_MODEL_MODE",
     "CC_PIPELINE_QC_CONCURRENCY", "CC_PIPELINE_MODEL_CONCURRENCY",
-    "CC_PIPELINE_CODEX_CONCURRENCY",
+    "CC_PIPELINE_CODEX_CONCURRENCY", "CC_CLAUDE_HEARTBEAT_SECONDS",
+    "CC_CLAUDE_START_TIMEOUT", "CC_CLAUDE_STALLED_TIMEOUT",
+    "CC_PIPELINE_WORKER_TIMEOUT",
 )
 NEWS_URL_MAX = 20
 AUTHOR_DIFFICULTIES = ("中等", "困难", "地狱")
@@ -69,6 +71,7 @@ from tools.runtime_environment import docker_info, repair_docker_engine  # noqa:
 from tools.batch_pipeline import SCHEMA_VERSION, connect as initialize_database  # noqa: E402
 from tools.authoring_policy import backend_only_requirement  # noqa: E402
 from tools.scheduler_state import SchedulerStore  # noqa: E402
+from tools.text_encoding import read_portable_text  # noqa: E402
 
 AUTHOR_JOB_SCHEMA = """
 CREATE TABLE IF NOT EXISTS author_jobs (
@@ -417,6 +420,13 @@ class ConsoleData:
     def vps_scheduler_logs(self, node_id: object, query: str) -> dict:
         node = self._vps_node(node_id)
         path = "/api/scheduler/logs" + (f"?{query}" if query else "")
+        payload, _headers = self._vps_request(node, path)
+        return json.loads(payload.decode("utf-8"))
+
+    def vps_scheduler_run_output(self, node_id: object, run_id: object, query: str) -> dict:
+        node = self._vps_node(node_id)
+        value = int(run_id)
+        path = f"/api/scheduler/runs/{value}/output" + (f"?{query}" if query else "")
         payload, _headers = self._vps_request(node, path)
         return json.loads(payload.decode("utf-8"))
 
@@ -1064,7 +1074,12 @@ class ConsoleData:
     def _redact_log(value: str) -> str:
         value = re.sub(r"\bsk-[A-Za-z0-9_-]{12,}\b", "[REDACTED]", value)
         value = re.sub(r"(?i)(?:gh[pousr]_\w+|github_pat_\w+)", "[REDACTED]", value)
-        return re.sub(r"(?i)(api[_ -]?key\s*[:=]\s*)\S+", r"\1[REDACTED]", value)
+        value = re.sub(r"(?i)(api[_ -]?key\s*[:=]\s*)\S+", r"\1[REDACTED]", value)
+        return re.sub(
+            r"(?i)((?:anthropic_auth_token|github_token|gh_token|access_token|password)\s*=\s*)\S+",
+            r"\1[REDACTED]",
+            value,
+        )
 
     def _subprocess_env(self) -> dict[str, str]:
         environment = os.environ.copy()
@@ -1283,6 +1298,197 @@ class ConsoleData:
                 containers.append(dict(zip(("id", "name", "image", "status"), fields)))
         return containers
 
+    def _registered_run_artifact(self, raw: object, *, directory: bool = False) -> Path | None:
+        value = str(raw or "").strip()
+        if not value:
+            return None
+        try:
+            path = Path(value).resolve(strict=True)
+            root = (self.project_root / "runs").resolve(strict=True)
+        except OSError:
+            return None
+        if root != path and root not in path.parents:
+            return None
+        if directory and not path.is_dir():
+            return None
+        if not directory and not path.is_file():
+            return None
+        return path
+
+    def _scheduler_active_runs(self) -> list[dict]:
+        with closing(self.connect()) as connection:
+            rows = connection.execute(
+                "SELECT r.id,r.batch_run_id,r.status,r.started_at,r.heartbeat_at,r.container_id,"
+                "r.log_path,r.trajectory_root,q.task_id,q.question_no,q.difficulty,q.languages,b.name AS batch_name "
+                "FROM runs r JOIN questions q ON q.id=r.question_id JOIN batches b ON b.id=q.batch_id "
+                "WHERE r.status='running' ORDER BY r.started_at,r.id"
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            activity = 0.0
+            log_path = self._registered_run_artifact(row["log_path"])
+            if log_path:
+                try:
+                    stat = log_path.stat()
+                    activity = max(activity, stat.st_mtime)
+                    item["output_bytes"] = stat.st_size
+                except OSError:
+                    item["output_bytes"] = 0
+            else:
+                item["output_bytes"] = 0
+            trajectory = self._registered_run_artifact(row["trajectory_root"], directory=True)
+            if trajectory:
+                try:
+                    activity = max(
+                        [activity, *(path.stat().st_mtime for path in trajectory.rglob("*.jsonl"))]
+                    )
+                except OSError:
+                    pass
+            item["activity_at"] = (
+                datetime.fromtimestamp(activity).astimezone().isoformat(timespec="seconds")
+                if activity else str(row["heartbeat_at"] or row["started_at"] or "")
+            )
+            item.pop("log_path", None)
+            item.pop("trajectory_root", None)
+            result.append(item)
+        return result
+
+    @staticmethod
+    def _tool_event_text(block: dict) -> str:
+        name = str(block.get("name") or "Tool")
+        value = block.get("input")
+        if isinstance(value, dict):
+            detail = value.get("command") or value.get("file_path") or value.get("path")
+            if not detail:
+                detail = json.dumps(value, ensure_ascii=False)
+        else:
+            detail = value
+        text = str(detail or "").strip()
+        return f"{name}: {text}" if text else name
+
+    def _claude_output_events(self, line: str, *, streaming: bool) -> list[dict]:
+        redacted = self._redact_log(line.strip())
+        if not redacted:
+            return []
+        try:
+            payload = json.loads(redacted)
+        except json.JSONDecodeError:
+            return [{"kind": "output", "text": redacted}]
+        if not isinstance(payload, dict):
+            return [{"kind": "output", "text": redacted}]
+        timestamp = str(payload.get("timestamp") or "")
+        kind = str(payload.get("type") or "")
+        events: list[dict] = []
+        if kind == "stream_event":
+            event = payload.get("event")
+            if isinstance(event, dict) and event.get("type") == "content_block_delta":
+                delta = event.get("delta")
+                if isinstance(delta, dict) and delta.get("type") == "text_delta" and delta.get("text"):
+                    events.append({"kind": "delta", "text": str(delta["text"]), "timestamp": timestamp})
+            return events
+        message = payload.get("message")
+        content = message.get("content") if isinstance(message, dict) else None
+        if kind == "assistant" and isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "tool_use":
+                    events.append({"kind": "tool", "text": self._redact_log(self._tool_event_text(block))[:4000], "timestamp": timestamp})
+                elif block.get("type") == "text" and block.get("text") and not streaming:
+                    events.append({"kind": "output", "text": self._redact_log(str(block["text"]))[:8000], "timestamp": timestamp})
+        elif kind == "user" and isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    continue
+                value = block.get("content")
+                if isinstance(value, list):
+                    value = "\n".join(str(item.get("text", "")) for item in value if isinstance(item, dict))
+                if value:
+                    events.append({"kind": "result", "text": self._redact_log(str(value))[:8000], "timestamp": timestamp})
+        elif kind == "result":
+            value = payload.get("result") or payload.get("subtype") or "Claude 运行结束"
+            events.append({"kind": "complete", "text": self._redact_log(str(value))[:8000], "timestamp": timestamp})
+        elif kind == "system" and payload.get("subtype") == "init":
+            events.append({"kind": "system", "text": "Claude 会话已启动", "timestamp": timestamp})
+        return events
+
+    def scheduler_run_output(self, run_id: object, query: dict[str, list[str]]) -> dict:
+        try:
+            value = int(run_id)
+            after = max(0, int(query.get("after", ["0"])[0]))
+        except (TypeError, ValueError):
+            raise ValueError("运行编号或日志游标无效") from None
+        requested_source = str(query.get("source", [""])[0])
+        with closing(self.connect()) as connection:
+            row = connection.execute(
+                "SELECT r.id,r.status,r.log_path,r.trajectory_root,q.task_id,b.name AS batch_name "
+                "FROM runs r JOIN questions q ON q.id=r.question_id JOIN batches b ON b.id=q.batch_id WHERE r.id=?",
+                (value,),
+            ).fetchone()
+        if row is None:
+            raise ValueError("运行记录不存在")
+        path = self._registered_run_artifact(row["log_path"])
+        source = f"log:{value}"
+        streaming = True
+        try:
+            log_size = path.stat().st_size if path else 0
+        except OSError:
+            path = None
+            log_size = 0
+        if path is None or log_size == 0:
+            root = self._registered_run_artifact(row["trajectory_root"], directory=True)
+            try:
+                candidates = sorted(root.rglob("*.jsonl"), key=lambda item: item.stat().st_mtime) if root else []
+            except OSError:
+                candidates = []
+            path = candidates[-1] if candidates else None
+            source = (
+                "trajectory:" + path.relative_to(root).as_posix()
+                if path and root else "pending"
+            )
+            streaming = False
+        if path is None:
+            return {"run_id": value, "source": source, "next_after": 0, "events": [], "status": row["status"]}
+        if requested_source and requested_source != source:
+            after = 0
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return {"run_id": value, "source": "pending", "next_after": 0, "events": [], "status": row["status"]}
+        truncated = False
+        if after > size:
+            after = 0
+        if after == 0 and size > 524_288:
+            after = size - 524_288
+            truncated = True
+        events: list[dict] = []
+        with path.open("rb") as handle:
+            handle.seek(after)
+            if truncated:
+                handle.readline()
+            while len(events) < 500:
+                line_start = handle.tell()
+                raw = handle.readline()
+                if not raw:
+                    break
+                # A running process can be observed between two writes. Keep the
+                # cursor before an unfinished JSONL record so the next poll can
+                # parse the complete line on every supported host OS.
+                if not raw.endswith(b"\n") and row["status"] == "running":
+                    handle.seek(line_start)
+                    break
+                for event in self._claude_output_events(raw.decode("utf-8", errors="replace"), streaming=streaming):
+                    events.append(event)
+                    if len(events) >= 500:
+                        break
+            next_after = handle.tell()
+        return {
+            "run_id": value, "task_id": row["task_id"], "batch_name": row["batch_name"],
+            "source": source, "next_after": next_after, "events": events,
+            "status": row["status"], "truncated": truncated,
+        }
+
     def scheduler_snapshot(self) -> dict:
         state = self.scheduler_store.state()
         heartbeat_age = None
@@ -1325,6 +1531,7 @@ class ConsoleData:
             "resources": self._scheduler_resources(),
             "git": self._scheduler_git(),
             "containers": self._scheduler_containers(),
+            "active_runs": self._scheduler_active_runs(),
             "cycles": self.scheduler_store.cycles(20),
             "config": {
                 "batch_size": config["author_batch_size"],
@@ -1470,7 +1677,7 @@ class ConsoleData:
         values = {key: "" for key in (*ENV_KEYS, *PIPELINE_ENV_KEYS)}
         if not self.env_file.exists():
             return values
-        for line in self.env_file.read_text(encoding="utf-8").splitlines():
+        for line in read_portable_text(self.env_file).splitlines():
             stripped = line.strip()
             if not stripped or stripped.startswith("#") or "=" not in stripped:
                 continue
@@ -1867,7 +2074,14 @@ class ConsoleData:
             "CC_PIPELINE_MODEL_MODE": values["model_mode"],
             **concurrency_values,
         }
-        lines = self.env_file.read_text(encoding="utf-8").splitlines() if self.env_file.exists() else []
+        for key, default in (
+            ("CC_CLAUDE_HEARTBEAT_SECONDS", "5"),
+            ("CC_CLAUDE_START_TIMEOUT", "300"),
+            ("CC_CLAUDE_STALLED_TIMEOUT", "900"),
+            ("CC_PIPELINE_WORKER_TIMEOUT", "3600"),
+        ):
+            output_values[key] = current.get(key, "").strip() or default
+        lines = read_portable_text(self.env_file).splitlines() if self.env_file.exists() else []
         replaced: set[str] = set()
         output: list[str] = []
         for line in lines:
@@ -2447,6 +2661,10 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             if parsed.path == "/api/scheduler/events/stream":
                 self.send_scheduler_stream(parse_qs(parsed.query))
                 return
+            match = re.fullmatch(r"/api/scheduler/runs/(\d+)/output", parsed.path)
+            if match:
+                self.send_json(self.data.scheduler_run_output(int(match.group(1)), parse_qs(parsed.query)))
+                return
             if parsed.path == "/api/vps-nodes":
                 self.send_json({"nodes": self.data.vps_nodes()})
                 return
@@ -2465,6 +2683,10 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             match = re.fullmatch(r"/api/vps-nodes/(\d+)/scheduler/logs", parsed.path)
             if match:
                 self.send_json(self.data.vps_scheduler_logs(int(match.group(1)), parsed.query))
+                return
+            match = re.fullmatch(r"/api/vps-nodes/(\d+)/scheduler/runs/(\d+)/output", parsed.path)
+            if match:
+                self.send_json(self.data.vps_scheduler_run_output(int(match.group(1)), int(match.group(2)), parsed.query))
                 return
             match = re.fullmatch(r"/api/vps-nodes/(\d+)/delivery-package", parsed.path)
             if match:

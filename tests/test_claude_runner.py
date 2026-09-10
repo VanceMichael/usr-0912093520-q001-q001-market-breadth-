@@ -95,7 +95,10 @@ class RunnerTests(unittest.TestCase):
         command = launch_task.build_claude_command("/usr/local/bin/claude", prompt)
         self.assertEqual(
             command,
-            ["/usr/local/bin/claude", "--dangerously-skip-permissions", prompt],
+            [
+                "/usr/local/bin/claude", "--safe-mode", "--disable-slash-commands",
+                "--dangerously-skip-permissions", prompt,
+            ],
         )
 
     def test_headless_command_cannot_wait_for_trust_or_permission_input(self):
@@ -107,6 +110,8 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("--print", command)
         self.assertIn("--verbose", command)
         self.assertEqual(command[command.index("--output-format") + 1], "stream-json")
+        self.assertIn("--safe-mode", command)
+        self.assertIn("--disable-slash-commands", command)
         self.assertIn("--dangerously-skip-permissions", command)
         self.assertIn("--permission-mode", command)
         self.assertIn("bypassPermissions", command)
@@ -222,7 +227,10 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(executable, "/usr/local/bin/claude")
             self.assertEqual(
                 command,
-                ["/usr/local/bin/claude", "--dangerously-skip-permissions", row["prompt"]],
+                [
+                    "/usr/local/bin/claude", "--safe-mode", "--disable-slash-commands",
+                    "--dangerously-skip-permissions", row["prompt"],
+                ],
             )
             self.assertEqual(environment["ANTHROPIC_AUTH_TOKEN"], "super-secret")
 
@@ -240,12 +248,15 @@ class RunnerTests(unittest.TestCase):
                 run_tasks, "find_claude", return_value="/usr/local/bin/claude"
             ), mock.patch.object(
                 run_tasks, "claude_version", return_value="2.1.259"
+            ), mock.patch.object(
+                run_tasks, "require_clean_mode_support"
             ), redirect_stdout(stdout):
                 self.assertEqual(run_tasks.main(), 0)
             output = stdout.getvalue()
             self.assertIn(f"cd {shlex.quote(str(row['folder_path']))}", output)
             self.assertIn(
                 "claude --print --verbose --output-format stream-json "
+                "--safe-mode --disable-slash-commands "
                 "--dangerously-skip-permissions "
                 "--permission-mode bypassPermissions --permission-prompts none "
                 "<SQLite 原始 prompt>",
@@ -313,6 +324,8 @@ class RunnerTests(unittest.TestCase):
             ), mock.patch.object(
                 run_tasks, "claude_version", return_value="2.1.259"
             ), mock.patch.object(
+                run_tasks, "require_clean_mode_support"
+            ), mock.patch.object(
                 run_tasks, "iterm_available", return_value=True
             ), mock.patch.object(
                 run_tasks, "open_iterm", return_value=completed
@@ -361,6 +374,8 @@ class RunnerTests(unittest.TestCase):
                 run_tasks, "find_claude", return_value="C:/npm/claude.cmd"
             ), mock.patch.object(
                 run_tasks, "claude_version", return_value="2.1.259"
+            ), mock.patch.object(
+                run_tasks, "require_clean_mode_support"
             ), mock.patch.object(
                 run_tasks, "powershell_executable", return_value="powershell.exe"
             ), mock.patch.object(
@@ -414,6 +429,8 @@ class RunnerTests(unittest.TestCase):
                 run_tasks, "find_claude", return_value="/usr/local/bin/claude"
             ), mock.patch.object(
                 run_tasks, "claude_version", return_value="2.1.259"
+            ), mock.patch.object(
+                run_tasks, "require_clean_mode_support"
             ), mock.patch.object(
                 run_tasks, "open_server", return_value=process
             ) as server_mock:

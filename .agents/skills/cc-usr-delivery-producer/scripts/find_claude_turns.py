@@ -79,6 +79,29 @@ def prompt_id(event: dict) -> tuple[str, str]:
     return "", ""
 
 
+def resolve_claude_root(
+    question: sqlite3.Row, run: sqlite3.Row, explicit_root: Path | None,
+) -> Path:
+    if explicit_root is not None:
+        root = explicit_root.expanduser().resolve()
+    else:
+        configured = str(run["trajectory_root"] or "").strip()
+        if configured:
+            root = Path(configured).expanduser().resolve()
+        else:
+            batch_folder = Path(question["folder_path"]).resolve().parent
+            root = (
+                batch_folder / ".runs" / str(run["batch_run_id"])
+                / str(question["task_id"]) / "claude-home" / "projects"
+            )
+    if not root.is_dir():
+        raise ValueError(
+            "Claude trajectory root does not exist; pass --claude-root explicitly: "
+            f"{root}"
+        )
+    return root
+
+
 def locate(
     claude_root: Path, folder: Path, prompt: str, launched_at: datetime,
     folder_aliases: tuple[Path, ...] = (),
@@ -160,12 +183,7 @@ def main() -> int:
         launched_at = parse_time(run["launched_at"])
         if launched_at is None or launched_at.tzinfo is None:
             raise ValueError("registered launch timestamp is invalid")
-        if args.claude_root:
-            claude_root = args.claude_root.resolve()
-        elif run["trajectory_root"]:
-            claude_root = Path(run["trajectory_root"]).resolve()
-        else:
-            claude_root = (Path.home() / ".claude/projects").resolve()
+        claude_root = resolve_claude_root(question, run, args.claude_root)
         folder_aliases: tuple[Path, ...] = ()
         if str(run["batch_run_id"]).startswith("docker-"):
             aliases = [Path("/workspace")]
@@ -176,6 +194,7 @@ def main() -> int:
             claude_root, Path(question["folder_path"]), question["prompt"],
             launched_at, folder_aliases,
         )
+        result["trajectory_root"] = str(claude_root)
     except (OSError, ValueError, sqlite3.Error) as exc:
         print(f"Claude session lookup failed: {exc}", file=sys.stderr)
         return 1

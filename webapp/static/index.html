@@ -202,6 +202,13 @@
             <div><h3>最近周期</h3><div id="scheduler-cycles" class="scheduler-cycle-list"></div></div>
           </div>
         </section>
+        <section class="scheduler-panel scheduler-live-panel" aria-labelledby="scheduler-live-title">
+          <div class="scheduler-panel-head"><div><h2 id="scheduler-live-title">Claude 运行现场</h2><span id="scheduler-live-status">等待运行任务</span></div><div class="scheduler-live-actions"><button class="icon-button" id="scheduler-live-follow" type="button" title="跟随最新输出" aria-label="跟随最新输出"><i data-lucide="arrow-down-to-line"></i></button><button class="icon-button" id="scheduler-live-download" type="button" title="下载当前输出" aria-label="下载当前输出"><i data-lucide="download"></i></button></div></div>
+          <div class="scheduler-live-grid">
+            <div id="scheduler-live-runs" class="scheduler-live-runs"><div class="empty-state compact-empty"><strong>当前没有运行中的题目</strong></div></div>
+            <div id="scheduler-live-terminal" class="scheduler-live-terminal"><div class="terminal-empty"><i data-lucide="square-terminal"></i><strong>等待 Claude 输出</strong></div></div>
+          </div>
+        </section>
         <section class="scheduler-panel scheduler-log-panel" aria-labelledby="scheduler-log-title">
           <div class="scheduler-panel-head"><div><h2 id="scheduler-log-title">实时日志</h2><span id="scheduler-log-status">结构化事件</span></div><button class="icon-button" id="scheduler-refresh" type="button" title="刷新调度信息" aria-label="刷新调度信息"><i data-lucide="refresh-cw"></i></button></div>
           <div class="scheduler-log-tools">
