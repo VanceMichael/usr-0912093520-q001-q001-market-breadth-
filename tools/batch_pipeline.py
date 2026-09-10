@@ -19,7 +19,7 @@ from datetime import datetime
 from pathlib import Path
 
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 DEFAULT_NEWS_FEEDS = (
     "https://channel.chinanews.com.cn/cns/cl/gn-js.shtml",
     "https://channel.chinanews.com.cn/cns/cl/gn-kjww.shtml",
@@ -171,6 +171,9 @@ CREATE TABLE IF NOT EXISTS questions (
     model_lease_expires_at TEXT NOT NULL DEFAULT '',
     delivery_lease_owner TEXT NOT NULL DEFAULT '',
     delivery_lease_expires_at TEXT NOT NULL DEFAULT '',
+    maintenance_mode INTEGER NOT NULL DEFAULT 0 CHECK (maintenance_mode IN (0, 1)),
+    maintenance_note TEXT NOT NULL DEFAULT '',
+    reset_count INTEGER NOT NULL DEFAULT 0 CHECK (reset_count >= 0),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE (batch_id, question_no),
@@ -205,6 +208,8 @@ CREATE TABLE IF NOT EXISTS runs (
     failure_kind TEXT NOT NULL DEFAULT '',
     retryable INTEGER NOT NULL DEFAULT 0,
     retry_delay_seconds INTEGER NOT NULL DEFAULT 0,
+    manual_baseline_turns INTEGER NOT NULL DEFAULT 0 CHECK (manual_baseline_turns >= 0),
+    manual_env_file TEXT NOT NULL DEFAULT '',
     UNIQUE (question_id, batch_run_id)
 );
 
@@ -248,8 +253,11 @@ CREATE TABLE IF NOT EXISTS records (
     delivery_qc_note TEXT NOT NULL DEFAULT '',
     delivery_qc_checked_at TEXT NOT NULL DEFAULT '',
     delivery_qc_changes TEXT NOT NULL DEFAULT '[]',
+    raw_user_prompt TEXT NOT NULL DEFAULT '',
+    raw_turn_id TEXT NOT NULL DEFAULT '',
+    is_continuation INTEGER NOT NULL DEFAULT 0 CHECK (is_continuation IN (0, 1)),
+    continuation_count INTEGER NOT NULL DEFAULT 0 CHECK (continuation_count >= 0),
     created_at TEXT NOT NULL,
-    UNIQUE (session_id, turn_id),
     UNIQUE (question_id, turn_no)
 );
 
@@ -349,11 +357,206 @@ CREATE TABLE IF NOT EXISTS pipeline_items (
 
 CREATE INDEX IF NOT EXISTS idx_pipeline_jobs_created ON pipeline_jobs(created_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_pipeline_items_job ON pipeline_items(pipeline_job_id, question_no);
+
+CREATE TABLE IF NOT EXISTS solo2_submissions (
+    id INTEGER PRIMARY KEY,
+    record_id TEXT NOT NULL UNIQUE,
+    question_id INTEGER NOT NULL REFERENCES questions(id) ON DELETE RESTRICT,
+    remote_submission_id TEXT NOT NULL DEFAULT '',
+    remote_status TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'pending',
+    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    last_error TEXT NOT NULL DEFAULT '',
+    submitted_at TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL,
+    lease_owner TEXT NOT NULL DEFAULT '',
+    lease_expires_at TEXT NOT NULL DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS question_reset_audit (
+    id INTEGER PRIMARY KEY,
+    question_id INTEGER NOT NULL REFERENCES questions(id) ON DELETE RESTRICT,
+    task_id TEXT NOT NULL,
+    reason TEXT NOT NULL DEFAULT '',
+    removed_runs INTEGER NOT NULL DEFAULT 0,
+    removed_records INTEGER NOT NULL DEFAULT 0,
+    reset_at TEXT NOT NULL
+);
 """
 
 
 def now() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+RECORD_COLUMNS = (
+    "id", "question_id", "record_id", "turn_no", "user_prompt", "session_id",
+    "turn_id", "initial_snapshot", "trajectory_file", "reproducibility", "harness",
+    "harness_version", "operating_system", "task_type", "difficulty", "languages",
+    "delivery_score", "delivery_description", "instruction_score",
+    "instruction_description", "planning_score", "planning_description",
+    "reasoning_score", "reasoning_description", "execution_score",
+    "execution_description", "other_issues", "submitter", "submitted_at",
+    "parent_record", "turn_completed_at", "human_authored", "human_qc_approved",
+    "human_qc_reviewer", "human_qc_approved_at", "delivery_qc_passed",
+    "delivery_qc_note", "delivery_qc_checked_at", "delivery_qc_changes",
+    "raw_user_prompt", "raw_turn_id", "is_continuation", "continuation_count",
+    "created_at",
+)
+
+
+def migrate_records_continuation_identity(connection: sqlite3.Connection) -> None:
+    """Remove the obsolete SessionID/PromptID uniqueness rule without losing rows."""
+    table_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='records'"
+    ).fetchone()
+    table_sql = str(table_row["sql"] or "") if table_row else ""
+    has_old_constraint = bool(re.search(
+        r"UNIQUE\s*\(\s*session_id\s*,\s*turn_id\s*\)", table_sql, re.IGNORECASE,
+    ))
+    if not has_old_constraint:
+        return
+    before = int(connection.execute("SELECT COUNT(*) FROM records").fetchone()[0])
+    existing = {row["name"] for row in connection.execute("PRAGMA table_info(records)")}
+    connection.execute("PRAGMA foreign_keys=OFF")
+    try:
+        connection.executescript("""
+            DROP TABLE IF EXISTS records_v15;
+            CREATE TABLE records_v15 (
+                id INTEGER PRIMARY KEY,
+                question_id INTEGER NOT NULL REFERENCES questions(id) ON DELETE RESTRICT,
+                record_id TEXT NOT NULL UNIQUE,
+                turn_no INTEGER NOT NULL CHECK (turn_no BETWEEN 1 AND 10),
+                user_prompt TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                turn_id TEXT NOT NULL,
+                initial_snapshot TEXT NOT NULL,
+                trajectory_file TEXT NOT NULL,
+                reproducibility TEXT NOT NULL,
+                harness TEXT NOT NULL,
+                harness_version TEXT NOT NULL,
+                operating_system TEXT NOT NULL,
+                task_type TEXT NOT NULL,
+                difficulty TEXT NOT NULL,
+                languages TEXT NOT NULL,
+                delivery_score INTEGER NOT NULL CHECK (delivery_score BETWEEN 1 AND 5),
+                delivery_description TEXT NOT NULL,
+                instruction_score INTEGER NOT NULL CHECK (instruction_score BETWEEN 1 AND 5),
+                instruction_description TEXT NOT NULL,
+                planning_score INTEGER NOT NULL CHECK (planning_score BETWEEN 1 AND 5),
+                planning_description TEXT NOT NULL,
+                reasoning_score INTEGER NOT NULL CHECK (reasoning_score BETWEEN 1 AND 5),
+                reasoning_description TEXT NOT NULL,
+                execution_score INTEGER NOT NULL CHECK (execution_score BETWEEN 1 AND 5),
+                execution_description TEXT NOT NULL,
+                other_issues TEXT NOT NULL DEFAULT '',
+                submitter TEXT NOT NULL,
+                submitted_at TEXT NOT NULL,
+                parent_record TEXT NOT NULL DEFAULT '',
+                turn_completed_at TEXT NOT NULL,
+                human_authored INTEGER NOT NULL DEFAULT 1 CHECK (human_authored IN (0, 1)),
+                human_qc_approved INTEGER NOT NULL DEFAULT 0 CHECK (human_qc_approved IN (0, 1)),
+                human_qc_reviewer TEXT NOT NULL DEFAULT '',
+                human_qc_approved_at TEXT NOT NULL DEFAULT '',
+                delivery_qc_passed INTEGER NOT NULL DEFAULT 0 CHECK (delivery_qc_passed IN (0, 1)),
+                delivery_qc_note TEXT NOT NULL DEFAULT '',
+                delivery_qc_checked_at TEXT NOT NULL DEFAULT '',
+                delivery_qc_changes TEXT NOT NULL DEFAULT '[]',
+                raw_user_prompt TEXT NOT NULL DEFAULT '',
+                raw_turn_id TEXT NOT NULL DEFAULT '',
+                is_continuation INTEGER NOT NULL DEFAULT 0 CHECK (is_continuation IN (0, 1)),
+                continuation_count INTEGER NOT NULL DEFAULT 0 CHECK (continuation_count >= 0),
+                created_at TEXT NOT NULL,
+                UNIQUE (question_id, turn_no)
+            )
+        """)
+        common = [column for column in RECORD_COLUMNS if column in existing]
+        names = ",".join(common)
+        connection.execute(f"INSERT INTO records_v15 ({names}) SELECT {names} FROM records")
+        after = int(connection.execute("SELECT COUNT(*) FROM records_v15").fetchone()[0])
+        if before != after:
+            raise sqlite3.IntegrityError(
+                f"records migration row mismatch: before={before}, after={after}"
+            )
+        connection.executescript("""
+            DROP TABLE records;
+            ALTER TABLE records_v15 RENAME TO records;
+            CREATE INDEX IF NOT EXISTS idx_records_question ON records(question_id, turn_no);
+        """)
+    finally:
+        connection.execute("PRAGMA foreign_keys=ON")
+
+
+def migrate_solo2_submissions(connection: sqlite3.Connection) -> None:
+    """Upgrade the earlier append-only SOLO2 receipt table to a retry state machine."""
+    columns = {
+        row["name"] for row in connection.execute("PRAGMA table_info(solo2_submissions)")
+    }
+    required = {
+        "status", "attempt_count", "last_error", "updated_at", "lease_owner",
+        "lease_expires_at",
+    }
+    if required.issubset(columns):
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_solo2_submissions_status "
+            "ON solo2_submissions(status, lease_expires_at, updated_at)"
+        )
+        return
+    connection.execute("PRAGMA foreign_keys=OFF")
+    try:
+        connection.executescript("""
+            DROP TABLE IF EXISTS solo2_submissions_v15;
+            CREATE TABLE solo2_submissions_v15 (
+                id INTEGER PRIMARY KEY,
+                record_id TEXT NOT NULL UNIQUE,
+                question_id INTEGER NOT NULL REFERENCES questions(id) ON DELETE RESTRICT,
+                remote_submission_id TEXT NOT NULL DEFAULT '',
+                remote_status TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+                last_error TEXT NOT NULL DEFAULT '',
+                submitted_at TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL,
+                lease_owner TEXT NOT NULL DEFAULT '',
+                lease_expires_at TEXT NOT NULL DEFAULT ''
+            );
+        """)
+        stable = [
+            name for name in (
+                "id", "record_id", "question_id", "remote_submission_id",
+                "remote_status", "submitted_at",
+            ) if name in columns
+        ]
+        select_parts = stable + [
+            "CASE WHEN COALESCE(remote_submission_id,'')!='' THEN 'succeeded' ELSE 'pending' END",
+            "CASE WHEN COALESCE(remote_submission_id,'')!='' THEN 1 ELSE 0 END",
+            "''",
+            "CASE WHEN COALESCE(submitted_at,'')!='' THEN submitted_at ELSE ? END",
+            "''",
+            "''",
+        ]
+        target = stable + [
+            "status", "attempt_count", "last_error", "updated_at", "lease_owner",
+            "lease_expires_at",
+        ]
+        connection.execute(
+            f"INSERT INTO solo2_submissions_v15({','.join(target)}) "
+            f"SELECT {','.join(select_parts)} FROM solo2_submissions",
+            (now(),),
+        )
+        before = int(connection.execute("SELECT COUNT(*) FROM solo2_submissions").fetchone()[0])
+        after = int(connection.execute("SELECT COUNT(*) FROM solo2_submissions_v15").fetchone()[0])
+        if before != after:
+            raise sqlite3.IntegrityError(
+                f"SOLO2 migration row mismatch: before={before}, after={after}"
+            )
+        connection.executescript("""
+            DROP TABLE solo2_submissions;
+            ALTER TABLE solo2_submissions_v15 RENAME TO solo2_submissions;
+            CREATE INDEX idx_solo2_submissions_status
+                ON solo2_submissions(status, lease_expires_at, updated_at);
+        """)
+    finally:
+        connection.execute("PRAGMA foreign_keys=ON")
 
 
 def connect(database: Path) -> sqlite3.Connection:
@@ -364,6 +567,7 @@ def connect(database: Path) -> sqlite3.Connection:
     connection.execute("PRAGMA journal_mode=WAL")
     connection.execute("PRAGMA foreign_keys=ON")
     connection.executescript(SCHEMA)
+    migrate_solo2_submissions(connection)
     feed_initialized = connection.execute(
         "SELECT 1 FROM schema_meta WHERE key='news_feeds_initialized'"
     ).fetchone()
@@ -393,6 +597,9 @@ def connect(database: Path) -> sqlite3.Connection:
         "model_lease_expires_at": "TEXT NOT NULL DEFAULT ''",
         "delivery_lease_owner": "TEXT NOT NULL DEFAULT ''",
         "delivery_lease_expires_at": "TEXT NOT NULL DEFAULT ''",
+        "maintenance_mode": "INTEGER NOT NULL DEFAULT 0 CHECK (maintenance_mode IN (0, 1))",
+        "maintenance_note": "TEXT NOT NULL DEFAULT ''",
+        "reset_count": "INTEGER NOT NULL DEFAULT 0 CHECK (reset_count >= 0)",
     }
     for name, definition in question_lease_columns.items():
         if name not in question_columns:
@@ -453,6 +660,25 @@ def connect(database: Path) -> sqlite3.Connection:
         connection.execute(
             "ALTER TABLE records ADD COLUMN delivery_qc_changes TEXT NOT NULL DEFAULT '[]'"
         )
+    migrate_records_continuation_identity(connection)
+    record_columns = {
+        row["name"] for row in connection.execute("PRAGMA table_info(records)")
+    }
+    record_migrations = {
+        "raw_user_prompt": "TEXT NOT NULL DEFAULT ''",
+        "raw_turn_id": "TEXT NOT NULL DEFAULT ''",
+        "is_continuation": "INTEGER NOT NULL DEFAULT 0 CHECK (is_continuation IN (0, 1))",
+        "continuation_count": "INTEGER NOT NULL DEFAULT 0 CHECK (continuation_count >= 0)",
+    }
+    for name, definition in record_migrations.items():
+        if name not in record_columns:
+            connection.execute(f"ALTER TABLE records ADD COLUMN {name} {definition}")
+    connection.execute(
+        "UPDATE records SET raw_user_prompt=user_prompt WHERE raw_user_prompt=''"
+    )
+    connection.execute(
+        "UPDATE records SET raw_turn_id=turn_id WHERE raw_turn_id=''"
+    )
     run_columns = {
         row["name"] for row in connection.execute("PRAGMA table_info(runs)")
     }
@@ -492,6 +718,8 @@ def connect(database: Path) -> sqlite3.Connection:
         "failure_kind": "TEXT NOT NULL DEFAULT ''",
         "retryable": "INTEGER NOT NULL DEFAULT 0",
         "retry_delay_seconds": "INTEGER NOT NULL DEFAULT 0",
+        "manual_baseline_turns": "INTEGER NOT NULL DEFAULT 0 CHECK (manual_baseline_turns >= 0)",
+        "manual_env_file": "TEXT NOT NULL DEFAULT ''",
     }
     for name, definition in run_migrations.items():
         if name not in run_columns:

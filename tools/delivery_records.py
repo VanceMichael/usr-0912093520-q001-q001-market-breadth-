@@ -53,6 +53,7 @@ EXPORT_KEYS = [
     "other_issues", "submitter", "submitted_at", "parent_record", "delivery_qc_note",
 ]
 SCORE_KEYS = {f"{prefix}_score" for prefix in SCORE_PREFIXES}
+MIN_DESCRIPTION_CHINESE = 45
 DESCRIPTION_META_PATTERNS = (
     re.compile(r"(?i)(?:^|[^A-Za-z])AI\s*(?:分析|生成|评分|撰写|认为)"),
     re.compile(r"(?:由|作为|本)\s*(?:AI|Codex)\b", re.IGNORECASE),
@@ -84,6 +85,7 @@ def as_record(row: sqlite3.Row | dict) -> dict:
     record["human_authored"] = bool(record.get("human_authored"))
     record["human_qc_approved"] = bool(record.get("human_qc_approved"))
     record["delivery_qc_passed"] = bool(record.get("delivery_qc_passed"))
+    record["is_continuation"] = bool(record.get("is_continuation"))
     return record
 
 
@@ -128,10 +130,14 @@ def _parse_timestamp(
     return parsed
 
 
-def _description_style_errors(description: str) -> list[str]:
+def _description_style_errors(description: str, *, minimum: int = MIN_DESCRIPTION_CHINESE) -> list[str]:
     errors: list[str] = []
-    if len(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]", description)) < 12:
-        errors.append("必须使用自然、完整的中文书面语")
+    chinese_count = len(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]", description))
+    if chinese_count < minimum:
+        errors.append(f"必须包含至少 {minimum} 个中文字符并使用自然、完整的书面语")
+    sentences = [part for part in re.split(r"[。！？!?]+", description) if part.strip()]
+    if minimum >= MIN_DESCRIPTION_CHINESE and len(sentences) < 2:
+        errors.append("必须用至少两个完整句子分别说明证据和工程影响")
     if any(pattern.search(description) for pattern in DESCRIPTION_META_PATTERNS):
         errors.append("不得包含评价者自述、评分质检、模型表现或生成过程措辞")
     if any(pattern.search(description) for pattern in DESCRIPTION_TEMPLATE_PATTERNS):
@@ -209,7 +215,7 @@ def validate_one(
         errors.append(f"{record_id}: score descriptions must not repeat verbatim")
     other_issues = record.get("other_issues")
     if isinstance(other_issues, str) and other_issues.strip():
-        for style_error in _description_style_errors(other_issues):
+        for style_error in _description_style_errors(other_issues, minimum=12):
             errors.append(f"{record_id}: other_issues {style_error}")
         normalized_other = re.sub(r"\s+", "", other_issues)
         for description in descriptions:
@@ -250,6 +256,31 @@ def validate_one(
         else:
             if not isinstance(parsed_changes, list):
                 errors.append(f"{record_id}: delivery_qc_changes must contain an array")
+
+    is_continuation = record.get("is_continuation", False)
+    if not isinstance(is_continuation, bool):
+        errors.append(f"{record_id}: is_continuation must be boolean")
+    continuation_count = record.get("continuation_count", 0)
+    if (
+        isinstance(continuation_count, bool)
+        or not isinstance(continuation_count, int)
+        or continuation_count < 0
+    ):
+        errors.append(f"{record_id}: continuation_count must be a non-negative integer")
+    raw_user_prompt = record.get("raw_user_prompt", "")
+    raw_turn_id = record.get("raw_turn_id", "")
+    if not isinstance(raw_user_prompt, str) or not isinstance(raw_turn_id, str):
+        errors.append(f"{record_id}: raw continuation fields must be text")
+    elif is_continuation:
+        if raw_user_prompt.strip() != "继续" or not raw_turn_id.strip():
+            errors.append(f"{record_id}: continuation must preserve raw 继续 and its PromptID")
+        if not isinstance(continuation_count, bool) and continuation_count < 1:
+            errors.append(f"{record_id}: continuation_count must be positive for a continuation")
+        other = str(record.get("other_issues") or "")
+        if "中断" not in other or "继续" not in other:
+            errors.append(f"{record_id}: continuation must explain the interruption and recovery in other_issues")
+    elif continuation_count not in {0, False}:
+        errors.append(f"{record_id}: a normal turn cannot have continuation_count")
 
     completed = _parse_timestamp(
         record.get("turn_completed_at"), "turn_completed_at", record_id, errors
@@ -298,17 +329,22 @@ def validate_records(
         warnings.extend(item_warnings)
 
     ids = [str(record.get("record_id", "")) for record in records]
-    pairs = [
-        (str(record.get("session_id", "")), str(record.get("turn_id", "")))
-        for record in records
-    ]
     for duplicate, count in Counter(ids).items():
         if duplicate and count > 1:
             errors.append(f"duplicate record_id: {duplicate}")
-    for duplicate, count in Counter(pairs).items():
-        if all(duplicate) and count > 1:
+    pair_records: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for record in records:
+        pair_records[(
+            str(record.get("session_id", "")), str(record.get("turn_id", "")),
+        )].append(record)
+    for duplicate, items in pair_records.items():
+        if not all(duplicate) or len(items) <= 1:
+            continue
+        ordered = sorted(items, key=lambda item: int(item.get("turn_no") or 0))
+        if any(not bool(item.get("is_continuation")) for item in ordered[1:]):
             errors.append(
-                f"duplicate SessionID + TurnID: {duplicate[0]} / {duplicate[1]}"
+                f"duplicate SessionID + TurnID without verified continuation: "
+                f"{duplicate[0]} / {duplicate[1]}"
             )
 
     by_id = {str(record.get("record_id")): record for record in records}

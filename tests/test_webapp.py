@@ -185,6 +185,10 @@ class WebConsoleTests(unittest.TestCase):
             )
             data = ConsoleData(self.make_database(root), root)
             self.assertEqual(data.env_config()["api_key_hint"], "已配置（末尾 cret）")
+            self.assertFalse(data.env_config()["solo2_auto_submit"])
+            self.assertEqual(
+                data.env_config()["solo2_origin"], "https://solo2.jzxhnh.com",
+            )
             result = data.update_env({
                 "base_url": "https://relay.example.com/v1",
                 "model": "claude-new",
@@ -198,6 +202,7 @@ class WebConsoleTests(unittest.TestCase):
             self.assertIn('CC_SWITCH_API_KEY="new-secret"', content)
             self.assertIn('CC_PIPELINE_MODEL_MODE="local"', content)
             self.assertIn('CC_AUTHOR_BATCH_SIZE="10"', content)
+            self.assertIn('CC_SOLO2_AUTO_SUBMIT="false"', content)
             self.assertNotIn("old-secret", content)
             self.assertEqual(len(result["config"]["news_feeds"]), 3)
             if os.name != "nt":

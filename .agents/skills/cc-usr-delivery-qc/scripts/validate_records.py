@@ -182,17 +182,6 @@ def trajectory_integrity_issues(record: dict, source_row: sqlite3.Row) -> list[s
     session_id = str(record.get("session_id") or "")
     turn_id = str(record.get("turn_id") or "")
     user_prompt = str(record.get("user_prompt") or "")
-    exact_matches = [
-        index for index, event in enumerate(events)
-        if _event_session_id(event) == session_id
-        and _event_prompt_id(event) == turn_id
-        and _event_user_prompt(event) == user_prompt
-    ]
-    if len(exact_matches) != 1:
-        return [
-            f"{record_id}: trajectory must contain exactly one exact "
-            f"SessionID + PromptID + User Prompt match, found {len(exact_matches)} in {path}"
-        ]
     session_events = [event for event in events if _event_session_id(event) in {"", session_id}]
     issues: list[str] = []
     foreign_sessions = sorted({
@@ -209,11 +198,75 @@ def trajectory_integrity_issues(record: dict, source_row: sqlite3.Row) -> list[s
         if _event_session_id(event) in {"", session_id}
         and _event_user_prompt(event) and _event_prompt_id(event)
     ]
-    matched_index = exact_matches[0]
-    ordinal = next((number for number, (index, _event) in enumerate(real_turns, 1) if index == matched_index), None)
-    if ordinal is not None and ordinal != record.get("turn_no"):
+    turn_no = record.get("turn_no")
+    if not isinstance(turn_no, int) or isinstance(turn_no, bool) or not 1 <= turn_no <= len(real_turns):
         issues.append(
-            f"{record_id}: turn_no {record.get('turn_no')} does not match trajectory user-turn order {ordinal}"
+            f"{record_id}: turn_no {turn_no} does not identify a trajectory user turn"
+        )
+        return issues
+    matched_index, matched_event = real_turns[turn_no - 1]
+    raw_prompt = _event_user_prompt(matched_event)
+    raw_prompt_id = _event_prompt_id(matched_event)
+    is_continuation = raw_prompt.strip() == "继续"
+    exact_matches = [
+        index for index, event in enumerate(events)
+        if _event_session_id(event) == session_id
+        and _event_prompt_id(event) == turn_id
+        and _event_user_prompt(event) == user_prompt
+    ]
+    if bool(record.get("is_continuation")) != is_continuation:
+        issues.append(f"{record_id}: continuation flag does not match the original trajectory")
+    if str(record.get("raw_user_prompt") or "") != raw_prompt:
+        issues.append(f"{record_id}: raw_user_prompt does not match the original trajectory")
+    if str(record.get("raw_turn_id") or "") != raw_prompt_id:
+        issues.append(f"{record_id}: raw_turn_id does not match the original trajectory")
+    if is_continuation:
+        if user_prompt.strip() == "继续" or raw_prompt_id == turn_id:
+            issues.append(
+                f"{record_id}: continuation delivery fields must reuse the interrupted task's User Prompt and PromptID"
+            )
+        origin_event: dict | None = None
+        for _index, earlier_event in reversed(real_turns[:turn_no - 1]):
+            if _event_user_prompt(earlier_event).strip() != "继续":
+                origin_event = earlier_event
+                break
+        if (
+            origin_event is None
+            or _event_user_prompt(origin_event) != user_prompt
+            or _event_prompt_id(origin_event) != turn_id
+            or len(exact_matches) != 1
+            or exact_matches[0] >= matched_index
+        ):
+            issues.append(
+                f"{record_id}: continuation must reuse the nearest interrupted task's "
+                f"User Prompt and PromptID from {path}"
+            )
+        consecutive_count = 1
+        for _index, earlier_event in reversed(real_turns[:turn_no - 1]):
+            if _event_user_prompt(earlier_event).strip() != "继续":
+                break
+            consecutive_count += 1
+        if int(record.get("continuation_count") or 0) != consecutive_count:
+            issues.append(
+                f"{record_id}: continuation_count must be {consecutive_count} for this trajectory"
+            )
+        other_issues = str(record.get("other_issues") or "")
+        count_names = {2: "两", 3: "三", 4: "四", 5: "五", 6: "六", 7: "七", 8: "八", 9: "九", 10: "十"}
+        if consecutive_count > 1 and not re.search(
+            rf"(?:{consecutive_count}|{count_names.get(consecutive_count, '')})\s*次\s*继续",
+            other_issues,
+        ):
+            issues.append(
+                f"{record_id}: other_issues must state that continuation occurred {consecutive_count} times"
+            )
+    elif (
+        len(exact_matches) != 1
+        or exact_matches[0] != matched_index
+        or raw_prompt_id != turn_id
+        or raw_prompt != user_prompt
+    ):
+        issues.append(
+            f"{record_id}: trajectory turn must exactly match SessionID + PromptID + User Prompt"
         )
 
     calls: Counter[str] = Counter()
@@ -261,13 +314,18 @@ def trajectory_integrity_issues(record: dict, source_row: sqlite3.Row) -> list[s
     if out_of_order:
         issues.append(f"{record_id}: trajectory has tool results before their calls: " + ", ".join(out_of_order[:10]))
 
-    next_turn_indexes = [index for index, _event in real_turns if index > matched_index]
-    turn_end = next_turn_indexes[0] if next_turn_indexes else len(events)
+    next_turns = [(index, event) for index, event in real_turns if index > matched_index]
+    turn_end = next_turns[0][0] if next_turns else len(events)
     turn_assistant_events = [
         event for event in events[matched_index + 1:turn_end]
         if event.get("type") == "assistant"
     ]
-    if not turn_assistant_events or not _assistant_has_text(turn_assistant_events[-1]):
+    followed_by_continuation = bool(
+        next_turns and _event_user_prompt(next_turns[0][1]).strip() == "继续"
+    )
+    if not followed_by_continuation and (
+        not turn_assistant_events or not _assistant_has_text(turn_assistant_events[-1])
+    ):
         issues.append(f"{record_id}: trajectory turn has no final assistant text response")
 
     folder = Path(str(source_row["question_folder"])).resolve()
@@ -342,6 +400,7 @@ def build_report(
     )
     source_query = (
         "SELECT r.record_id, r.turn_no, r.user_prompt, r.session_id, r.turn_id, r.trajectory_file, "
+        "r.raw_user_prompt, r.raw_turn_id, r.is_continuation, r.continuation_count, r.other_issues, "
         "r.initial_snapshot, r.reproducibility, r.harness, r.harness_version, "
         "r.task_type, r.difficulty, r.languages, q.prompt AS source_prompt, "
         "q.initial_snapshot AS source_snapshot, q.reproducibility AS source_reproducibility, "

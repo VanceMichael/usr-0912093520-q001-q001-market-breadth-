@@ -4,6 +4,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import sqlite3
 from contextlib import redirect_stdout
 from pathlib import Path
 
@@ -53,6 +54,120 @@ def make_question(index: int, *, difficulty: str = "困难") -> dict:
 
 
 class BatchPipelineTests(unittest.TestCase):
+    def test_schema_15_migrates_old_record_identity_without_losing_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "production.sqlite3"
+            connection = connect(database)
+            create_batch(connection, root, self.write_spec(root, count=1))
+            question_id = connection.execute("SELECT id FROM questions").fetchone()[0]
+            table_sql = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='records'"
+            ).fetchone()[0]
+            old_sql = table_sql.replace(
+                "UNIQUE (question_id, turn_no)",
+                "UNIQUE (session_id, turn_id), UNIQUE (question_id, turn_no)",
+            )
+            columns = [
+                row["name"] for row in connection.execute("PRAGMA table_info(records)")
+                if row["name"] != "id"
+            ]
+            values: list[object] = []
+            for name in columns:
+                if name == "question_id":
+                    values.append(question_id)
+                elif name == "turn_no":
+                    values.append(1)
+                elif name.endswith("_score"):
+                    values.append(3)
+                elif name in {
+                    "human_authored", "human_qc_approved", "delivery_qc_passed",
+                    "is_continuation", "continuation_count", "reset_count",
+                }:
+                    values.append(0)
+                elif name == "record_id":
+                    values.append("legacy-record")
+                elif name == "session_id":
+                    values.append("legacy-session")
+                elif name in {"turn_id", "raw_turn_id"}:
+                    values.append("legacy-turn")
+                elif name == "created_at":
+                    values.append("2026-09-01T00:00:00+08:00")
+                else:
+                    values.append("legacy")
+            connection.execute(
+                f"INSERT INTO records({','.join(columns)}) VALUES({','.join('?' for _ in columns)})",
+                values,
+            )
+            connection.commit()
+            connection.execute("PRAGMA foreign_keys=OFF")
+            connection.execute("DROP INDEX IF EXISTS idx_records_question")
+            connection.execute("ALTER TABLE records RENAME TO records_current")
+            connection.execute(old_sql)
+            connection.execute(
+                f"INSERT INTO records({','.join(columns)}) SELECT {','.join(columns)} FROM records_current"
+            )
+            connection.execute("DROP TABLE records_current")
+            connection.commit()
+            connection.close()
+
+            migrated = connect(database)
+            migrated_sql = migrated.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='records'"
+            ).fetchone()[0]
+            self.assertNotIn("UNIQUE (session_id, turn_id)", migrated_sql)
+            self.assertEqual(
+                migrated.execute("SELECT record_id FROM records").fetchone()[0],
+                "legacy-record",
+            )
+            copied = dict(migrated.execute("SELECT * FROM records").fetchone())
+            copied.pop("id")
+            copied.update({
+                "record_id": "continued-record", "turn_no": 2,
+                "parent_record": "legacy-record", "is_continuation": 1,
+                "continuation_count": 1, "raw_user_prompt": "继续",
+                "raw_turn_id": "raw-continue",
+            })
+            migrated.execute(
+                f"INSERT INTO records({','.join(copied)}) VALUES({','.join('?' for _ in copied)})",
+                list(copied.values()),
+            )
+            migrated.commit()
+            self.assertEqual(migrated.execute("SELECT COUNT(*) FROM records").fetchone()[0], 2)
+            migrated.close()
+
+    def test_schema_15_migrates_existing_solo2_receipts_as_succeeded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "production.sqlite3"
+            with connect(database) as connection:
+                create_batch(connection, root, self.write_spec(root, count=1))
+                question_id = connection.execute("SELECT id FROM questions").fetchone()[0]
+                connection.execute("DROP TABLE solo2_submissions")
+                connection.execute(
+                    "CREATE TABLE solo2_submissions("
+                    "id INTEGER PRIMARY KEY,record_id TEXT NOT NULL UNIQUE,"
+                    "question_id INTEGER NOT NULL,remote_submission_id TEXT NOT NULL,"
+                    "remote_status TEXT NOT NULL DEFAULT '',schema_fingerprint TEXT NOT NULL,"
+                    "payload_sha256 TEXT NOT NULL,response_summary TEXT NOT NULL DEFAULT '{}',"
+                    "submitted_at TEXT NOT NULL)"
+                )
+                connection.execute(
+                    "INSERT INTO solo2_submissions(record_id,question_id,remote_submission_id,"
+                    "remote_status,schema_fingerprint,payload_sha256,response_summary,submitted_at) "
+                    "VALUES('record-1',?,'remote-1','SUBMITTED','schema','hash','{}',"
+                    "'2026-09-01T00:00:00+08:00')",
+                    (question_id,),
+                )
+                connection.commit()
+
+            with connect(database) as migrated:
+                row = migrated.execute("SELECT * FROM solo2_submissions").fetchone()
+                self.assertEqual(row["status"], "succeeded")
+                self.assertEqual(row["attempt_count"], 1)
+                self.assertEqual(row["remote_submission_id"], "remote-1")
+                self.assertEqual(row["updated_at"], row["submitted_at"])
+
     def test_technology_diversity_rejects_go_sqlite_monoculture(self):
         issues = technology_diversity_issues([["Go", "SQLite"] for _ in range(10)])
         self.assertTrue(any("完整技术组合" in issue for issue in issues))

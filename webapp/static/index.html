@@ -146,6 +146,23 @@
       <section class="export-view" id="export-view" hidden>
         <div class="section-heading"><div><h2>交付文件</h2><p>按生成时间查看工作簿和原始轨迹副本。</p><span class="delivery-download-status" id="delivery-download-status"></span></div><button class="button primary" type="button" id="delivery-package-button"><i data-lucide="file-archive"></i>下载交付包</button></div>
         <div class="file-list" id="file-list"></div>
+        <section class="solo2-panel" aria-labelledby="solo2-title">
+          <div class="section-heading"><div><h2 id="solo2-title">SOLO2 平台交付</h2><p>默认人工确认提交；登录会话只保存在当前机器。</p></div><button class="icon-button" id="solo2-refresh" type="button" title="刷新 SOLO2 状态" aria-label="刷新 SOLO2 状态"><i data-lucide="refresh-cw"></i></button></div>
+          <div class="solo2-grid">
+            <form class="settings-card" id="solo2-login-form" autocomplete="off">
+              <div class="card-heading"><div><h3>平台账号</h3><p id="solo2-auth-message">尚未读取登录状态</p></div><span class="tag" id="solo2-auth-tag">未登录</span></div>
+              <label class="settings-field"><span>账号</span><input id="solo2-username" required autocomplete="username"></label>
+              <label class="settings-field"><span>密码</span><input id="solo2-password" type="password" required autocomplete="current-password"></label>
+              <button class="button secondary" id="solo2-login-button" type="submit"><i data-lucide="log-in"></i>登录并保存会话</button>
+            </form>
+            <div class="settings-card">
+              <div class="card-heading"><div><h3>当前批次</h3><p id="solo2-summary">等待读取</p></div><span class="tag amber" id="solo2-mode-tag">人工确认</span></div>
+              <button class="button primary" id="solo2-submit-batch" type="button"><i data-lucide="send"></i>确认提交当前批次</button>
+              <p class="settings-note" id="solo2-origin"></p>
+            </div>
+          </div>
+          <div class="file-list" id="solo2-history"></div>
+        </section>
       </section>
 
       <section class="vps-view" id="vps-view" hidden>
@@ -263,6 +280,15 @@
               <label class="settings-field"><span>熔断失败阈值</span><input id="config-gateway-circuit-threshold" type="number" min="1" max="20" value="2"></label>
               <label class="settings-field"><span>熔断统计窗口（秒）</span><input id="config-gateway-circuit-window" type="number" min="1" max="3600" value="120"></label>
               <label class="settings-field"><span>熔断冷却时间（秒）</span><input id="config-gateway-circuit-cooldown" type="number" min="1" max="3600" value="180"></label>
+            </div>
+            <div class="solo2-config">
+              <div class="concurrency-heading"><strong>SOLO2 平台交付</strong><label class="switch-label"><input id="config-solo2-auto-submit" type="checkbox"><span>质检后自动提交</span></label></div>
+              <label class="settings-field"><span>平台地址</span><input id="config-solo2-origin" type="url" placeholder="https://solo2.jzxhnh.com"></label>
+              <div class="pipeline-concurrency-fields">
+                <label class="settings-field"><span>提交并发</span><input id="config-solo2-concurrency" type="number" min="1" max="8" value="1"></label>
+                <label class="settings-field"><span>最大尝试次数</span><input id="config-solo2-max-attempts" type="number" min="1" max="10" value="3"></label>
+              </div>
+              <p class="settings-note">开关默认关闭。401/403 或平台字段不兼容时只暂停平台提交，不会停止出题、跑题和本地归档。</p>
             </div>
             <p class="settings-note">模型只接收 SQLite 中该题的原始 User Prompt；中转配置通过容器环境变量传递，不拼入 Prompt。默认镜像不存在时会自动构建。</p>
           </div>

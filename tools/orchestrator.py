@@ -30,6 +30,7 @@ from tools.batch_pipeline import SNAPSHOT_RE, connect, prompt_hash, question_row
 from tools.capacity import adaptive_model_limit, detect_capacity
 from tools.text_encoding import read_portable_text
 from tools.trajectory_gate import TrajectoryGateError, validate_effective_trajectory
+from tools.solo2_service import submit_records
 
 
 DEFAULT_HEARTBEAT_SECONDS = 5
@@ -126,6 +127,7 @@ def ready(row: sqlite3.Row) -> bool:
         and row["qc_decision"] == "pass"
         and row["qc_prompt_sha256"] == prompt_hash(row["prompt"])
         and row["status"] == "approved"
+        and not bool(row["maintenance_mode"])
     )
 
 
@@ -408,7 +410,8 @@ def run_one(
                 ),
             )
             connection.execute(
-                "UPDATE questions SET status='approved',updated_at=? WHERE id=?",
+                "UPDATE questions SET status='approved',updated_at=? WHERE id=? "
+                "AND maintenance_mode=0",
                 (finished, row["id"]),
             )
             connection.commit()
@@ -528,7 +531,7 @@ def run_one(
             ),
         )
         connection.execute(
-            "UPDATE questions SET status=?,updated_at=? WHERE id=?",
+            "UPDATE questions SET status=?,updated_at=? WHERE id=? AND maintenance_mode=0",
             ("completed" if status == "succeeded" else "approved", finished, row["id"]),
         )
         connection.commit()
@@ -760,7 +763,7 @@ def _claim_rows(
         if kind == "model":
             rows = connection.execute(
                 "SELECT q.* FROM questions q JOIN batches b ON b.id=q.batch_id "
-                "WHERE b.status NOT IN ('completed','partial','failed') "
+                "WHERE b.status NOT IN ('completed','partial','failed') AND q.maintenance_mode=0 "
                 "AND q.status='approved' AND q.mechanical_qc='pass' AND q.qc_decision='pass' "
                 "AND q.qc_prompt_sha256=q.prompt_sha256 "
                 "AND (q.model_lease_owner='' OR julianday(q.model_lease_expires_at)<julianday(?)) "
@@ -776,7 +779,7 @@ def _claim_rows(
         else:
             candidates = connection.execute(
                 "SELECT q.* FROM questions q JOIN batches b ON b.id=q.batch_id "
-                "WHERE b.status NOT IN ('completed','partial','failed') "
+                "WHERE b.status NOT IN ('completed','partial','failed') AND q.maintenance_mode=0 "
                 "AND q.status='completed' "
                 "AND (q.delivery_lease_owner='' OR julianday(q.delivery_lease_expires_at)<julianday(?)) "
                 "AND EXISTS(SELECT 1 FROM runs s WHERE s.question_id=q.id AND s.status='succeeded') "
@@ -820,22 +823,38 @@ def active_batch_names(db: Path) -> list[str]:
         ]
 
 
+def solo2_pending_available(db: Path, max_attempts: int) -> bool:
+    with connect(db) as connection:
+        return connection.execute(
+            "SELECT 1 FROM records r LEFT JOIN solo2_submissions s ON s.record_id=r.record_id "
+            "WHERE r.delivery_qc_passed=1 AND r.delivery_qc_note='质检通过' "
+            "AND COALESCE(s.status,'') NOT IN ('succeeded','auth_blocked','schema_blocked') "
+            "AND (COALESCE(s.status,'')!='submitting' OR "
+            "julianday(COALESCE(s.lease_expires_at,''))<julianday('now')) "
+            "AND COALESCE(s.attempt_count,0)<? "
+            "AND (s.status IS NULL OR s.status!='retry_wait' OR "
+            "julianday(s.updated_at)<=julianday('now')-(30 * (1 << MIN(COALESCE(s.attempt_count,1)-1,5)))/86400.0) "
+            "LIMIT 1",
+            (max_attempts,),
+        ).fetchone() is not None
+
+
 def batch_ready_to_finalize(db: Path, batch: str) -> bool:
     with connect(db) as connection:
         rows = connection.execute(
-            "SELECT q.status,COUNT(r.id) AS records,"
+            "SELECT q.status,q.maintenance_mode,COUNT(r.id) AS records,"
             "SUM(CASE WHEN r.delivery_qc_passed=1 AND r.delivery_qc_note='质检通过' THEN 1 ELSE 0 END) passed "
             "FROM questions q JOIN batches b ON b.id=q.batch_id "
             "LEFT JOIN records r ON r.question_id=q.id WHERE b.name=? GROUP BY q.id",
             (batch,),
         ).fetchall()
     return bool(rows) and all(
-        row["status"] == "blocked"
+        not bool(row["maintenance_mode"]) and (row["status"] == "blocked"
         or (
             row["status"] == "completed"
             and int(row["records"] or 0) > 0
             and int(row["records"] or 0) == int(row["passed"] or 0)
-        )
+        ))
         for row in rows
     )
 
@@ -885,7 +904,7 @@ def finalize_batch(
         if batch_row is None:
             return 1, "batch does not exist"
         states = connection.execute(
-            "SELECT q.id,q.question_no,q.status,"
+            "SELECT q.id,q.question_no,q.status,q.maintenance_mode,"
             "EXISTS(SELECT 1 FROM runs x WHERE x.question_id=q.id AND x.status='succeeded') AS model_succeeded,"
             "COUNT(r.id) AS record_count,"
             "SUM(CASE WHEN r.delivery_qc_passed=1 AND r.delivery_qc_note='质检通过' THEN 1 ELSE 0 END) AS passed_count "
@@ -907,7 +926,9 @@ def finalize_batch(
         and int(row["record_count"] or 0) == int(row["passed_count"] or 0)
     ]
     terminal = all(
-        int(row["question_no"]) in eligible or row["status"] == "blocked"
+        not bool(row["maintenance_mode"]) and (
+            int(row["question_no"]) in eligible or row["status"] == "blocked"
+        )
         for row in states
     )
     if not terminal:
@@ -1090,6 +1111,27 @@ def run_global_delivery_pipeline(args: argparse.Namespace) -> int:
         else float(memory_match.group(1)) if memory_match else 2.0
     )
     machine_capacity = detect_capacity()
+    env_values: dict[str, str] = {}
+    try:
+        for raw in read_portable_text(args.env_file.resolve()).splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            env_values[key.strip()] = value.strip().strip("'\"")
+    except OSError:
+        pass
+    solo2_enabled = env_values.get("CC_SOLO2_AUTO_SUBMIT", "false").lower() in {
+        "1", "true", "yes", "on",
+    }
+    solo2_origin = env_values.get("CC_SOLO2_ORIGIN", "").strip() or "https://solo2.jzxhnh.com"
+    try:
+        solo2_concurrency = max(1, min(8, int(env_values.get("CC_SOLO2_CONCURRENCY", "1"))))
+        solo2_max_attempts = max(1, min(10, int(env_values.get("CC_SOLO2_MAX_ATTEMPTS", "3"))))
+    except ValueError:
+        solo2_concurrency, solo2_max_attempts = 1, 3
+    solo2_cookie = args.env_file.resolve().parent / ".local-auth" / "solo2.cookies"
+    solo2_retry_at = 0.0
 
     def leased_model(row: sqlite3.Row) -> tuple[str, int, str]:
         try:
@@ -1125,10 +1167,13 @@ def run_global_delivery_pipeline(args: argparse.Namespace) -> int:
         max_workers=args.codex_concurrency, thread_name_prefix="global-delivery"
     ) as delivery_pool, concurrent.futures.ThreadPoolExecutor(
         max_workers=1, thread_name_prefix="global-export"
-    ) as export_pool:
+    ) as export_pool, concurrent.futures.ThreadPoolExecutor(
+        max_workers=solo2_concurrency, thread_name_prefix="global-solo2"
+    ) as solo2_pool:
         model_futures: dict[concurrent.futures.Future, sqlite3.Row] = {}
         delivery_futures: dict[concurrent.futures.Future, sqlite3.Row] = {}
         export_futures: dict[concurrent.futures.Future, str] = {}
+        solo2_futures: set[concurrent.futures.Future] = set()
 
         while not fatal_configuration:
             producer_done = sentinel is not None and sentinel.exists()
@@ -1170,7 +1215,20 @@ def run_global_delivery_pipeline(args: argparse.Namespace) -> int:
                     )] = batch
                     break
 
-            futures = set(model_futures) | set(delivery_futures) | set(export_futures)
+            if solo2_enabled and time.monotonic() >= solo2_retry_at:
+                solo2_slots = solo2_concurrency - len(solo2_futures)
+                for _slot in range(solo2_slots):
+                    if not solo2_pending_available(database, solo2_max_attempts):
+                        break
+                    solo2_futures.add(solo2_pool.submit(
+                        submit_records, database, solo2_cookie, solo2_origin,
+                        limit=1, max_attempts=solo2_max_attempts, manual=False,
+                    ))
+
+            futures = (
+                set(model_futures) | set(delivery_futures) | set(export_futures)
+                | solo2_futures
+            )
             if not futures:
                 if producer_done or time.monotonic() - idle_since >= args.idle_timeout:
                     break
@@ -1205,7 +1263,7 @@ def run_global_delivery_pipeline(args: argparse.Namespace) -> int:
                     except Exception as exc:
                         task_id, message = str(row["task_id"]), str(exc)
                     print(f"{task_id}: {message}", flush=True)
-                else:
+                elif future in export_futures:
                     batch = export_futures.pop(future)
                     try:
                         code, message = future.result()
@@ -1216,6 +1274,27 @@ def run_global_delivery_pipeline(args: argparse.Namespace) -> int:
                         export_attempts[batch] = export_attempts.get(batch, 0) + 1
                         if export_attempts[batch] < 2:
                             scheduled_exports.discard(batch)
+                else:
+                    solo2_futures.discard(future)
+                    try:
+                        result = future.result()
+                    except Exception as exc:
+                        solo2_retry_at = time.monotonic() + 60
+                        print(
+                            f"SOLO2 auto-submit paused for 60s: {exc}",
+                            file=sys.stderr, flush=True,
+                        )
+                        continue
+                    print(
+                        f"SOLO2 auto-submit: submitted={result['submitted']} "
+                        f"failed={result['failed']}", flush=True,
+                    )
+                    statuses = {
+                        str(item.get("status") or "") for item in result.get("results", [])
+                        if not item.get("ok")
+                    }
+                    if statuses & {"auth_blocked", "schema_blocked"}:
+                        solo2_retry_at = time.monotonic() + 300
 
     return 1 if fatal_configuration else 0
 

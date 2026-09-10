@@ -51,6 +51,7 @@ UNNECESSARY_ENGLISH_RE = re.compile(
     re.IGNORECASE,
 )
 STYLE_FIELDS = tuple(f"{prefix}_description" for prefix in PREFIXES)
+MIN_DESCRIPTION_CHINESE = 45
 
 
 def load_records(paths: list[Path]) -> list[tuple[Path, dict]]:
@@ -60,10 +61,15 @@ def load_records(paths: list[Path]) -> list[tuple[Path, dict]]:
             value = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise ValueError(f"{path}: cannot read JSON: {exc}") from exc
-        values = value if isinstance(value, list) else [value]
+        if isinstance(value, dict) and isinstance(value.get("records"), list):
+            values = value["records"]
+        else:
+            values = value if isinstance(value, list) else [value]
         for index, item in enumerate(values, 1):
             if not isinstance(item, dict):
                 raise ValueError(f"{path}: item {index} is not an object")
+            if isinstance(item.get("changes"), dict):
+                item = item["changes"]
             records.append((path, item))
     return records
 
@@ -95,6 +101,17 @@ def check_record(path: Path, record: dict, record_index: int) -> list[str]:
         prose = re.sub(r"```.*?```|`[^`]*`|https?://\S+", " ", text, flags=re.DOTALL)
         if UNNECESSARY_ENGLISH_RE.search(prose):
             errors.append(f"{path} record {record_index}: {field} contains unnecessary English evaluator wording")
+        chinese_count = len(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]", text))
+        if chinese_count < MIN_DESCRIPTION_CHINESE:
+            errors.append(
+                f"{path} record {record_index}: {field} must contain at least "
+                f"{MIN_DESCRIPTION_CHINESE} Chinese characters"
+            )
+        sentences = [part for part in re.split(r"[。！？!?]+", text) if part.strip()]
+        if len(sentences) < 2:
+            errors.append(
+                f"{path} record {record_index}: {field} must contain at least two complete sentences"
+            )
         if text.count("；") + text.count(";") > 1:
             errors.append(f"{path} record {record_index}: {field} has repeated semicolon joins")
         if text.count("，") >= 10 and text.count("、") >= 3:

@@ -1,4 +1,6 @@
 .env
+.local-auth/
+.ccusr-*.pending.json
 .idea/
 09*/
 .tmp-*-spec.json

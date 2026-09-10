@@ -65,6 +65,8 @@ PIPELINE_ENV_KEYS = (
     "CC_GATEWAY_MAX_ATTEMPTS", "CC_GATEWAY_BACKOFF_BASE",
     "CC_GATEWAY_BACKOFF_MAX", "CC_GATEWAY_CIRCUIT_THRESHOLD",
     "CC_GATEWAY_CIRCUIT_WINDOW", "CC_GATEWAY_CIRCUIT_COOLDOWN",
+    "CC_SOLO2_ORIGIN", "CC_SOLO2_AUTO_SUBMIT", "CC_SOLO2_CONCURRENCY",
+    "CC_SOLO2_MAX_ATTEMPTS",
 )
 NEWS_URL_MAX = 20
 AUTHOR_DIFFICULTIES = ("中等", "困难", "地狱")
@@ -78,6 +80,9 @@ from tools.batch_pipeline import SCHEMA_VERSION, connect as initialize_database 
 from tools.authoring_policy import backend_only_requirement  # noqa: E402
 from tools.scheduler_state import SchedulerStore  # noqa: E402
 from tools.text_encoding import read_portable_text  # noqa: E402
+from tools.solo2_client import Solo2Client, Solo2Error  # noqa: E402
+from tools.solo2_service import submission_overview, submit_records  # noqa: E402
+from tools.task_maintenance import begin_takeover, finish_takeover, reset_question  # noqa: E402
 
 AUTHOR_JOB_SCHEMA = """
 CREATE TABLE IF NOT EXISTS author_jobs (
@@ -1807,6 +1812,10 @@ class ConsoleData:
             "gateway_circuit_threshold": env_bounded("CC_GATEWAY_CIRCUIT_THRESHOLD", 2, 20),
             "gateway_circuit_window": env_bounded("CC_GATEWAY_CIRCUIT_WINDOW", 120),
             "gateway_circuit_cooldown": env_bounded("CC_GATEWAY_CIRCUIT_COOLDOWN", 180),
+            "solo2_origin": values.get("CC_SOLO2_ORIGIN", "").strip() or "https://solo2.jzxhnh.com",
+            "solo2_auto_submit": values.get("CC_SOLO2_AUTO_SUBMIT", "false").strip().lower() in {"1", "true", "yes", "on"},
+            "solo2_concurrency": env_int("CC_SOLO2_CONCURRENCY", 1),
+            "solo2_max_attempts": env_bounded("CC_SOLO2_MAX_ATTEMPTS", 3, 10),
             "news_feeds": news_feeds,
         }
 
@@ -2128,6 +2137,33 @@ class ConsoleData:
             gateway_values[env_key] = str(value)
         if int(gateway_values["CC_GATEWAY_BACKOFF_BASE"]) > int(gateway_values["CC_GATEWAY_BACKOFF_MAX"]):
             raise ValueError("网关退避初始秒数不能大于上限秒数")
+        default_solo2_origin = (
+            current.get("CC_SOLO2_ORIGIN", "").strip() or "https://solo2.jzxhnh.com"
+        )
+        solo2_origin = str(body.get("solo2_origin", default_solo2_origin)).strip()
+        parsed_solo2 = urlparse(solo2_origin)
+        if parsed_solo2.scheme not in {"http", "https"} or not parsed_solo2.hostname:
+            raise ValueError("SOLO2 地址必须是完整的 http(s) 地址")
+        if parsed_solo2.username or parsed_solo2.password or parsed_solo2.query or parsed_solo2.fragment:
+            raise ValueError("SOLO2 地址不能包含账号、密码、查询参数或片段")
+        solo2_auto_submit = body.get(
+            "solo2_auto_submit",
+            current.get("CC_SOLO2_AUTO_SUBMIT", "false").strip().lower() in {"1", "true", "yes", "on"},
+        )
+        if not isinstance(solo2_auto_submit, bool):
+            raise ValueError("SOLO2 自动提交开关无效")
+        solo2_numbers: dict[str, str] = {}
+        for field, key, default, maximum in (
+            ("solo2_concurrency", "CC_SOLO2_CONCURRENCY", 1, 8),
+            ("solo2_max_attempts", "CC_SOLO2_MAX_ATTEMPTS", 3, 10),
+        ):
+            try:
+                value = int(body.get(field, current.get(key, str(default))) or default)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(f"{field} 配置无效") from exc
+            if not 1 <= value <= maximum:
+                raise ValueError(f"{field} 必须是 1-{maximum}")
+            solo2_numbers[key] = str(value)
         if not values["api_key"]:
             values["api_key"] = current["CC_SWITCH_API_KEY"]
         if not values["api_key"]:
@@ -2149,6 +2185,9 @@ class ConsoleData:
             "CC_CLAUDE_WORKER_MEMORY": worker_memory,
             **concurrency_values,
             **gateway_values,
+            "CC_SOLO2_ORIGIN": solo2_origin,
+            "CC_SOLO2_AUTO_SUBMIT": "true" if solo2_auto_submit else "false",
+            **solo2_numbers,
         }
         for key, default in (
             ("CC_CLAUDE_HEARTBEAT_SECONDS", "5"),
@@ -2358,6 +2397,9 @@ class ConsoleData:
                 "(SELECT AVG((r.delivery_score+r.instruction_score+r.planning_score+"
                 " r.reasoning_score+r.execution_score)/5.0) FROM records r "
                 " WHERE r.question_id=q.id) AS average_score "
+                ",(SELECT COUNT(*) FROM records r JOIN solo2_submissions s "
+                " ON s.record_id=r.record_id WHERE r.question_id=q.id "
+                " AND s.status='succeeded') AS solo2_submitted_count "
                 "FROM questions q JOIN batches b ON b.id=q.batch_id "
                 "WHERE b.name=? ORDER BY q.question_no",
                 (batch_name,),
@@ -2382,6 +2424,8 @@ class ConsoleData:
                 passed_count = int(row["passed_record_count"] or 0)
                 delivery_qc = record_count > 0 and passed_count == record_count
                 exported = delivery_qc and int(row["question_no"]) in exported_numbers
+                solo2_submitted_count = int(row["solo2_submitted_count"] or 0)
+                solo2_submitted = record_count > 0 and solo2_submitted_count == record_count
                 if not question_qc:
                     stage_index, stage_label = 1, "题目待质检"
                 elif not run_complete:
@@ -2399,6 +2443,8 @@ class ConsoleData:
                     stage_index, stage_label = 5, "待导出"
                 else:
                     stage_index, stage_label = 6, "已交付"
+                if bool(row["maintenance_mode"]):
+                    stage_index, stage_label = 2, "人工接管中"
                 questions.append({
                     "id": row["id"],
                     "question_no": row["question_no"],
@@ -2427,9 +2473,19 @@ class ConsoleData:
                     "average_score": round(float(row["average_score"]), 1)
                     if row["average_score"] is not None else None,
                     "exported": exported,
+                    "solo2_submitted_count": solo2_submitted_count,
+                    "solo2_submitted": solo2_submitted,
+                    "maintenance_mode": bool(row["maintenance_mode"]),
+                    "maintenance_note": row["maintenance_note"] or "",
+                    "reset_count": int(row["reset_count"] or 0),
                     "stage_index": stage_index,
                     "stage_label": stage_label,
-                    "can_launch": question_qc and row["status"] == "approved" and not run_complete,
+                    "can_launch": question_qc and row["status"] == "approved" and not run_complete and not bool(row["maintenance_mode"]),
+                    "can_takeover": run_status in {"running", "failed", "timeout", "interrupted"}
+                    and not solo2_submitted and not bool(row["maintenance_mode"]),
+                    "can_finish_takeover": bool(row["maintenance_mode"]),
+                    "can_reset": run_count > 0 and not solo2_submitted,
+                    "can_solo2_submit": delivery_qc and not solo2_submitted,
                 })
 
         total = len(questions)
@@ -2456,6 +2512,7 @@ class ConsoleData:
             "summary": {
                 "total": total,
                 "delivered": sum(q["exported"] for q in questions),
+                "solo2_submitted": sum(q["solo2_submitted"] for q in questions),
                 "qc_passed": sum(q["delivery_qc"] for q in questions),
                 "waiting": sum(q["stage_index"] < 6 for q in questions),
             },
@@ -2471,7 +2528,8 @@ class ConsoleData:
             if question is None:
                 raise ValueError("题目不存在")
             runs = connection.execute(
-                "SELECT batch_run_id, launched_at, session_id, harness, harness_version "
+                "SELECT batch_run_id, launched_at, session_id, harness, harness_version,status,"
+                "finished_at,error_message,container_id "
                 "FROM runs WHERE question_id=? ORDER BY launched_at DESC, id DESC",
                 (question_id,),
             ).fetchall()
@@ -2480,7 +2538,8 @@ class ConsoleData:
                 "delivery_score, delivery_description, instruction_score, instruction_description, "
                 "planning_score, planning_description, reasoning_score, reasoning_description, "
                 "execution_score, execution_description, other_issues, submitted_at, "
-                "delivery_qc_passed, delivery_qc_note, delivery_qc_checked_at "
+                "delivery_qc_passed, delivery_qc_note, delivery_qc_checked_at,"
+                "raw_user_prompt,raw_turn_id,is_continuation,continuation_count "
                 "FROM records WHERE question_id=? ORDER BY turn_no",
                 (question_id,),
             ).fetchall()
@@ -2503,6 +2562,9 @@ class ConsoleData:
             "expected_areas": json_value(question["expected_areas"], []),
             "difficulty_evidence": json_value(question["difficulty_evidence"], []),
             "qc_report": question["qc_report"],
+            "maintenance_mode": bool(question["maintenance_mode"]),
+            "maintenance_note": question["maintenance_note"],
+            "reset_count": int(question["reset_count"] or 0),
             "runs": [dict(row) for row in runs],
             "records": [dict(row) for row in records],
         }
@@ -2622,6 +2684,99 @@ class ConsoleData:
             command.extend(["--select", ",".join(map(str, selected))])
         return self.run_tool(command)
 
+    def _solo2_settings(self) -> tuple[str, int]:
+        values = self.read_env()
+        origin = values.get("CC_SOLO2_ORIGIN", "").strip() or "https://solo2.jzxhnh.com"
+        try:
+            attempts = max(1, min(10, int(values.get("CC_SOLO2_MAX_ATTEMPTS", "3"))))
+        except ValueError:
+            attempts = 3
+        return origin, attempts
+
+    def solo2_login(self, username: object, password: object) -> dict[str, object]:
+        if not isinstance(username, str) or not isinstance(password, str):
+            raise ValueError("请输入 SOLO2 账号和密码")
+        origin, _attempts = self._solo2_settings()
+        client = Solo2Client(self.project_root / ".local-auth" / "solo2.cookies", origin=origin)
+        user = client.login(username, password)
+        return {"ok": True, "message": "SOLO2 登录成功", "user": {
+            "username": user.get("username") or user.get("name") or username,
+        }}
+
+    def solo2_status(self, batch: object | None = None) -> dict[str, object]:
+        batch_name = str(batch or "").strip() or None
+        if batch_name and not BATCH_RE.fullmatch(batch_name):
+            raise ValueError("批次名无效")
+        origin, _attempts = self._solo2_settings()
+        authenticated = False
+        user: dict[str, object] = {}
+        error = ""
+        try:
+            value = Solo2Client(
+                self.project_root / ".local-auth" / "solo2.cookies", origin=origin,
+            ).me()
+            authenticated = True
+            user = {"username": value.get("username") or value.get("name") or "已登录账号"}
+        except Solo2Error as exc:
+            error = str(exc)
+        return {
+            "origin": origin, "authenticated": authenticated, "user": user,
+            "auth_error": error, **submission_overview(self.database, batch_name),
+        }
+
+    def solo2_submit(self, batch: object, numbers: object | None) -> dict[str, object]:
+        batch_name = str(batch or "")
+        selected: set[int] | None = None
+        if numbers:
+            batch_name, normalized = self.validate_selection(batch_name, numbers)
+            selected = set(normalized)
+        elif not BATCH_RE.fullmatch(batch_name):
+            raise ValueError("批次名无效")
+        origin, attempts = self._solo2_settings()
+        result = submit_records(
+            self.database, self.project_root / ".local-auth" / "solo2.cookies", origin,
+            batch=batch_name, numbers=selected, max_attempts=attempts,
+        )
+        result["ok"] = result["failed"] == 0
+        result["message"] = f"SOLO2 提交完成：成功 {result['submitted']}，失败 {result['failed']}"
+        if result["failed"]:
+            details = "；".join(
+                str(item.get("error") or "提交失败") for item in result["results"]
+                if not item.get("ok")
+            )
+            raise RuntimeError(result["message"] + (f"。{details}" if details else ""))
+        return result
+
+    @staticmethod
+    def _question_id(value: object) -> int:
+        raw = str(value or "")
+        if not QUESTION_ID_RE.fullmatch(raw):
+            raise ValueError("题目编号无效")
+        return int(raw)
+
+    def takeover_question(self, question_id: object) -> dict[str, object]:
+        values = self.read_env()
+        try:
+            cpus = float(values.get("CC_CLAUDE_WORKER_CPUS", "1") or "1")
+        except ValueError:
+            cpus = 1.0
+        result = begin_takeover(
+            self.database, self._question_id(question_id), self.env_file,
+            values.get("CC_CLAUDE_DOCKER_IMAGE", "").strip() or "claude-cli:latest",
+            cpus, values.get("CC_CLAUDE_WORKER_MEMORY", "").strip() or "2g",
+        )
+        return {"ok": True, "message": "已进入人工接管，命令已生成", **result}
+
+    def finish_question_takeover(self, question_id: object) -> dict[str, object]:
+        result = finish_takeover(self.database, self._question_id(question_id))
+        return {"ok": True, "message": "有效轨迹门禁通过，题目已恢复自动流水线", **result}
+
+    def reset_question(self, question_id: object, reason: object = "") -> dict[str, object]:
+        result = reset_question(
+            self.database, self._question_id(question_id), str(reason or "人工完整重置"),
+        )
+        return {"ok": True, "message": "题目已恢复到初始快照并清除本地运行数据", **result}
+
 
 class ConsoleHandler(BaseHTTPRequestHandler):
     server_version = "CCUSRConsole/1.0"
@@ -2712,6 +2867,10 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 return
             if parsed.path == "/api/config":
                 self.send_json(self.data.env_config())
+                return
+            if parsed.path == "/api/solo2/status":
+                batch = parse_qs(parsed.query).get("batch", [None])[0]
+                self.send_json(self.data.solo2_status(batch))
                 return
             if parsed.path == "/api/environment":
                 self.send_json(self.data.environment_status())
@@ -2836,6 +2995,16 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 result = self.data.qc_check(body.get("batch"))
             elif self.path == "/api/actions/export":
                 result = self.data.export(body.get("batch"), body.get("numbers"))
+            elif self.path == "/api/solo2/login":
+                result = self.data.solo2_login(body.get("username"), body.get("password"))
+            elif self.path == "/api/actions/solo2-submit":
+                result = self.data.solo2_submit(body.get("batch"), body.get("numbers"))
+            elif self.path == "/api/actions/takeover-question":
+                result = self.data.takeover_question(body.get("question_id"))
+            elif self.path == "/api/actions/finish-takeover":
+                result = self.data.finish_question_takeover(body.get("question_id"))
+            elif self.path == "/api/actions/reset-question":
+                result = self.data.reset_question(body.get("question_id"), body.get("reason"))
             elif self.path == "/api/config":
                 result = self.data.update_env(body)
             elif self.path == "/api/actions/environment-repair":

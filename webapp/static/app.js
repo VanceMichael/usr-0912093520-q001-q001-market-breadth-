@@ -25,6 +25,7 @@ const state = {
   schedulerRunCursor: 0,
   schedulerRunSource: "",
   schedulerFollowOutput: true,
+  solo2: null,
 };
 let drawerCloseTimer = null;
 let authorJobsTimer = null;
@@ -152,6 +153,10 @@ function renderRows() {
         <button class="icon-button" data-action="copy" title="复制 Prompt" aria-label="复制 Prompt"><i data-lucide="copy"></i></button>
         <button class="icon-button" data-action="folder" title="打开题目目录" aria-label="打开题目目录"><i data-lucide="folder-open"></i></button>
         ${question.run_count === 0 ? `<button class="icon-button" data-action="single-pipeline" title="单题跑全流程" aria-label="单题跑全流程"><i data-lucide="play-circle"></i></button>` : ""}
+        ${question.can_takeover ? `<button class="icon-button" data-action="takeover" title="在隔离容器中人工接管" aria-label="人工接管"><i data-lucide="square-terminal"></i></button>` : ""}
+        ${question.can_finish_takeover ? `<button class="icon-button" data-action="finish-takeover" title="验证接管结果并恢复调度" aria-label="完成接管"><i data-lucide="badge-check"></i></button>` : ""}
+        ${question.can_solo2_submit ? `<button class="icon-button" data-action="solo2-submit" title="确认提交到 SOLO2" aria-label="提交到 SOLO2"><i data-lucide="send"></i></button>` : ""}
+        ${question.can_reset ? `<button class="icon-button danger-icon" data-action="reset" title="完整重置本题" aria-label="完整重置"><i data-lucide="rotate-ccw"></i></button>` : ""}
       </div></td>
     </tr>`;
   }).join("");
@@ -179,6 +184,35 @@ function renderFiles() {
       <button class="button secondary" data-file-path="${escapeHtml(file.path)}"><i data-lucide="copy"></i>复制路径</button>
     </div>`).join("") : `<div class="empty-state"><strong>还没有交付文件</strong><span>交付质检通过后即可导出。</span></div>`;
   refreshIcons();
+}
+
+function renderSolo2() {
+  const delivery = state.solo2;
+  if (!delivery) return;
+  $("#solo2-auth-tag").textContent = delivery.authenticated ? "已登录" : "未登录";
+  $("#solo2-auth-tag").className = `tag ${delivery.authenticated ? "green" : "amber"}`;
+  $("#solo2-auth-message").textContent = delivery.authenticated
+    ? String(delivery.user?.username || "会话有效")
+    : (delivery.auth_error || "请登录后提交");
+  $("#solo2-summary").textContent = `可提交 ${delivery.eligible || 0} 条 · 已提交 ${delivery.submitted || 0} 条 · 待提交 ${delivery.pending || 0} 条`;
+  $("#solo2-origin").textContent = delivery.origin || "";
+  $("#solo2-mode-tag").textContent = state.config?.solo2_auto_submit ? "自动提交" : "人工确认";
+  $("#solo2-submit-batch").disabled = !delivery.authenticated || !delivery.pending;
+  const history = delivery.history || [];
+  $("#solo2-history").innerHTML = history.length ? history.map((item) => `
+    <div class="file-row"><span class="file-icon"><i data-lucide="send"></i></span>
+      <div class="file-info"><strong>${escapeHtml(item.record_id)}</strong><span>${escapeHtml(item.task_id)} · ${escapeHtml(item.status)} · 尝试 ${item.attempt_count}</span>${item.last_error ? `<small>${escapeHtml(item.last_error)}</small>` : ""}</div>
+      <span class="tag ${item.status === "succeeded" ? "green" : "amber"}">${item.status === "succeeded" ? "已提交" : "待处理"}</span>
+    </div>`).join("") : `<div class="empty-state"><strong>还没有 SOLO2 提交记录</strong></div>`;
+  refreshIcons();
+}
+
+async function loadSolo2() {
+  if (!state.batch) return;
+  try {
+    state.solo2 = await api(`/api/solo2/status?batch=${encodeURIComponent(state.batch)}`);
+    renderSolo2();
+  } catch (error) { toast(error.message, true); }
 }
 
 function renderView() {
@@ -210,7 +244,7 @@ function renderView() {
   $("#page-title").textContent = titles[state.view][0];
   $("#page-subtitle").textContent = titles[state.view][1];
   $$(".nav-item").forEach((button) => button.classList.toggle("active", button.dataset.view === state.view));
-  if (exportsView) renderFiles();
+  if (exportsView) { renderFiles(); loadSolo2(); }
   else if (settingsView) renderSettings();
   else if (vpsView) renderVps();
   else if (schedulerView) renderScheduler();
@@ -583,6 +617,10 @@ function renderSettings() {
   $("#config-gateway-circuit-threshold").value = state.config.gateway_circuit_threshold || 2;
   $("#config-gateway-circuit-window").value = state.config.gateway_circuit_window || 120;
   $("#config-gateway-circuit-cooldown").value = state.config.gateway_circuit_cooldown || 180;
+  $("#config-solo2-origin").value = state.config.solo2_origin || "https://solo2.jzxhnh.com";
+  $("#config-solo2-auto-submit").checked = Boolean(state.config.solo2_auto_submit);
+  $("#config-solo2-concurrency").value = state.config.solo2_concurrency || 1;
+  $("#config-solo2-max-attempts").value = state.config.solo2_max_attempts || 3;
   renderNewsFeeds();
 }
 
@@ -1278,6 +1316,27 @@ $("#question-rows").addEventListener("click", async (event) => {
     executeAction("/api/actions/open", { kind: "question", id }, button, `已打开 ${question.task_id} 目录`).catch(() => {});
   }
   if (button.dataset.action === "single-pipeline") startSinglePipeline(question, button);
+  if (button.dataset.action === "takeover") {
+    try {
+      const result = await executeAction("/api/actions/takeover-question", { question_id: id }, button, "已进入人工接管");
+      await copyText(result.command, "Docker 接管命令已复制");
+    } catch {}
+  }
+  if (button.dataset.action === "finish-takeover") {
+    executeAction("/api/actions/finish-takeover", { question_id: id }, button, "接管结果已通过有效轨迹门禁").catch(() => {});
+  }
+  if (button.dataset.action === "solo2-submit") {
+    openModal("确认提交到 SOLO2", `${question.task_id} 的交付质检记录将上传到平台。成功提交后本地将禁止完整重置。`, "确认提交", async () => {
+      closeModal();
+      await executeAction("/api/actions/solo2-submit", { batch: state.batch, numbers: [question.question_no] }, button, "SOLO2 提交完成");
+    });
+  }
+  if (button.dataset.action === "reset") {
+    openModal("完整重置题目", `将永久删除 ${question.task_id} 的运行记录、Claude 私有状态、轨迹、评分记录和所在批次的旧导出文件，并把代码恢复到初始快照。`, "确认永久重置", async () => {
+      closeModal();
+      await executeAction("/api/actions/reset-question", { question_id: id, reason: "控制台人工完整重置" }, button, "题目已完整重置");
+    });
+  }
 });
 $("#open-batch").addEventListener("click", () => executeAction("/api/actions/open", { kind: "batch", id: state.batch }, $("#open-batch"), "批次目录已打开").catch(() => {}));
 $("#qc-check").addEventListener("click", async () => {
@@ -1373,6 +1432,10 @@ $("#settings-form").addEventListener("submit", async (event) => {
         gateway_circuit_threshold: Number($("#config-gateway-circuit-threshold").value),
         gateway_circuit_window: Number($("#config-gateway-circuit-window").value),
         gateway_circuit_cooldown: Number($("#config-gateway-circuit-cooldown").value),
+        solo2_origin: $("#config-solo2-origin").value,
+        solo2_auto_submit: $("#config-solo2-auto-submit").checked,
+        solo2_concurrency: Number($("#config-solo2-concurrency").value),
+        solo2_max_attempts: Number($("#config-solo2-max-attempts").value),
         news_feeds: collectNewsFeeds(),
       }),
     });
@@ -1561,6 +1624,26 @@ $("#delivery-package-button").addEventListener("click", async () => {
     button.disabled = false;
     refreshIcons();
   }
+});
+$("#solo2-refresh").addEventListener("click", loadSolo2);
+$("#solo2-login-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const button = $("#solo2-login-button");
+  try {
+    await executeAction("/api/solo2/login", {
+      username: $("#solo2-username").value,
+      password: $("#solo2-password").value,
+    }, button, "SOLO2 登录成功");
+    $("#solo2-password").value = "";
+    await loadSolo2();
+  } catch {}
+});
+$("#solo2-submit-batch").addEventListener("click", () => {
+  openModal("确认提交当前批次", `将提交 ${state.batch} 中全部已通过交付质检且尚未成功提交的记录。`, "确认提交", async () => {
+    closeModal();
+    await executeAction("/api/actions/solo2-submit", { batch: state.batch, numbers: [] }, $("#solo2-submit-batch"), "SOLO2 提交完成");
+    await loadSolo2();
+  });
 });
 $("#auto-pipeline-button").addEventListener("click", startAutoPipeline);
 $("#pipeline-jobs-refresh").addEventListener("click", loadPipelineJobs);

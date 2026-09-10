@@ -61,12 +61,12 @@ def collect_fields(turn_no: int) -> dict:
     print("请填写已经确认的记录内容；自动评分请使用 --from-json。")
     data: dict[str, object] = {
         "session_id": ask("SessionID（人工从当前 Claude Code 会话记录复制）"),
-        "turn_id": ask("PromptID（人工从本轮 user 消息复制）"),
+        "turn_id": ask("交付 PromptID（继续轮填写被中断任务的 PromptID）"),
         "trajectory_file": ask("轨迹文件名（例如 SessionID.jsonl）"),
     }
     if turn_no > 1:
         data.update({
-            "user_prompt": ask("本轮 User Prompt 原文"),
+            "user_prompt": ask("交付 User Prompt（继续轮填写被中断任务的完整原文）"),
             "task_type": ask_choice("本轮任务类型", TASK_TYPES),
             "difficulty": ask_choice("本轮任务难度", DIFFICULTIES),
             "languages": ask("本轮语言/框架（逗号分隔）"),
@@ -187,6 +187,12 @@ def build_record(
         "delivery_qc_note": "",
         "delivery_qc_checked_at": "",
         "delivery_qc_changes": "[]",
+        "raw_user_prompt": str(supplied.get("raw_user_prompt") or (
+            question["prompt"] if turn_no == 1 else supplied["user_prompt"]
+        )),
+        "raw_turn_id": str(supplied.get("raw_turn_id") or supplied["turn_id"]),
+        "is_continuation": bool(supplied.get("is_continuation", False)),
+        "continuation_count": int(supplied.get("continuation_count") or 0),
         "created_at": now(),
     }
     for prefix in SCORE_PREFIXES:

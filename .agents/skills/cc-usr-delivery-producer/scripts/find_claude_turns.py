@@ -134,17 +134,31 @@ def locate(
     matched = events[first_index]
     session_id = str(matched.get("sessionId") or path.stem)
     turns = []
+    active_prompt = ""
+    active_prompt_id = ""
+    continuation_count = 0
     for event in events[first_index:]:
         text = user_text(event)
         identifier, source = prompt_id(event)
         event_session = str(event.get("sessionId") or session_id)
         if text and identifier and event_session == session_id:
+            is_continuation = text.strip() == "继续" and bool(active_prompt_id)
+            if is_continuation:
+                continuation_count += 1
+            else:
+                active_prompt = text
+                active_prompt_id = identifier
+                continuation_count = 0
             turns.append({
                 "turn_no": len(turns) + 1,
-                "prompt_id": identifier,
-                "prompt_id_source": source,
+                "prompt_id": active_prompt_id,
+                "user_prompt": active_prompt,
+                "raw_turn_id": identifier,
+                "raw_turn_id_source": source,
+                "raw_user_prompt": text,
+                "is_continuation": is_continuation,
+                "continuation_count": continuation_count,
                 "timestamp": str(event.get("timestamp", "")),
-                "user_prompt": text,
             })
     if not session_id or not turns:
         raise ValueError("matching Claude Code session lacks SessionID or user PromptID")
