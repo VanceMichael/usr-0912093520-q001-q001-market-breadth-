@@ -1,5 +1,6 @@
 import os
 import tempfile
+import threading
 import time
 from argparse import Namespace
 from pathlib import Path
@@ -21,6 +22,8 @@ from tools.pipeline_daemon import (
     difficulty_distribution,
     difficulty_plan,
     load_runtime_env,
+    count_new_topics,
+    maintain_ready_buffer,
     manual_jobs_active,
     pipeline_batch_timeout,
 )
@@ -158,6 +161,105 @@ def test_claim_topics_requires_enough_distinct_rows() -> None:
             assert connection.execute(
                 "SELECT COUNT(*) FROM news_topics WHERE status='claimed'"
             ).fetchone()[0] == 3
+
+
+def test_news_count_connections_do_not_accumulate_file_descriptors() -> None:
+    descriptor_root = Path("/dev/fd")
+    if not descriptor_root.exists():
+        pytest.skip("file descriptor inventory is unavailable")
+    with tempfile.TemporaryDirectory() as raw:
+        database = Path(raw) / "production.sqlite3"
+        before = len(list(descriptor_root.iterdir()))
+        for _ in range(100):
+            assert count_new_topics(database) == 0
+        after = len(list(descriptor_root.iterdir()))
+    assert after - before < 5
+
+
+class StopAfterFirstWait:
+    def __init__(self) -> None:
+        self.stopped = False
+        self.waits: list[float] = []
+
+    def is_set(self) -> bool:
+        return self.stopped
+
+    def wait(self, seconds: float) -> bool:
+        self.waits.append(seconds)
+        self.stopped = True
+        return True
+
+
+def test_news_below_watermark_refills_then_waits_for_a_complete_batch() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        database = root / "production.sqlite3"
+        with connect(database) as connection:
+            for index in range(18):
+                connection.execute(
+                    "INSERT INTO news_topics(source_url,article_url,title,topic_hash,status,created_at,updated_at) "
+                    "VALUES(?,?,?,?, 'new','now','now')",
+                    ("https://news.example", f"https://news.example/{index}", f"topic {index}", f"hash-{index}"),
+                )
+            connection.commit()
+        args = Namespace(
+            news_watermark=40, ready_watermark=40, dynamic_feeds=False,
+            feeds=["https://news.example"], feed_timeout=1, poll_seconds=60,
+        )
+        store = mock.Mock()
+        store.state.return_value = {"desired_state": "running"}
+        stop = StopAfterFirstWait()
+        sentinel = root / "producer.done"
+        with mock.patch.dict(os.environ, {"CC_AUTHOR_BATCH_SIZE": "20"}), mock.patch(
+            "tools.pipeline_daemon.count_ready", return_value=0
+        ), mock.patch(
+            "tools.pipeline_daemon.ingest", return_value=(0, [])
+        ) as ingest_news, mock.patch(
+            "tools.pipeline_daemon.create_next_batch"
+        ) as create_next:
+            maintain_ready_buffer(database, args, store, stop, sentinel, {})
+
+        ingest_news.assert_called_once()
+        create_next.assert_not_called()
+        assert stop.waits == [60]
+        assert "新闻待用 18/40 条" in store.heartbeat.call_args.kwargs["detail"]
+
+
+def test_news_below_watermark_still_creates_batch_when_enough_exist() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        database = root / "production.sqlite3"
+        with connect(database) as connection:
+            for index in range(39):
+                connection.execute(
+                    "INSERT INTO news_topics(source_url,article_url,title,topic_hash,status,created_at,updated_at) "
+                    "VALUES(?,?,?,?, 'new','now','now')",
+                    ("https://news.example", f"https://news.example/{index}", f"topic {index}", f"hash-{index}"),
+                )
+            connection.commit()
+        args = Namespace(
+            news_watermark=40, ready_watermark=40, dynamic_feeds=False,
+            feeds=["https://news.example"], feed_timeout=1, poll_seconds=60,
+        )
+        store = mock.Mock()
+        store.state.return_value = {"desired_state": "running"}
+        stop = threading.Event()
+
+        def create_and_stop(*_args):
+            stop.set()
+            return 0, "batch"
+
+        with mock.patch.dict(os.environ, {"CC_AUTHOR_BATCH_SIZE": "20"}), mock.patch(
+            "tools.pipeline_daemon.count_ready", return_value=0
+        ), mock.patch(
+            "tools.pipeline_daemon.ingest", return_value=(0, [])
+        ) as ingest_news, mock.patch(
+            "tools.pipeline_daemon.create_next_batch", side_effect=create_and_stop
+        ) as create_next:
+            maintain_ready_buffer(database, args, store, stop, root / "producer.done", {})
+
+        ingest_news.assert_called_once()
+        create_next.assert_called_once()
 
 
 def test_create_batch_rejects_topic_count_mismatch() -> None:

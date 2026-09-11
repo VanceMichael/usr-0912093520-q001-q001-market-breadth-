@@ -9,7 +9,7 @@ isolated Docker workers managed by ``tools.orchestrator``.
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 import json
 import math
 import os
@@ -133,7 +133,7 @@ def _terminate_process(process: subprocess.Popen, grace_seconds: int = 10) -> No
 
 def recover_interrupted_runs(database: Path) -> int:
     """Stop orphaned workers and make their questions eligible for a clean retry."""
-    with connect(database.resolve()) as connection:
+    with closing(connect(database.resolve())) as connection:
         rows = connection.execute(
             "SELECT r.id,r.question_id,r.container_id FROM runs r WHERE r.status='running'"
         ).fetchall()
@@ -271,7 +271,8 @@ def load_runtime_env(path: Path) -> None:
             os.environ["CC_AUTHOR_BATCH_SIZE"] = value
         elif key in {
             "CC_PIPELINE_MODEL_CONCURRENCY", "CC_PIPELINE_CODEX_CONCURRENCY",
-            "CC_PIPELINE_READY_TARGET", "CC_CLAUDE_WORKER_CPUS",
+            "CC_PIPELINE_READY_TARGET", "CC_NEWS_READY_TARGET",
+            "CC_CLAUDE_WORKER_CPUS",
             "CC_CLAUDE_WORKER_MEMORY",
             "CC_CLAUDE_DOCKER_IMAGE", "CC_CLAUDE_HEARTBEAT_SECONDS",
             "CC_CLAUDE_START_TIMEOUT", "CC_CLAUDE_STALLED_TIMEOUT",
@@ -347,7 +348,7 @@ def resolve_codex(codex: str) -> str:
 def claim_topics(database: Path, count: int) -> list[dict]:
     """Atomically claim exactly ``count`` distinct topics, or claim none."""
     count = max(1, count)
-    with connect(database.resolve()) as connection:
+    with closing(connect(database.resolve())) as connection:
         connection.execute("BEGIN IMMEDIATE")
         rows = connection.execute(
             "SELECT * FROM news_topics WHERE status='new' ORDER BY created_at,id LIMIT ?",
@@ -367,7 +368,7 @@ def claim_topics(database: Path, count: int) -> list[dict]:
 def release_topics(database: Path, topic_ids: list[int], status: str, batch: str = "") -> None:
     if not topic_ids:
         return
-    with connect(database.resolve()) as connection:
+    with closing(connect(database.resolve())) as connection:
         timestamp = now()
         connection.executemany(
             "UPDATE news_topics SET status=?,used_batch=?,updated_at=? WHERE id=?",
@@ -377,7 +378,7 @@ def release_topics(database: Path, topic_ids: list[int], status: str, batch: str
 
 
 def count_ready(database: Path) -> int:
-    with connect(database.resolve()) as connection:
+    with closing(connect(database.resolve())) as connection:
         return int(connection.execute(
             "SELECT COUNT(*) FROM questions q JOIN batches b ON b.id=q.batch_id "
             "WHERE b.status NOT IN ('completed','partial','failed') "
@@ -387,28 +388,34 @@ def count_ready(database: Path) -> int:
 
 
 def active_batches(database: Path) -> list[str]:
-    with connect(database.resolve()) as connection:
+    with closing(connect(database.resolve())) as connection:
         return [str(row["name"]) for row in connection.execute(
             "SELECT name FROM batches WHERE status NOT IN ('completed','partial','failed') ORDER BY created_at"
         )]
 
 
 def manual_jobs_active(database: Path) -> bool:
-    with connect(database.resolve()) as connection:
+    with closing(connect(database.resolve())) as connection:
         return connection.execute(
             "SELECT 1 FROM author_jobs WHERE status IN ('queued','running') "
             "UNION ALL SELECT 1 FROM pipeline_jobs WHERE status IN ('queued','running') LIMIT 1"
         ).fetchone() is not None
 
 
+def count_new_topics(database: Path) -> int:
+    with closing(connect(database.resolve())) as connection:
+        return int(connection.execute(
+            "SELECT COUNT(*) FROM news_topics WHERE status='new'"
+        ).fetchone()[0])
+
+
 def has_new_topics(database: Path) -> bool:
-    with connect(database.resolve()) as connection:
-        return connection.execute("SELECT 1 FROM news_topics WHERE status='new' LIMIT 1").fetchone() is not None
+    return count_new_topics(database) > 0
 
 
 def latest_systemic_failure(database: Path, since: str = "") -> str:
     """Return a recent non-retryable worker failure, if one caused pool shutdown."""
-    with connect(database.resolve()) as connection:
+    with closing(connect(database.resolve())) as connection:
         row = connection.execute(
             "SELECT failure_kind FROM runs WHERE status IN ('failed','timeout') "
             "AND retryable=0 AND failure_kind IN ('permanent_auth','model_config','environment') "
@@ -451,7 +458,7 @@ def create_batch(database: Path, codex: str, topics: list[dict], batch: str, log
 
 
 def authored_batch_result(database: Path, batch: str, expected_count: int) -> tuple[bool, int, int]:
-    with connect(database.resolve()) as connection:
+    with closing(connect(database.resolve())) as connection:
         batch_row = connection.execute(
             "SELECT id,question_count FROM batches WHERE name=?", (batch,),
         ).fetchone()
@@ -481,7 +488,7 @@ def authored_batch_result(database: Path, batch: str, expected_count: int) -> tu
 
 
 def fail_authored_batch(database: Path, batch: str) -> None:
-    with connect(database.resolve()) as connection:
+    with closing(connect(database.resolve())) as connection:
         connection.execute(
             "UPDATE batches SET status='failed',updated_at=? WHERE name=?",
             (now(), batch),
@@ -562,7 +569,7 @@ def run_batch(database: Path, args: argparse.Namespace, batch: str, store: Sched
     if store:
         store.heartbeat(phase="model", batch=batch, detail="Claude 模型池与 Codex 交付池正在流水线处理")
         store.event("phase_started", "开始模型与交付并行流水线", phase="model", batch=batch)
-    with connect(database.resolve()) as connection:
+    with closing(connect(database.resolve())) as connection:
         question_count = int(connection.execute(
             "SELECT COUNT(*) FROM questions q JOIN batches b ON b.id=q.batch_id WHERE b.name=?",
             (batch,),
@@ -664,15 +671,36 @@ def maintain_ready_buffer(
             if count_ready(database) >= args.ready_watermark:
                 stop_event.wait(2)
                 continue
-            if not has_new_topics(database):
+            batch_size = author_batch_size()
+            available_topics = count_new_topics(database)
+            if available_topics < args.news_watermark:
                 feeds = configured_feeds(database) if args.dynamic_feeds else args.feeds
                 added, errors = ingest(database, feeds, args.feed_timeout)
-                if errors and not added:
-                    stop_event.wait(min(60, max(5, args.poll_seconds)))
-                    continue
-                if not has_new_topics(database):
-                    stop_event.wait(min(60, max(5, args.poll_seconds)))
-                    continue
+                available_topics = count_new_topics(database)
+                if added or errors:
+                    store.event(
+                        "news_refill",
+                        f"新闻待用低于 {args.news_watermark} 条，抓取新增 {added} 条，当前 {available_topics} 条",
+                        level="warning" if errors and not added else "info",
+                        phase="news",
+                        details={
+                            "added": added,
+                            "available": available_topics,
+                            "target": args.news_watermark,
+                            "feed_errors": errors,
+                        },
+                    )
+            if available_topics < batch_size:
+                delay = min(60, max(5, args.poll_seconds))
+                store.heartbeat(
+                    phase="idle", batch="",
+                    detail=(
+                        f"新闻待用 {available_topics}/{args.news_watermark} 条，"
+                        f"不足单批 {batch_size} 条，{delay} 秒后重新抓取"
+                    ),
+                )
+                stop_event.wait(delay)
+                continue
             code, batch = create_next_batch(database, args, store)
             if code:
                 if code == AUTHOR_FAILURE_EXIT:
@@ -714,6 +742,7 @@ def cycle(args: argparse.Namespace, store: SchedulerStore | None = None) -> tupl
     load_runtime_env(args.env_file.resolve())
     database = args.db.resolve()
     args.ready_watermark = getattr(args, "ready_watermark", 40)
+    args.news_watermark = getattr(args, "news_watermark", 40)
     args.worker_cpus = getattr(args, "worker_cpus", 1.0)
     args.worker_memory = getattr(args, "worker_memory", "2g")
     args.heartbeat_seconds = getattr(args, "heartbeat_seconds", 5)
@@ -743,6 +772,13 @@ def cycle(args: argparse.Namespace, store: SchedulerStore | None = None) -> tupl
     try:
         args.ready_watermark = max(
             1, min(200, int(os.environ.get("CC_PIPELINE_READY_TARGET", args.ready_watermark)))
+        )
+    except ValueError:
+        pass
+    try:
+        args.news_watermark = max(
+            author_batch_size(),
+            min(1000, int(os.environ.get("CC_NEWS_READY_TARGET", args.news_watermark))),
         )
     except ValueError:
         pass
@@ -867,6 +903,7 @@ def main() -> int:
     parser.add_argument("--stalled-timeout", type=int, default=900)
     parser.add_argument("--global-idle-timeout", type=int, default=1800)
     parser.add_argument("--ready-watermark", type=int, default=40)
+    parser.add_argument("--news-watermark", type=int, default=40)
     parser.add_argument("--feed-timeout", type=int, default=20)
     parser.add_argument("--agent-timeout", type=int, default=3600)
     parser.add_argument("--loop", action="store_true")

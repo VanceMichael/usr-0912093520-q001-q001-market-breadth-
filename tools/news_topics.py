@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
 import hashlib
 import html
 import json
@@ -182,7 +183,7 @@ def topic_hash(item: dict[str, str]) -> str:
 
 def configured_feeds(database: Path, *, enabled_only: bool = True) -> list[str]:
     """Read the persisted news-source list used by the autonomous daemon."""
-    with connect(database.resolve()) as connection:
+    with closing(connect(database.resolve())) as connection:
         query = "SELECT url FROM news_feeds"
         if enabled_only:
             query += " WHERE enabled=1"
@@ -193,7 +194,7 @@ def configured_feeds(database: Path, *, enabled_only: bool = True) -> list[str]:
 def ingest(database: Path, feeds: list[str], timeout: int = 20) -> tuple[int, list[str]]:
     added = 0
     errors: list[str] = []
-    with connect(database.resolve()) as connection:
+    with closing(connect(database.resolve())) as connection:
         for source_url in feeds:
             try:
                 items = fetch(source_url, timeout)
@@ -230,7 +231,7 @@ def main() -> int:
         if configured:
             feeds = configured
     if args.list:
-        with connect(args.db.resolve()) as connection:
+        with closing(connect(args.db.resolve())) as connection:
             for row in connection.execute("SELECT id,title,source_url,status,used_batch FROM news_topics ORDER BY id DESC LIMIT 100"):
                 print(f"{row['id']}\t{row['status']}\t{row['title']}\t{row['source_url']}")
         return 0
