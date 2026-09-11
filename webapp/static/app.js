@@ -230,6 +230,20 @@ function evidenceLocator(item) {
   return "原始要求";
 }
 
+function reviewDeliveryState(record) {
+  const states = {
+    succeeded: ["已提交", "green", record.solo2_remote_id ? `平台编号 ${record.solo2_remote_id}` : "平台已接收"],
+    submitting: ["提交中", "blue", "正在上传轨迹和交付字段"],
+    retry_wait: ["提交失败，可重试", "amber", "平台或网络暂时未完成接收"],
+    auth_blocked: ["登录失效，可重试", "amber", "请在导出中心重新登录"],
+    schema_blocked: ["平台字段阻断", "red", "请检查平台字段后重试"],
+  };
+  if (states[record.solo2_status]) return states[record.solo2_status];
+  if (record.human_qc_approved) return ["可提交", "green", "最终复核已通过，可以提交这条记录"];
+  if (record.ready_for_review) return ["待最终复核", "amber", "请选择人工确认或 Codex 严格复核"];
+  return ["前置门禁阻断", "red", "请先补齐交付质检、事实证据和历史去重结果"];
+}
+
 function renderReviews() {
   if (!state.reviews) return;
   const summary = state.reviews.summary;
@@ -250,6 +264,7 @@ function renderReviews() {
     return;
   }
   list.innerHTML = state.reviews.records.map((record) => {
+    const [deliveryLabel, deliveryTone, deliveryDetail] = reviewDeliveryState(record);
     const gateStatus = [
       [record.delivery_qc_passed, "自动质检"],
       [record.evidence_gate_passed, "事实证据"],
@@ -274,11 +289,15 @@ function renderReviews() {
     }).join("");
     const history = record.history_matches.length ? `<div class="history-warning"><strong>发现历史相似描述</strong>${record.history_matches.slice(0, 5).map((item) => `<p>${escapeHtml(item.record_id)} · ${escapeHtml(item.dimension)} · 相似度 ${Math.round(item.similarity * 100)}%</p>`).join("")}</div>` : "";
     const codex = record.codex_review ? `<div class="codex-review-report ${escapeHtml(record.codex_review.status)} ${escapeHtml(record.codex_review.decision)}"><div><strong>Codex 自动逐维复核${record.codex_review.decision === "approved" ? " · 已通过" : record.codex_review.decision === "rejected" ? " · 未通过" : ""}</strong><span>${escapeHtml(formatDate(record.codex_review.updated_at))}</span></div><pre>${escapeHtml(record.codex_review.report || (record.codex_review.status === "started" ? "正在读取全部复核资料…" : "暂无报告"))}</pre></div>` : "";
+    const submitLabel = record.solo2_status === "succeeded" ? "已提交此条" :
+      record.solo2_status === "submitting" ? "正在提交" :
+      record.solo2_status ? "重试提交此条" : "提交此条到 SOLO2";
     return `<article class="review-record" data-review-record="${escapeHtml(record.record_id)}">
       <header class="review-record-head"><div><span>${escapeHtml(record.batch_name)} · 第 ${record.question_no} 题 · 第 ${record.turn_no} 轮</span><h3>${escapeHtml(record.title)}</h3><p>${escapeHtml(record.record_id)}</p></div><div class="gate-strip">${gateStatus.map(([passed, label]) => `<span class="tag ${passed ? "green" : "amber"}">${escapeHtml(label)}${passed ? "通过" : "待处理"}</span>`).join("")}</div></header>
       <details class="review-prompt"><summary>查看原始要求和需求覆盖</summary><p>${escapeHtml(record.user_prompt)}</p><ul>${coverage}</ul></details>
       ${history}${dimensions}${codex}
-      <footer class="review-actions"><textarea data-review-note rows="2" maxlength="500" placeholder="退回时填写具体问题；人工通过时可填写补充说明"></textarea><div><button class="button secondary" type="button" data-review-action="codex" ${record.ready_for_review && !record.human_qc_approved && record.codex_review?.status !== "started" ? "" : "disabled"}><i data-lucide="scan-search"></i>${record.codex_review?.status === "started" ? "Codex 复核中" : "Codex 代替人工复核"}</button><button class="button secondary" type="button" data-review-action="reject"><i data-lucide="undo-2"></i>退回重写</button><button class="button primary" type="button" data-review-action="approve" ${record.ready_for_review && !record.human_qc_approved ? "" : "disabled"}><i data-lucide="badge-check"></i>${record.human_qc_approved ? (record.review_method === "codex" ? "已由 Codex 通过" : "已人工确认") : "人工确认五维并通过"}</button></div></footer>
+      <div class="review-delivery-state"><div><span>单条交付状态${record.solo2_attempt_count ? ` · 已尝试 ${record.solo2_attempt_count} 次` : ""}</span><strong>${escapeHtml(deliveryDetail)}</strong>${record.solo2_last_error ? `<small>${escapeHtml(record.solo2_last_error)}</small>` : ""}</div><span class="tag ${escapeHtml(deliveryTone)}">${escapeHtml(deliveryLabel)}</span></div>
+      <footer class="review-actions"><textarea data-review-note rows="2" maxlength="500" placeholder="退回时填写具体问题；人工通过时可填写补充说明"></textarea><div><button class="button secondary" type="button" data-review-action="codex" ${record.ready_for_review && !record.human_qc_approved && record.codex_review?.status !== "started" ? "" : "disabled"}><i data-lucide="scan-search"></i>${record.codex_review?.status === "started" ? "Codex 复核中" : "Codex 代替人工复核"}</button><button class="button secondary" type="button" data-review-action="reject" ${["submitting", "succeeded"].includes(record.solo2_status) ? "disabled" : ""}><i data-lucide="undo-2"></i>退回重写</button><button class="button primary" type="button" data-review-action="approve" ${record.ready_for_review && !record.human_qc_approved ? "" : "disabled"}><i data-lucide="badge-check"></i>${record.human_qc_approved ? (record.review_method === "codex" ? "已由 Codex 通过" : "已人工确认") : "人工确认五维并通过"}</button><button class="button delivery-submit" type="button" data-review-action="solo2" ${record.can_solo2_submit ? "" : "disabled"}><i data-lucide="send"></i>${escapeHtml(submitLabel)}</button></div></footer>
     </article>`;
   }).join("");
   refreshIcons();
@@ -1567,6 +1586,28 @@ $("#review-list").addEventListener("click", async (event) => {
             await loadReviews({ quiet: true });
           } catch (error) {
             toast(error.message, true);
+          }
+        },
+      );
+      return;
+    } else if (action === "solo2") {
+      openModal(
+        "确认提交这一条记录",
+        `${recordId} 的字段和原始轨迹将提交到 SOLO2。提交成功后不能完整重置对应题目。`,
+        "确认提交",
+        async () => {
+          closeModal();
+          try {
+            await api("/api/actions/solo2-submit", {
+              method: "POST",
+              body: JSON.stringify({ batch: state.batch, record_ids: [recordId] }),
+            });
+            toast("这一条记录已提交到 SOLO2");
+            await loadDashboard(state.batch);
+          } catch (error) {
+            toast(error.message, true);
+          } finally {
+            await loadReviews({ quiet: true });
           }
         },
       );

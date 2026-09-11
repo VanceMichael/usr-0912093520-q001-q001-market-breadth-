@@ -3007,10 +3007,36 @@ class ConsoleData:
             "auth_error": error, **submission_overview(self.database, batch_name),
         }
 
-    def solo2_submit(self, batch: object, numbers: object | None) -> dict[str, object]:
+    def solo2_submit(
+        self, batch: object, numbers: object | None, record_ids: object | None = None,
+    ) -> dict[str, object]:
         batch_name = str(batch or "")
         selected: set[int] | None = None
+        selected_records: set[str] | None = None
+        if record_ids is not None:
+            if not isinstance(record_ids, list) or not record_ids or len(record_ids) > 100:
+                raise ValueError("交付记录选择无效")
+            selected_records = set()
+            for value in record_ids:
+                record_id = str(value or "").strip()
+                if not record_id or len(record_id) > 128:
+                    raise ValueError("交付记录编号无效")
+                selected_records.add(record_id)
+            if not BATCH_RE.fullmatch(batch_name):
+                raise ValueError("批次名无效")
+            with closing(self.connect()) as connection:
+                marks = ",".join("?" for _ in selected_records)
+                found = connection.execute(
+                    "SELECT r.record_id FROM records r JOIN questions q ON q.id=r.question_id "
+                    "JOIN batches b ON b.id=q.batch_id "
+                    f"WHERE b.name=? AND r.record_id IN ({marks})",
+                    [batch_name, *sorted(selected_records)],
+                ).fetchall()
+            if {str(row["record_id"]) for row in found} != selected_records:
+                raise ValueError("选择中包含不属于当前批次的交付记录")
         if numbers:
+            if selected_records:
+                raise ValueError("题号和交付记录不能同时选择")
             batch_name, normalized = self.validate_selection(batch_name, numbers)
             selected = set(normalized)
         elif not BATCH_RE.fullmatch(batch_name):
@@ -3018,7 +3044,8 @@ class ConsoleData:
         origin, attempts = self._solo2_settings()
         result = submit_records(
             self.database, self.project_root / ".local-auth" / "solo2.cookies", origin,
-            batch=batch_name, numbers=selected, max_attempts=attempts,
+            batch=batch_name, numbers=selected, record_ids=selected_records,
+            max_attempts=attempts,
         )
         result["ok"] = result["failed"] == 0
         result["message"] = f"SOLO2 提交完成：成功 {result['submitted']}，失败 {result['failed']}"
@@ -3288,7 +3315,9 @@ class ConsoleHandler(BaseHTTPRequestHandler):
             elif self.path == "/api/solo2/login":
                 result = self.data.solo2_login(body.get("username"), body.get("password"))
             elif self.path == "/api/actions/solo2-submit":
-                result = self.data.solo2_submit(body.get("batch"), body.get("numbers"))
+                result = self.data.solo2_submit(
+                    body.get("batch"), body.get("numbers"), body.get("record_ids")
+                )
             elif self.path == "/api/reviews/approve":
                 result = self.data.approve_delivery_review(body)
             elif self.path == "/api/reviews/reject":

@@ -494,6 +494,13 @@ th:nth-child(6) { width: 12%; }
 .codex-review-report.failed, .codex-review-report.rejected { border-color: #efb8bf; background: var(--red-soft); }
 .codex-review-report.approved { border-color: #add8bf; background: var(--green-soft); }
 .gate-message.error { margin: 0; color: var(--red-dark); font-size: 11px; }
+.review-delivery-state { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin: 14px 18px 0; padding: 11px 12px; border: 1px solid var(--line); border-radius: 5px; background: #f7f6f8; }
+.review-delivery-state > div { display: grid; gap: 3px; min-width: 0; }
+.review-delivery-state span, .review-delivery-state small { color: var(--muted); font-size: 10px; }
+.review-delivery-state strong { font-size: 12px; overflow-wrap: anywhere; }
+.review-delivery-state small { color: var(--red-dark); overflow-wrap: anywhere; }
+.delivery-submit { background: var(--ink); color: #fff; }
+.delivery-submit:hover:not(:disabled) { background: #3a3336; }
 .review-actions { display: grid; grid-template-columns: minmax(220px, 1fr) auto; gap: 12px; align-items: end; padding: 15px 18px; background: #faf9fa; }
 .review-actions textarea { width: 100%; min-height: 58px; padding: 9px 10px; resize: vertical; border: 1px solid var(--line); border-radius: 5px; font-family: inherit; font-size: 11px; line-height: 1.5; color: var(--ink); }
 .review-actions > div { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 7px; }
@@ -586,7 +593,7 @@ th:nth-child(6) { width: 12%; }
   .question-main strong { white-space: normal; }
   .detail-grid { grid-template-columns: 1fr; }
   .score-grid { grid-template-columns: repeat(5, minmax(48px, 1fr)); overflow-x: auto; }
-  .review-heading, .review-record-head, .review-dimension-head { align-items: stretch; flex-direction: column; }
+  .review-heading, .review-record-head, .review-dimension-head, .review-delivery-state { align-items: stretch; flex-direction: column; }
   .review-heading-actions { align-items: stretch; }
   .review-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .gate-strip { justify-content: flex-start; }

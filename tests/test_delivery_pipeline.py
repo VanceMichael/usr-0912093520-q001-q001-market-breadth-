@@ -22,6 +22,8 @@ from tools.human_review import (  # noqa: E402
     approve_codex_record,
     approve_record,
     build_codex_review_dossier,
+    reject_record,
+    review_queue,
 )
 from tools import orchestrator  # noqa: E402
 
@@ -1053,6 +1055,56 @@ class DeliveryPipelineTests(unittest.TestCase):
             self.assertEqual(Client.uploads[0].name, "session-001.jsonl")
             self.assertEqual(Client.submissions[0]["fingerprint"], "schema-1")
             self.assertEqual(len(Client.submissions), 1)
+
+    def test_solo2_can_submit_one_exact_delivery_record(self):
+        class Client:
+            submissions: list[str] = []
+
+            def form_schema(self):
+                return {"fingerprint": "schema-1", "fields": [
+                    {"field_key": "user_prompt", "field_type": "text", "is_required": True},
+                ]}
+
+            def create_submission(self, data, _fingerprint):
+                self.submissions.append(data["user_prompt"])
+                return {"id": "remote-exact", "status": "SUBMITTED"}
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = self.prepare(root, count=2)
+            for number in (1, 2):
+                input_path = root / f"score-{number}.json"
+                input_path.write_text(
+                    json.dumps(automated_record(number), ensure_ascii=False), encoding="utf-8",
+                )
+                result = self.run_command([
+                    sys.executable, str(COLLECTOR), "--db", str(database), "--batch", "0911",
+                    "--question", str(number), "--turn", "1", "--from-json", str(input_path),
+                ])
+                self.assertEqual(result.returncode, 0, result.stdout)
+            result = self.run_command([
+                sys.executable, str(QC), "--db", str(database), "--batch", "0911", "--finalize",
+            ])
+            self.assertEqual(result.returncode, 0, result.stdout)
+            approve_all(database)
+
+            before = review_queue(database, "0911")["records"]
+            self.assertTrue(all(item["can_solo2_submit"] for item in before))
+            result = submit_records(
+                database, root / "cookies", "https://solo2.example.com",
+                batch="0911", record_ids={"0911-002-T01"},
+                client_factory=lambda *_args: Client(),
+            )
+
+            self.assertEqual((result["submitted"], result["failed"]), (1, 0))
+            self.assertEqual(Client.submissions, [before[1]["user_prompt"]])
+            after = {item["record_id"]: item for item in review_queue(database, "0911")["records"]}
+            self.assertEqual(after["0911-002-T01"]["solo2_status"], "succeeded")
+            self.assertEqual(after["0911-002-T01"]["solo2_remote_id"], "remote-exact")
+            self.assertFalse(after["0911-002-T01"]["can_solo2_submit"])
+            self.assertTrue(after["0911-001-T01"]["can_solo2_submit"])
+            with self.assertRaisesRegex(ValueError, "已经提交到 SOLO2"):
+                reject_record(database, "0911-002-T01", "gaoyong", "需要重新修改评分描述")
 
     def test_solo2_504_waits_then_manual_retry_recovers(self):
         class Client:

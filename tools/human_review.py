@@ -45,9 +45,13 @@ def review_queue(database: Path, batch: str | None = None) -> dict:
             where = "WHERE b.name=?"
             parameters.append(batch)
         rows = connection.execute(
-            "SELECT r.*,q.task_id,q.question_no,q.title,b.name AS batch_name "
+            "SELECT r.*,q.task_id,q.question_no,q.title,b.name AS batch_name,"
+            "s.status AS solo2_status,s.attempt_count AS solo2_attempt_count,"
+            "s.last_error AS solo2_last_error,s.remote_submission_id AS solo2_remote_id,"
+            "s.updated_at AS solo2_updated_at "
             "FROM records r JOIN questions q ON q.id=r.question_id "
-            f"JOIN batches b ON b.id=q.batch_id {where} "
+            "JOIN batches b ON b.id=q.batch_id "
+            f"LEFT JOIN solo2_submissions s ON s.record_id=r.record_id {where} "
             "ORDER BY r.human_qc_approved ASC,b.created_at,q.question_no,r.turn_no",
             parameters,
         ).fetchall()
@@ -97,6 +101,21 @@ def review_queue(database: Path, batch: str | None = None) -> dict:
                 and record["evidence_gate_passed"]
                 and record["history_gate_passed"]
                 and not record["history_matches"]
+            )
+            record["solo2_status"] = str(record.get("solo2_status") or "")
+            record["solo2_attempt_count"] = int(record.get("solo2_attempt_count") or 0)
+            record["solo2_last_error"] = str(record.get("solo2_last_error") or "")
+            record["solo2_remote_id"] = str(record.get("solo2_remote_id") or "")
+            record["solo2_updated_at"] = str(record.get("solo2_updated_at") or "")
+            record["can_solo2_submit"] = bool(
+                record["delivery_qc_passed"]
+                and record.get("delivery_qc_note") == "质检通过"
+                and record["evidence_gate_passed"]
+                and record["history_gate_passed"]
+                and not record["history_matches"]
+                and record["human_qc_approved"]
+                and record.get("review_method") in {"human", "codex"}
+                and record["solo2_status"] not in {"succeeded", "submitting"}
             )
             items.append(record)
     return {
@@ -316,6 +335,12 @@ def reject_record(database: Path, record_id: str, reviewer: str, note: str) -> d
         connection.execute("BEGIN IMMEDIATE")
         if _record_context(connection, record_id) is None:
             raise ValueError("交付记录不存在")
+        submission = connection.execute(
+            "SELECT status FROM solo2_submissions WHERE record_id=?", (record_id,)
+        ).fetchone()
+        if submission and submission["status"] in {"submitting", "succeeded"}:
+            connection.rollback()
+            raise ValueError("记录正在提交或已经提交到 SOLO2，不能退回重写")
         timestamp = now()
         connection.execute(
             "DELETE FROM record_dimension_reviews WHERE record_id=?", (record_id,)

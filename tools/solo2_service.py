@@ -58,6 +58,7 @@ def _records(
     *,
     batch: str | None = None,
     numbers: set[int] | None = None,
+    record_ids: set[str] | None = None,
     pending_only: bool = False,
 ) -> list[sqlite3.Row]:
     clauses = [
@@ -73,6 +74,10 @@ def _records(
         marks = ",".join("?" for _ in numbers)
         clauses.append(f"q.question_no IN ({marks})")
         parameters.extend(sorted(numbers))
+    if record_ids:
+        marks = ",".join("?" for _ in record_ids)
+        clauses.append(f"r.record_id IN ({marks})")
+        parameters.extend(sorted(record_ids))
     if pending_only:
         clauses.append(
             "COALESCE(s.status,'') NOT IN ('succeeded','auth_blocked','schema_blocked') "
@@ -174,6 +179,7 @@ def submit_records(
     *,
     batch: str | None = None,
     numbers: set[int] | None = None,
+    record_ids: set[str] | None = None,
     limit: int | None = None,
     max_attempts: int = 3,
     timeout: float = 30,
@@ -183,7 +189,8 @@ def submit_records(
     """Submit eligible records once; retries are scheduled by later calls."""
     with connect(database) as connection:
         rows = _records(
-            connection, batch=batch, numbers=numbers, pending_only=not manual,
+            connection, batch=batch, numbers=numbers, record_ids=record_ids,
+            pending_only=not manual,
         )
     if not rows:
         return {"submitted": 0, "skipped": 0, "failed": 0, "results": []}
