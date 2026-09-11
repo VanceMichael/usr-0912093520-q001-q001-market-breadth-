@@ -2331,6 +2331,14 @@ class ConsoleData:
         connection.row_factory = sqlite3.Row
         return connection
 
+    def connect_rw(self) -> sqlite3.Connection:
+        """Open the database for the small set of console operations that write state."""
+        if not self.database.is_file():
+            raise FileNotFoundError(f"数据库不存在：{self.database}")
+        connection = sqlite3.connect(self.database, timeout=30)
+        connection.row_factory = sqlite3.Row
+        return connection
+
     def batches(self, connection: sqlite3.Connection) -> list[dict]:
         rows = connection.execute(
             "SELECT b.*, "
@@ -2742,7 +2750,7 @@ class ConsoleData:
         if not record_id:
             raise ValueError("请选择交付记录")
         dossier = build_codex_review_dossier(self.database, record_id)
-        with closing(self.connect()) as connection:
+        with closing(self.connect_rw()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
                 "SELECT r.record_id,r.human_qc_approved FROM records r WHERE r.record_id=?",
@@ -2838,7 +2846,7 @@ class ConsoleData:
             action = "codex_review_failed"
             report = str(exc)[:4000]
         try:
-            with closing(self.connect()) as connection:
+            with closing(self.connect_rw()) as connection:
                 connection.execute(
                     "INSERT INTO record_review_events(record_id,action,reviewer,note,details,created_at) "
                     "VALUES(?,?,?,?,?,?)",

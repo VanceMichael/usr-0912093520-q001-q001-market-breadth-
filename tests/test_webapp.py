@@ -128,7 +128,64 @@ class WebConsoleTests(unittest.TestCase):
                     event = connection.execute(
                         "SELECT action,details FROM record_review_events ORDER BY id DESC LIMIT 1"
                     ).fetchone()
-                self.assertIsNone(event)
+                self.assertIsNotNone(event)
+                self.assertEqual(event[0], "codex_review_completed")
+            finally:
+                data.author_executor.shutdown(wait=True)
+                data.pipeline_executor.shutdown(wait=True)
+
+    def test_codex_review_start_event_uses_a_writable_connection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = self.make_database(root)
+            with connect(database) as connection:
+                question = connection.execute("SELECT id FROM questions LIMIT 1").fetchone()
+                columns = [
+                    row["name"] for row in connection.execute("PRAGMA table_info(records)")
+                    if row["name"] != "id"
+                ]
+                values = []
+                for name in columns:
+                    if name == "question_id":
+                        values.append(question[0])
+                    elif name == "turn_no":
+                        values.append(1)
+                    elif name.endswith("_score"):
+                        values.append(3)
+                    elif name in {
+                        "human_authored", "human_qc_approved", "delivery_qc_passed",
+                        "evidence_gate_passed", "history_gate_passed", "is_continuation",
+                        "continuation_count", "reset_count",
+                    }:
+                        values.append(0)
+                    elif name == "record_id":
+                        values.append("0911-001-T01")
+                    elif name == "created_at":
+                        values.append("2026-09-01T00:00:00+08:00")
+                    else:
+                        values.append("value")
+                connection.execute(
+                    f"INSERT INTO records({','.join(columns)}) VALUES({','.join('?' for _ in columns)})",
+                    values,
+                )
+                connection.commit()
+            data = ConsoleData(database, root)
+            try:
+                dossier = {"record_id": "0911-001-T01"}
+                with mock.patch(
+                    "webapp.server.build_codex_review_dossier", return_value=dossier
+                ), mock.patch.object(data.author_executor, "submit") as submit:
+                    result = data.create_codex_delivery_review(
+                        {"record_id": "0911-001-T01"}
+                    )
+                self.assertTrue(result["ok"])
+                submit.assert_called_once()
+                with sqlite3.connect(database) as connection:
+                    event = connection.execute(
+                        "SELECT action FROM record_review_events WHERE record_id=?",
+                        ("0911-001-T01",),
+                    ).fetchone()
+                self.assertEqual(event[0], "codex_review_started")
             finally:
                 data.author_executor.shutdown(wait=True)
                 data.pipeline_executor.shutdown(wait=True)
