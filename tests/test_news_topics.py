@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 
 from tools.batch_pipeline import connect
-from tools.news_topics import ingest, ingest_report, parse_feed
+from tools.news_topics import FeedItems, ingest, ingest_report, parse_feed, parse_next_page
 
 
 RSS = b'''<?xml version="1.0"?><rss><channel>
@@ -78,6 +78,74 @@ class NewsTopicTest(unittest.TestCase):
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["title"], "Embedded article title")
         self.assertEqual(items[0]["article_url"], "http://www.chinanews.com.cn/gn/2026/09-08/123.shtml")
+
+    def test_parse_next_page_accepts_only_same_site_navigation(self):
+        html = b'''<html><body>
+        <a href="https://other.example/index2.html">next</a>
+        <a href="index2.html">next page</a>
+        </body></html>'''
+        self.assertEqual(
+            parse_next_page("https://news.example/list/index.html", html),
+            "https://news.example/list/index2.html",
+        )
+
+    def test_ingest_follows_next_page_until_new_topic_target_is_met(self):
+        first = FeedItems([{
+            "source_url": "https://news.example/list/index.html",
+            "article_url": "https://news.example/2026/known.html",
+            "title": "A known meaningful article title",
+            "summary": "",
+            "published_at": "",
+        }], "https://news.example/list/index2.html")
+        second = FeedItems([{
+            "source_url": "https://news.example/list/index2.html",
+            "article_url": "https://news.example/2026/new.html",
+            "title": "A new meaningful article title",
+            "summary": "",
+            "published_at": "",
+        }], "https://news.example/list/index3.html")
+        third = FeedItems([{
+            "source_url": "https://news.example/list/index3.html",
+            "article_url": "https://news.example/2026/unused.html",
+            "title": "An unused meaningful article title",
+            "summary": "",
+            "published_at": "",
+        }])
+        with tempfile.TemporaryDirectory() as raw:
+            database = Path(raw) / "production.sqlite3"
+            import tools.news_topics as news_topics
+            original_fetch = news_topics.fetch
+            calls: list[str] = []
+            pages = {
+                "https://news.example/list/index.html": first,
+                "https://news.example/list/index2.html": second,
+                "https://news.example/list/index3.html": third,
+            }
+            try:
+                news_topics.fetch = lambda url, *_args, **_kwargs: calls.append(url) or pages[url]
+                ingest(database, ["https://news.example/list/index.html"])
+                calls.clear()
+                report = ingest_report(
+                    database, ["https://news.example/list/index.html"], target_new=1,
+                )
+            finally:
+                news_topics.fetch = original_fetch
+            self.assertEqual(calls, [
+                "https://news.example/list/index.html",
+                "https://news.example/list/index2.html",
+            ])
+            self.assertEqual(report["added"], 1)
+            self.assertEqual(report["duplicates"], 1)
+            self.assertEqual(report["feeds"][0]["pages_fetched"], 2)
+            self.assertEqual(report["feeds"][0]["stop_reason"], "target_reached")
+            with connect(database) as connection:
+                rows = connection.execute(
+                    "SELECT source_url,article_url FROM news_topics ORDER BY id"
+                ).fetchall()
+            self.assertEqual(len(rows), 2)
+            self.assertTrue(all(
+                row["source_url"] == "https://news.example/list/index.html" for row in rows
+            ))
 
 
 if __name__ == "__main__":

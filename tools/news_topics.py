@@ -18,6 +18,7 @@ from urllib.parse import urljoin, urlparse
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
+from typing import Iterable
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -105,6 +106,39 @@ class _ChannelParser(HTMLParser):
             self.in_heading = False
 
 
+class FeedItems(list[dict[str, str]]):
+    """Parsed feed items with an optional same-site pagination link."""
+
+    def __init__(self, values: Iterable[dict[str, str]], next_url: str = "") -> None:
+        super().__init__(values)
+        self.next_url = next_url
+
+
+def parse_next_page(source_url: str, payload: bytes) -> str:
+    """Return a same-site next-page URL advertised by an HTML list page."""
+    charset = "utf-8"
+    head = payload[:4096].decode("ascii", errors="ignore")
+    match = re.search(r"charset\s*=\s*[\"']?([\w-]+)", head, re.IGNORECASE)
+    if match:
+        charset = match.group(1)
+    parser = _ChannelParser()
+    parser.feed(payload.decode(charset, errors="replace"))
+    source_host = urlparse(source_url).netloc.lower()
+    for raw_link, label in parser.items:
+        normalized = re.sub(r"\s+", "", clean(label)).casefold()
+        if normalized not in {"下一页", "下页", "next", "nextpage", ">", "›", "»"}:
+            continue
+        candidate = urljoin(source_url, raw_link).split("#", 1)[0]
+        parsed = urlparse(candidate)
+        same_news_network = parsed.netloc.lower() == source_host or (
+            parsed.netloc.lower().endswith(".chinanews.com.cn")
+            and source_host.endswith(".chinanews.com.cn")
+        )
+        if parsed.scheme in {"http", "https"} and same_news_network and candidate != source_url:
+            return candidate
+    return ""
+
+
 def parse_html(source_url: str, payload: bytes) -> list[dict[str, str]]:
     # China News channel pages embed their article list as a JSON ``docArr``
     # JavaScript variable instead of ordinary anchor tags.
@@ -173,7 +207,8 @@ def parse_html(source_url: str, payload: bytes) -> list[dict[str, str]]:
 def fetch(source_url: str, timeout: int = 20) -> list[dict[str, str]]:
     request = urllib.request.Request(source_url, headers={"User-Agent": "CCUSR-NewsTopics/1.0"})
     with urllib.request.urlopen(request, timeout=timeout) as response:
-        return parse_feed(source_url, response.read())
+        payload = response.read()
+    return FeedItems(parse_feed(source_url, payload), parse_next_page(source_url, payload))
 
 
 def topic_hash(item: dict[str, str]) -> str:
@@ -191,7 +226,9 @@ def configured_feeds(database: Path, *, enabled_only: bool = True) -> list[str]:
         return [str(row["url"]) for row in connection.execute(query)]
 
 
-def ingest_report(database: Path, feeds: list[str], timeout: int = 20) -> dict:
+def ingest_report(
+    database: Path, feeds: list[str], timeout: int = 20, *, target_new: int | None = None,
+) -> dict:
     """Ingest feeds and explain how parsed items became new or duplicate topics."""
     added = 0
     errors: list[str] = []
@@ -200,39 +237,62 @@ def ingest_report(database: Path, feeds: list[str], timeout: int = 20) -> dict:
     feed_reports: list[dict] = []
     with closing(connect(database.resolve())) as connection:
         for source_url in feeds:
-            try:
-                items = fetch(source_url, timeout)
-            except Exception as exc:  # noqa: BLE001 - one bad feed must not stop the cycle
-                errors.append(f"{source_url}: {exc}")
-                feed_reports.append({
-                    "url": source_url, "parsed": 0, "added": 0,
-                    "duplicates": 0, "error": str(exc),
-                })
-                continue
-            parsed += len(items)
             feed_added = 0
             feed_duplicates = 0
-            for item in items:
-                timestamp = now()
-                result = connection.execute(
-                    "INSERT OR IGNORE INTO news_topics(source_url,article_url,title,summary,published_at,topic_hash,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-                    (item["source_url"], item["article_url"], item["title"], item["summary"], item["published_at"], topic_hash(item), timestamp, timestamp),
-                )
-                if result.rowcount == 1:
-                    added += 1
-                    feed_added += 1
-                else:
-                    duplicates += 1
-                    feed_duplicates += 1
-            # A feed that was successfully parsed but only contained topics
-            # already present in SQLite is healthy; do not report it as an
-            # outage on subsequent daemon cycles.  Warn only when parsing
-            # yielded no article-like entries at all.
-            if not items:
-                errors.append(f"{source_url}: no article-like topics found")
+            feed_parsed = 0
+            page_url = source_url
+            page_urls: list[str] = []
+            seen_pages: set[str] = set()
+            feed_error = ""
+            stop_reason = "single_page"
+            while page_url and page_url not in seen_pages:
+                seen_pages.add(page_url)
+                try:
+                    items = fetch(page_url, timeout)
+                except Exception as exc:  # noqa: BLE001 - one bad feed must not stop the cycle
+                    feed_error = str(exc)
+                    errors.append(f"{page_url}: {exc}")
+                    stop_reason = "request_failed"
+                    break
+                page_urls.append(page_url)
+                feed_parsed += len(items)
+                parsed += len(items)
+                for item in items:
+                    item = {**item, "source_url": source_url}
+                    timestamp = now()
+                    result = connection.execute(
+                        "INSERT OR IGNORE INTO news_topics(source_url,article_url,title,summary,published_at,topic_hash,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
+                        (item["source_url"], item["article_url"], item["title"], item["summary"], item["published_at"], topic_hash(item), timestamp, timestamp),
+                    )
+                    if result.rowcount == 1:
+                        added += 1
+                        feed_added += 1
+                    else:
+                        duplicates += 1
+                        feed_duplicates += 1
+                if not items:
+                    errors.append(f"{page_url}: no article-like topics found")
+                    stop_reason = "empty_page"
+                    break
+                if target_new is None:
+                    stop_reason = "single_page"
+                    break
+                if added >= max(1, target_new):
+                    stop_reason = "target_reached"
+                    break
+                next_url = str(getattr(items, "next_url", "") or "")
+                if not next_url:
+                    stop_reason = "no_next_page"
+                    break
+                if next_url in seen_pages:
+                    stop_reason = "page_cycle"
+                    break
+                page_url = next_url
             feed_reports.append({
-                "url": source_url, "parsed": len(items), "added": feed_added,
-                "duplicates": feed_duplicates, "error": "",
+                "url": source_url, "parsed": feed_parsed, "added": feed_added,
+                "duplicates": feed_duplicates, "error": feed_error,
+                "pages_fetched": len(page_urls), "page_urls": page_urls,
+                "stop_reason": stop_reason,
             })
         connection.commit()
     return {

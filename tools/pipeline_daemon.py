@@ -757,7 +757,10 @@ def maintain_ready_buffer(
             refill_delay = min(60, max(5, args.poll_seconds))
             if available_topics < args.news_watermark and time.monotonic() >= next_news_refill_at:
                 feeds = configured_feeds(database) if args.dynamic_feeds else args.feeds
-                report = ingest_report(database, feeds, args.feed_timeout)
+                report = ingest_report(
+                    database, feeds, args.feed_timeout,
+                    target_new=max(1, args.news_watermark - available_topics),
+                )
                 added = int(report["added"])
                 errors = list(report["errors"])
                 available_topics = count_new_topics(database)
@@ -916,7 +919,12 @@ def cycle(args: argparse.Namespace, store: SchedulerStore | None = None) -> tupl
     args.worker_image = os.environ.get("CC_CLAUDE_DOCKER_IMAGE", args.worker_image).strip() or args.worker_image
     if store:
         store.heartbeat(phase="news", batch="", detail="正在抓取新闻主题")
-    added, errors = ingest(database, feeds, args.feed_timeout)
+    report = ingest_report(
+        database, feeds, args.feed_timeout,
+        target_new=max(1, args.news_watermark - count_new_topics(database)),
+    )
+    added = int(report["added"])
+    errors = list(report["errors"])
     print(f"news: added={added} feed_errors={len(errors)}", flush=True)
     for error in errors:
         print(f"news warning: {error}", file=sys.stderr, flush=True)
