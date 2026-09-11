@@ -747,10 +747,14 @@ class Pipeline:
                 "只依据匹配的原始 Claude JSONL、SQLite、初始快照、Git diff 和真实产物评分；"
                 "为每个有效轮次生成临时 JSON 并使用 collect_record.py --from-json 写入 SQLite。"
                 "28 个交付字段必须完整记录，其中当前对话轮次排序使用原始 JSONL 中该会话的真实轮次顺序；"
-                "五项评分描述和非空的其他问题必须使用自然中文书面语，"
+                "功能成功结论必须由目标轮次结束前写入原始 JSONL 的真实测试输出、实际服务交互或其他运行证据支撑，"
+                "不能只凭静态代码阅读、文件存在或最终回复判定；纯后端题不要求浏览器测试。"
+                "测试或实跑失败仍须生成交付记录，如实说明失败行为和影响并降低对应维度。"
+                "五项评分描述必须各自保持单段、至少 45 个汉字且不超过 420 个字符；五项描述和非空的其他问题必须使用自然中文书面语，"
                 "直接写文件、函数、命令、报错、测试结果、明确需求或原始轨迹动作等可核验证据，"
                 "不得出现评价者自述、评分质检、模型表现、生成过程、固定标签、套话开头或统一句式。"
-                "不得修改题目代码、轨迹或仓库，不得编造 SessionID、PromptID、评分证据。完成后不要执行交付质检或导出。"
+                "不得修改题目代码、轨迹或仓库，不得编造 SessionID、PromptID、评分证据。"
+                "完成生产后停止，保持交付质检和最终复核字段未通过或为空，不得执行交付质检或导出。"
             )
             returncode = self.codex(prompt)
             if returncode:
@@ -804,7 +808,7 @@ class Pipeline:
 
     def qc_export_stage(self) -> None:
         assert self.trajectory_search_root is not None
-        self.log("阶段 4/4：Codex CLI 执行交付质检并导出 Excel")
+        self.log("阶段 4/4：Codex CLI 执行交付质检，完成后进入人工或 Codex 逐维复核")
         with closing(self.db()) as connection:
             question_ids = [
                 int(row["question_id"]) for row in connection.execute(
@@ -822,33 +826,30 @@ class Pipeline:
         for question_id in question_ids:
             self.item(question_id, status="finalizing")
         root = self.trajectory_search_root
-        with closing(self.db()) as connection:
-            batch_folder = Path(connection.execute(
-                "SELECT folder_path FROM batches WHERE name=?", (self.batch,)
-            ).fetchone()[0])
-        existing_workbooks = {path.resolve() for path in batch_folder.glob("CC_Codex*.xlsx")}
-        existing_trajectories = {path.resolve() for path in batch_folder.glob("轨迹_*.jsonl")}
         prompt = (
             f"使用 cc-usr-delivery-qc 处理批次 {self.batch} 中第 {selection} 题的交付记录。读取项目规范.md、"
             ".agents/skills/cc-usr-delivery-qc/SKILL.md、references/delivery-qc-checklist.md 以及 producer 的记录合同和评分规则，执行 validate_records.py，依据原始 JSONL、SQLite、"
             f"初始快照和实际产物修正所有有证据支持的不合规字段；本批次原始 JSONL 根目录是 {root}。"
+                "以 production.sqlite3 中已经生产的记录为质检对象，不得重新生产或重写整批。"
+                "所有功能成功结论必须有目标轮次结束前保存在原始 JSONL 的真实测试输出、实际服务交互或其他运行证据，"
+                "不能只凭静态阅读、文件存在或最终回复通过；纯后端题不要求浏览器测试。"
+                "测试或实跑失败不能丢弃记录，必须确认描述写明失败行为和影响，并降低相应维度。"
                 "遇到任何错误、警告、缺失字段或证据冲突都必须立即依据权威来源修正并重新验证；"
                 "只有连续复检得到零错误零警告后才执行 --finalize，不能把问题留给导出或用户手工处理。"
-            "逐项复核五项评分描述和非空的其他问题是否为自然中文书面语、是否各自引用可核验证据，"
+            "逐项复核五项评分描述是否各自为单段、至少 45 个汉字且不超过 420 个字符，"
+            "并检查五项描述和非空的其他问题是否为自然中文书面语、是否各自引用可核验证据，"
             "并拒绝评价者自述、评分质检、模型表现、生成过程、固定标签、套话开头和机械重复句式。"
             "无法从证据恢复的字段必须保持未通过，不得猜测或修改目标模型产物。"
-            f"全部通过后再使用 cc-usr-excel-exporter 导出批次 {self.batch} 的第 {selection} 题，"
-            ".agents/skills/cc-usr-delivery-qc/scripts/validate_records.py 和 "
-            ".agents/skills/cc-usr-excel-exporter/scripts/export_xlsx.py 都必须显式使用 "
-            f"--select {selection}；export_xlsx.py 还必须使用 --claude-root {root}，原始 JSONL 必须逐字节复制。"
+            f"validate_records.py 必须显式使用 --select {selection}。"
+            "质检通过后停止，记录必须先由人工或 Codex 严格逐维复核，不得直接导出 Excel 或提交 SOLO2。"
         )
         if self.codex(prompt) != 0:
             for question_id in question_ids:
                 self.item(
-                    question_id, status="failed", error="交付质检或 Excel 导出失败",
+                    question_id, status="failed", error="交付质检失败",
                     finished_at=timestamp(),
                 )
-            raise RuntimeError("交付质检或 Excel 导出失败")
+            raise RuntimeError("交付质检失败")
         with closing(self.db()) as connection:
             record_state = connection.execute(
                 "SELECT COUNT(*) AS total, "
@@ -858,23 +859,17 @@ class Pipeline:
             ).fetchone()
         total_records = int(record_state["total"] or 0)
         passed_records = int(record_state["passed"] or 0)
-        new_workbooks = {
-            path.resolve() for path in batch_folder.glob("CC_Codex*.xlsx")
-        } - existing_workbooks
-        new_trajectories = {
-            path.resolve() for path in batch_folder.glob("轨迹_*.jsonl")
-        } - existing_trajectories
-        if not total_records or passed_records != total_records or not new_workbooks or not new_trajectories:
+        if not total_records or passed_records != total_records:
             error = (
-                f"交付后置检查失败：记录 {passed_records}/{total_records} 通过，"
-                f"新增 Excel {len(new_workbooks)} 个，新增轨迹 {len(new_trajectories)} 个"
+                f"交付后置检查失败：记录 {passed_records}/{total_records} 通过"
             )
             for question_id in question_ids:
                 self.item(question_id, status="failed", error=error, finished_at=timestamp())
             raise RuntimeError(error)
         finished = timestamp()
         for question_id in question_ids:
-            self.item(question_id, status="completed", finished_at=finished)
+            self.item(question_id, status="awaiting_review", finished_at=finished)
+        self.log(f"交付质检通过 {passed_records}/{total_records} 条，等待人工或 Codex 逐维复核")
 
     @staticmethod
     def question_qc_passed(row: sqlite3.Row) -> bool:
@@ -1023,7 +1018,7 @@ class Pipeline:
             elif any(progress[int(row["id"])]["record_count"] == 0 for row in rows):
                 resume_stage = "交付生产"
             else:
-                resume_stage = "交付质检与导出"
+                resume_stage = "交付质检"
             self.log(f"重试任务：原任务 #{retry_of_job_id}，从{resume_stage}阶段继续")
         for row in rows:
             if int(row["id"]) not in qc_pending_ids:
@@ -1061,18 +1056,14 @@ class Pipeline:
             self.log("阶段 3/4：交付记录已经生成，跳过")
         self.ensure_active()
         progress = self.question_progress(rows)
-        batch_folder = Path(batch["folder_path"])
         delivery_complete = bool(rows) and all(
             progress[int(row["id"])]["delivery_passed"] for row in rows
         )
-        exported = bool(list(batch_folder.glob("CC_Codex*.xlsx"))) and bool(
-            list(batch_folder.glob("轨迹_*.jsonl"))
-        )
-        if retry_of_job_id is not None and delivery_complete and exported:
-            self.log("阶段 4/4：交付质检、Excel 和原始轨迹均已存在，跳过")
+        if retry_of_job_id is not None and delivery_complete:
+            self.log("阶段 4/4：交付质检已有有效通过记录，等待人工或 Codex 逐维复核")
             finished = timestamp()
             for row in rows:
-                self.item(int(row["id"]), status="completed", error="", finished_at=finished)
+                self.item(int(row["id"]), status="awaiting_review", error="", finished_at=finished)
         else:
             self.qc_export_stage()
 

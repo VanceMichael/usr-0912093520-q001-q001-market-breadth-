@@ -184,7 +184,11 @@ class TaskMaintenanceTests(unittest.TestCase):
                         record[name] = 1
                     elif name.endswith("_score"):
                         record[name] = 3
-                    elif name in {"human_authored", "human_qc_approved", "delivery_qc_passed", "is_continuation", "continuation_count"}:
+                    elif name in {
+                        "human_authored", "human_qc_approved", "delivery_qc_passed",
+                        "evidence_gate_passed", "history_gate_passed", "is_continuation",
+                        "continuation_count",
+                    }:
                         record[name] = 0
                     elif name == "record_id":
                         record[name] = "0911-001-T01"

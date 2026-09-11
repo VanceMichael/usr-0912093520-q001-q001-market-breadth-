@@ -18,6 +18,7 @@
         <button class="nav-item" data-view="author"><i data-lucide="file-plus-2"></i><span>生成题目</span></button>
         <button class="nav-item active" data-view="production"><i data-lucide="list-checks"></i><span>生产批次</span></button>
         <button class="nav-item" data-view="records"><i data-lucide="database"></i><span>交付记录</span></button>
+        <button class="nav-item" data-view="reviews"><i data-lucide="scan-eye"></i><span>交付复核</span></button>
         <button class="nav-item" data-view="exports"><i data-lucide="file-spreadsheet"></i><span>导出中心</span></button>
         <button class="nav-item" data-view="scheduler"><i data-lucide="activity"></i><span>调度器</span></button>
         <button class="nav-item" data-view="vps"><i data-lucide="server"></i><span>VPS 管理</span></button>
@@ -105,7 +106,7 @@
       </section>
 
       <section class="pipeline-jobs-panel" id="pipeline-jobs-panel" aria-labelledby="pipeline-jobs-title">
-        <div class="section-heading"><div><h2 id="pipeline-jobs-title">自动流水线</h2><p>按配置并行执行 Codex 质检、Claude 跑题、交付生产、交付质检和 Excel 导出。</p></div><button class="button secondary" type="button" id="pipeline-jobs-refresh"><i data-lucide="refresh-cw"></i>刷新任务</button></div>
+        <div class="section-heading"><div><h2 id="pipeline-jobs-title">自动流水线</h2><p>查看每次运行的逐题阶段、错误和日志。</p></div><div class="pipeline-history-controls"><label><span>任务记录</span><select id="pipeline-job-filter"><option value="all">最近全部任务</option></select></label><button class="button secondary" type="button" id="pipeline-jobs-refresh"><i data-lucide="refresh-cw"></i>刷新任务</button></div></div>
         <div id="pipeline-job-list" class="pipeline-job-list"><div class="empty-state"><strong>暂无自动流水线任务</strong></div></div>
       </section>
 
@@ -163,6 +164,19 @@
           </div>
           <div class="file-list" id="solo2-history"></div>
         </section>
+      </section>
+
+      <section class="review-view" id="review-view" hidden>
+        <div class="section-heading review-heading">
+          <div><h2>五维交付复核</h2><p>人工逐项确认，或由 Codex 结合全部证据执行同等严格的五维复核。</p></div>
+          <div class="review-heading-actions">
+            <label class="reviewer-select"><span>当前审核人</span><select id="review-reviewer" aria-label="选择审核人"></select></label>
+            <button class="button secondary" type="button" id="review-history-sync"><i data-lucide="refresh-ccw"></i>同步多节点历史</button>
+            <button class="icon-button" type="button" id="review-refresh" title="刷新复核队列" aria-label="刷新复核队列"><i data-lucide="refresh-cw"></i></button>
+          </div>
+        </div>
+        <div class="review-summary" id="review-summary"></div>
+        <div class="review-list" id="review-list"><div class="empty-state"><strong>正在读取待复核记录</strong></div></div>
       </section>
 
       <section class="vps-view" id="vps-view" hidden>

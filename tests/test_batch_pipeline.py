@@ -82,6 +82,7 @@ class BatchPipelineTests(unittest.TestCase):
                     values.append(3)
                 elif name in {
                     "human_authored", "human_qc_approved", "delivery_qc_passed",
+                    "evidence_gate_passed", "history_gate_passed",
                     "is_continuation", "continuation_count", "reset_count",
                 }:
                     values.append(0)
@@ -417,6 +418,24 @@ class BatchPipelineTests(unittest.TestCase):
         )
         self.assertIn("User Prompt 使用了“从零构建一套”式固定开头", issues)
         self.assertIn("User Prompt 不能把背景、功能、技术、验收等标签串成模板", issues)
+
+    def test_prompt_style_rejects_todo_literal_even_when_negated(self):
+        issues = prompt_style_issues(
+            "县域培训管理员需要核对课程学分，请补全可启动的后端代码和自动化测试，"
+            "不能用接口草案、TODO 或后续计划代替实际实现。"
+        )
+        self.assertIn(
+            "User Prompt 不得出现易被常见应用题库误判的 TODO 字面词，请用中文描述完整交付要求",
+            issues,
+        )
+
+    def test_prompt_style_accepts_natural_chinese_completion_boundary(self):
+        issues = prompt_style_issues(
+            "县域培训管理员需要核对教师课程学分，请补全仓库中的后端代码并确保服务可以启动，"
+            "所有要求都须落实为可执行代码，不能只说明思路或把工作留到以后；"
+            "执行自动化测试确认重复签到不会覆盖原记录。"
+        )
+        self.assertEqual(issues, [])
 
     def test_prompt_style_rejects_scenario_checklist_and_no_docker_tail(self):
         issues = prompt_style_issues(

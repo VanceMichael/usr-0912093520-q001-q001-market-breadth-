@@ -24,9 +24,12 @@ from tools.delivery_records import (  # noqa: E402
     load_records,
     validate_records,
 )
+from tools.delivery_quality import history_matches, verify_evidence_sources  # noqa: E402
 
 
-FIXABLE_FIELDS = frozenset(EXPORT_KEYS) - {"turn_no", "delivery_qc_note"}
+FIXABLE_FIELDS = (
+    frozenset(EXPORT_KEYS) - {"turn_no", "delivery_qc_note"}
+) | {"evidence_ledger", "requirement_coverage"}
 SKILL_PATH_RE = re.compile(
     r"(?i)(?:\.agents[/\\]+skills[/\\]+|\.claude[/\\]+skills[/\\]+|"
     r"\.codex[/\\]+skills[/\\]+|[/\\]skills[/\\][^\s'\"`]+[/\\]SKILL\.md)"
@@ -482,6 +485,7 @@ def build_report(
         source_query += " AND q.question_no IN (" + ",".join("?" for _ in selected_numbers) + ")"
         source_parameters.extend(sorted(selected_numbers))
     source_rows = connection.execute(source_query, source_parameters).fetchall()
+    records_by_id = {str(record["record_id"]): record for record in records}
     for row in source_rows:
         if row["source_run_id"] is None:
             errors.append(
@@ -516,6 +520,20 @@ def build_report(
                         f"{row['record_id']}: first-turn {field} does not match the question"
                     )
         errors.extend(trajectory_integrity_issues(dict(row), row))
+        record = records_by_id[str(row["record_id"])]
+        trajectory_root, _recursive = _trajectory_root(row)
+        errors.extend(verify_evidence_sources(
+            record,
+            question_folder=Path(str(row["question_folder"])),
+            trajectory_root=trajectory_root,
+        ))
+        for match in history_matches(
+            connection, record, exclude_record_id=str(row["record_id"])
+        ):
+            errors.append(
+                f"{row['record_id']}: {match['dimension']} 描述与 "
+                f"{match['source_node']}的 {match['record_id']} 过于相似"
+            )
     return {
         "checked_records": len(records),
         "passed": not errors and not warnings,
@@ -581,6 +599,22 @@ def apply_fixes(
         effective = {
             key: value for key, value in changes.items() if current.get(key) != value
         }
+        for json_field in ("evidence_ledger", "requirement_coverage"):
+            if json_field in effective:
+                if not isinstance(effective[json_field], list):
+                    raise ValueError(f"{record_id}: {json_field} 必须是数组")
+                effective[json_field] = json.dumps(effective[json_field], ensure_ascii=False)
+        judgment_fields = {
+            f"{prefix}_{suffix}"
+            for prefix in ("delivery", "instruction", "planning", "reasoning", "execution")
+            for suffix in ("score", "description")
+        }
+        if judgment_fields.intersection(effective) and not {
+            "evidence_ledger", "requirement_coverage"
+        }.issubset(effective):
+            raise ValueError(
+                f"{record_id}: 修改分数或描述时必须同步提交证据账本和需求覆盖表"
+            )
         if not effective:
             continue
         try:
@@ -602,6 +636,15 @@ def apply_fixes(
             "delivery_qc_passed=0",
             "delivery_qc_note=''",
             "delivery_qc_checked_at=''",
+            "evidence_gate_passed=0",
+            "evidence_checked_at=''",
+            "history_gate_passed=0",
+            "history_checked_at=''",
+            "human_qc_approved=0",
+            "human_qc_reviewer=''",
+            "human_qc_approved_at=''",
+            "human_qc_note=''",
+            "review_method=''",
             "delivery_qc_changes=?",
         ])
         connection.execute(
@@ -649,8 +692,9 @@ def finalize(
     question_marks = ", ".join("?" for _ in records)
     connection.execute(
         f"UPDATE records SET delivery_qc_passed=1, delivery_qc_note='质检通过', "
-        f"delivery_qc_checked_at=? WHERE record_id IN ({question_marks})",
-        [timestamp, *(record["record_id"] for record in records)],
+        f"delivery_qc_checked_at=?,evidence_gate_passed=1,evidence_checked_at=?,"
+        f"history_gate_passed=1,history_checked_at=? WHERE record_id IN ({question_marks})",
+        [timestamp, timestamp, timestamp, *(record["record_id"] for record in records)],
     )
     connection.commit()
     return len(records), report

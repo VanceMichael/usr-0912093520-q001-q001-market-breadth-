@@ -11,6 +11,7 @@ Produce a clean final workbook from `production.sqlite3` and place the matched o
 
 - Read `项目规范.md` and [references/excel-mapping.md](references/excel-mapping.md).
 - Every exported record must already have `delivery_qc_passed=1` and the note `质检通过`.
+- Every exported record must have passed the final five-dimension gate through either a real human review (`review_method=human`) or the isolated strict Codex review (`review_method=codex`). Do not infer or overwrite that provenance.
 - Do not analyze or transform trajectories, fill missing fields, repair records, or alter scores and descriptions. Copy the matched JSONL files byte for byte.
 
 ## Export

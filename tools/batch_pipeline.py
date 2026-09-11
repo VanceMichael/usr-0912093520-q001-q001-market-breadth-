@@ -19,7 +19,7 @@ from datetime import datetime
 from pathlib import Path
 
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 17
 DEFAULT_NEWS_FEEDS = (
     "https://channel.chinanews.com.cn/cns/cl/gn-js.shtml",
     "https://channel.chinanews.com.cn/cns/cl/gn-kjww.shtml",
@@ -74,6 +74,10 @@ PROMPT_LABEL_RE = re.compile(
 )
 PROMPT_CANNED_OPENING_RE = re.compile(
     r"^\s*(?:请(?:你)?\s*)?从零(?:开始)?(?:构建|实现|开发|搭建|创建)一套"
+)
+PROMPT_RISKY_CATEGORY_LITERAL_RE = re.compile(
+    r"(?<![A-Za-z0-9_])TODOs?(?![A-Za-z0-9_])",
+    re.IGNORECASE,
 )
 PRIMARY_TECH_ALIASES = {
     "golang": "go", "go": "go", "python": "python",
@@ -249,6 +253,14 @@ CREATE TABLE IF NOT EXISTS records (
     human_qc_approved INTEGER NOT NULL DEFAULT 0 CHECK (human_qc_approved IN (0, 1)),
     human_qc_reviewer TEXT NOT NULL DEFAULT '',
     human_qc_approved_at TEXT NOT NULL DEFAULT '',
+    human_qc_note TEXT NOT NULL DEFAULT '',
+    review_method TEXT NOT NULL DEFAULT '',
+    evidence_ledger TEXT NOT NULL DEFAULT '[]',
+    requirement_coverage TEXT NOT NULL DEFAULT '[]',
+    evidence_gate_passed INTEGER NOT NULL DEFAULT 0 CHECK (evidence_gate_passed IN (0, 1)),
+    evidence_checked_at TEXT NOT NULL DEFAULT '',
+    history_gate_passed INTEGER NOT NULL DEFAULT 0 CHECK (history_gate_passed IN (0, 1)),
+    history_checked_at TEXT NOT NULL DEFAULT '',
     delivery_qc_passed INTEGER NOT NULL DEFAULT 0 CHECK (delivery_qc_passed IN (0, 1)),
     delivery_qc_note TEXT NOT NULL DEFAULT '',
     delivery_qc_checked_at TEXT NOT NULL DEFAULT '',
@@ -263,6 +275,39 @@ CREATE TABLE IF NOT EXISTS records (
 
 CREATE INDEX IF NOT EXISTS idx_questions_batch ON questions(batch_id, question_no);
 CREATE INDEX IF NOT EXISTS idx_records_question ON records(question_id, turn_no);
+
+CREATE TABLE IF NOT EXISTS record_dimension_reviews (
+    record_id TEXT NOT NULL REFERENCES records(record_id) ON DELETE CASCADE,
+    dimension TEXT NOT NULL CHECK (dimension IN ('delivery','instruction','planning','reasoning','execution')),
+    approved INTEGER NOT NULL DEFAULT 0 CHECK (approved IN (0, 1)),
+    reviewer TEXT NOT NULL,
+    reviewed_at TEXT NOT NULL,
+    PRIMARY KEY (record_id, dimension)
+);
+
+CREATE TABLE IF NOT EXISTS record_review_events (
+    id INTEGER PRIMARY KEY,
+    record_id TEXT NOT NULL REFERENCES records(record_id) ON DELETE CASCADE,
+    action TEXT NOT NULL,
+    reviewer TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    details TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_record_review_events_record
+    ON record_review_events(record_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS description_history (
+    id INTEGER PRIMARY KEY,
+    source_node TEXT NOT NULL,
+    source_record_id TEXT NOT NULL,
+    dimension TEXT NOT NULL CHECK (dimension IN ('delivery','instruction','planning','reasoning','execution')),
+    description TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    approved_at TEXT NOT NULL,
+    synced_at TEXT NOT NULL,
+    UNIQUE (source_node, source_record_id, dimension)
+);
 
 CREATE TABLE IF NOT EXISTS mother_library (
     id INTEGER PRIMARY KEY,
@@ -397,7 +442,9 @@ RECORD_COLUMNS = (
     "reasoning_score", "reasoning_description", "execution_score",
     "execution_description", "other_issues", "submitter", "submitted_at",
     "parent_record", "turn_completed_at", "human_authored", "human_qc_approved",
-    "human_qc_reviewer", "human_qc_approved_at", "delivery_qc_passed",
+    "human_qc_reviewer", "human_qc_approved_at", "human_qc_note", "review_method",
+    "evidence_ledger", "requirement_coverage", "evidence_gate_passed",
+    "evidence_checked_at", "history_gate_passed", "history_checked_at", "delivery_qc_passed",
     "delivery_qc_note", "delivery_qc_checked_at", "delivery_qc_changes",
     "raw_user_prompt", "raw_turn_id", "is_continuation", "continuation_count",
     "created_at",
@@ -457,6 +504,14 @@ def migrate_records_continuation_identity(connection: sqlite3.Connection) -> Non
                 human_qc_approved INTEGER NOT NULL DEFAULT 0 CHECK (human_qc_approved IN (0, 1)),
                 human_qc_reviewer TEXT NOT NULL DEFAULT '',
                 human_qc_approved_at TEXT NOT NULL DEFAULT '',
+                human_qc_note TEXT NOT NULL DEFAULT '',
+                review_method TEXT NOT NULL DEFAULT '',
+                evidence_ledger TEXT NOT NULL DEFAULT '[]',
+                requirement_coverage TEXT NOT NULL DEFAULT '[]',
+                evidence_gate_passed INTEGER NOT NULL DEFAULT 0 CHECK (evidence_gate_passed IN (0, 1)),
+                evidence_checked_at TEXT NOT NULL DEFAULT '',
+                history_gate_passed INTEGER NOT NULL DEFAULT 0 CHECK (history_gate_passed IN (0, 1)),
+                history_checked_at TEXT NOT NULL DEFAULT '',
                 delivery_qc_passed INTEGER NOT NULL DEFAULT 0 CHECK (delivery_qc_passed IN (0, 1)),
                 delivery_qc_note TEXT NOT NULL DEFAULT '',
                 delivery_qc_checked_at TEXT NOT NULL DEFAULT '',
@@ -669,10 +724,22 @@ def connect(database: Path) -> sqlite3.Connection:
         "raw_turn_id": "TEXT NOT NULL DEFAULT ''",
         "is_continuation": "INTEGER NOT NULL DEFAULT 0 CHECK (is_continuation IN (0, 1))",
         "continuation_count": "INTEGER NOT NULL DEFAULT 0 CHECK (continuation_count >= 0)",
+        "human_qc_note": "TEXT NOT NULL DEFAULT ''",
+        "review_method": "TEXT NOT NULL DEFAULT ''",
+        "evidence_ledger": "TEXT NOT NULL DEFAULT '[]'",
+        "requirement_coverage": "TEXT NOT NULL DEFAULT '[]'",
+        "evidence_gate_passed": "INTEGER NOT NULL DEFAULT 0 CHECK (evidence_gate_passed IN (0, 1))",
+        "evidence_checked_at": "TEXT NOT NULL DEFAULT ''",
+        "history_gate_passed": "INTEGER NOT NULL DEFAULT 0 CHECK (history_gate_passed IN (0, 1))",
+        "history_checked_at": "TEXT NOT NULL DEFAULT ''",
     }
     for name, definition in record_migrations.items():
         if name not in record_columns:
             connection.execute(f"ALTER TABLE records ADD COLUMN {name} {definition}")
+    connection.execute(
+        "UPDATE records SET review_method='human' "
+        "WHERE human_qc_approved=1 AND review_method=''"
+    )
     connection.execute(
         "UPDATE records SET raw_user_prompt=user_prompt WHERE raw_user_prompt=''"
     )
@@ -882,6 +949,8 @@ def prompt_style_issues(prompt: str) -> list[str]:
         re.IGNORECASE,
     ):
         issues.append("User Prompt 不能使用可由中文直接表达的英文评价或衔接词")
+    if PROMPT_RISKY_CATEGORY_LITERAL_RE.search(stripped):
+        issues.append("User Prompt 不得出现易被常见应用题库误判的 TODO 字面词，请用中文描述完整交付要求")
     for sentence in re.split(r"[。！？!?\n]+", stripped):
         if (
             sentence.count("、") >= 2

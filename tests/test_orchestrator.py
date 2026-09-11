@@ -559,7 +559,10 @@ class OrchestratorTest(unittest.TestCase):
                     "planning_description": "步骤清楚", "reasoning_score": 5, "reasoning_description": "推理完整",
                     "execution_score": 5, "execution_description": "执行完成", "submitter": "测试",
                     "submitted_at": "now", "turn_completed_at": "now", "delivery_qc_passed": 1,
-                    "delivery_qc_note": "质检通过", "created_at": "now",
+                    "delivery_qc_note": "质检通过", "human_qc_approved": 1,
+                    "human_qc_reviewer": "gaoyong", "human_qc_approved_at": "now",
+                    "review_method": "human", "evidence_gate_passed": 1,
+                    "history_gate_passed": 1, "created_at": "now",
                 }
                 columns = ",".join(values)
                 connection.execute(

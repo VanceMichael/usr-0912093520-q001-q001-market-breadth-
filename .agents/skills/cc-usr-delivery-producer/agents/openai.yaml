@@ -1,7 +1,7 @@
 interface:
   display_name: "用户满意度交付生产"
   short_description: "分析 Claude 轨迹与产物，逐轮评分并写入 SQLite"
-  default_prompt: "使用 $cc-usr-delivery-producer 分析指定批次已完成的 Claude Code 运行，提取会话 ID，逐轮评分，以专业程序员的自然语言写清具体依据后入库。"
+  default_prompt: "使用 $cc-usr-delivery-producer 分析指定批次已完成的 Claude Code 运行，以目标轮次内的真实运行证据逐轮评分并写入 SQLite；生产完成后停止，不要执行交付质检或导出。"
 
 policy:
   allow_implicit_invocation: true

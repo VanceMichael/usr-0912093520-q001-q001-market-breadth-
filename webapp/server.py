@@ -83,6 +83,15 @@ from tools.text_encoding import read_portable_text  # noqa: E402
 from tools.solo2_client import Solo2Client, Solo2Error  # noqa: E402
 from tools.solo2_service import submission_overview, submit_records  # noqa: E402
 from tools.task_maintenance import begin_takeover, finish_takeover, reset_question  # noqa: E402
+from tools.human_review import (  # noqa: E402
+    approve_codex_record,
+    approve_record as approve_delivery_record,
+    approved_history,
+    build_codex_review_dossier,
+    import_history,
+    reject_record as reject_delivery_record,
+    review_queue,
+)
 
 AUTHOR_JOB_SCHEMA = """
 CREATE TABLE IF NOT EXISTS author_jobs (
@@ -177,6 +186,92 @@ def json_value(raw: object, fallback: object) -> object:
     except json.JSONDecodeError:
         return fallback
     return parsed
+
+
+def parse_codex_review(raw: str) -> dict:
+    """Parse and validate the machine-readable final Codex review."""
+    text = raw.strip()
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if len(lines) >= 3 and lines[-1].strip() == "```":
+            text = "\n".join(lines[1:-1])
+            if text.lstrip().startswith("json"):
+                text = text.lstrip()[4:].lstrip("\r\n")
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Codex 复核结果不是有效 JSON：{exc}") from exc
+    if not isinstance(value, dict):
+        raise ValueError("Codex 复核结果必须是 JSON 对象")
+    if value.get("decision") not in {"approved", "rejected"}:
+        raise ValueError("Codex 复核结论必须是 approved 或 rejected")
+    dimensions = value.get("dimensions")
+    expected = {"delivery", "instruction", "planning", "reasoning", "execution"}
+    if not isinstance(dimensions, dict) or set(dimensions) != expected:
+        raise ValueError("Codex 复核结果必须完整包含五个维度")
+    for name, item in dimensions.items():
+        if not isinstance(item, dict) or not isinstance(item.get("approved"), bool):
+            raise ValueError(f"Codex 复核维度 {name} 缺少布尔结论")
+        if len(str(item.get("reason") or "").strip()) < 8:
+            raise ValueError(f"Codex 复核维度 {name} 缺少具体依据")
+    if len(str(value.get("summary") or "").strip()) < 8:
+        raise ValueError("Codex 复核缺少总结")
+    if not isinstance(value.get("issues", []), list):
+        raise ValueError("Codex 复核 issues 必须是数组")
+    return value
+
+
+def codex_review_report(review: dict) -> str:
+    labels = {
+        "delivery": "交付完整性", "instruction": "指令遵循", "planning": "任务规划",
+        "reasoning": "推理能力", "execution": "执行能力",
+    }
+    lines = [
+        f"结论：{'通过' if review['decision'] == 'approved' else '不通过'}",
+        f"总结：{str(review['summary']).strip()}",
+    ]
+    for name, label in labels.items():
+        item = review["dimensions"][name]
+        lines.append(
+            f"{label}：{'通过' if item['approved'] else '不通过'}。{str(item['reason']).strip()}"
+        )
+    issues = [str(item).strip() for item in review.get("issues", []) if str(item).strip()]
+    if issues:
+        lines.append("阻断问题：" + "；".join(issues))
+    return "\n".join(lines)
+
+
+def codex_review_schema() -> dict:
+    """Return the strict response contract used by the isolated Codex review."""
+    dimension = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "approved": {"type": "boolean"},
+            "reason": {"type": "string", "minLength": 8},
+        },
+        "required": ["approved", "reason"],
+    }
+    names = ("delivery", "instruction", "planning", "reasoning", "execution")
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "decision": {"type": "string", "enum": ["approved", "rejected"]},
+            "summary": {"type": "string", "minLength": 8},
+            "dimensions": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {name: dimension for name in names},
+                "required": list(names),
+            },
+            "issues": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+            },
+        },
+        "required": ["decision", "summary", "dimensions", "issues"],
+    }
 
 
 def runtime_info() -> dict[str, str]:
@@ -701,18 +796,19 @@ class ConsoleData:
                 "p.model_mode,"
                 "substr(p.output,-30000) AS output,length(p.output) AS output_length,"
                 "p.last_message,p.error,p.pid,p.retry_of_job_id,p.created_at,p.started_at,p.finished_at "
-                "FROM pipeline_jobs p WHERE p.id=(SELECT MAX(latest.id) FROM pipeline_jobs latest "
-                "WHERE latest.batch_name=p.batch_name) ORDER BY p.created_at DESC,p.id DESC LIMIT ?",
+                "FROM pipeline_jobs p ORDER BY p.created_at DESC,p.id DESC LIMIT ?",
                 (max(1, min(limit, 50)),),
             ).fetchall()
             job_ids = [int(job["id"]) for job in jobs]
             if job_ids:
                 placeholders = ",".join("?" for _ in job_ids)
                 items = connection.execute(
-                    "SELECT id,pipeline_job_id,question_id,question_no,status,error,"
-                    "heartbeat_at,activity_at,health_status,health_detail,started_at,finished_at "
-                    f"FROM pipeline_items WHERE pipeline_job_id IN ({placeholders}) "
-                    "ORDER BY pipeline_job_id DESC,question_no",
+                    "SELECT pi.id,pi.pipeline_job_id,pi.question_id,pi.question_no,pi.status,pi.error,"
+                    "pi.heartbeat_at,pi.activity_at,pi.health_status,pi.health_detail,pi.started_at,pi.finished_at,"
+                    "q.task_id,q.title,(SELECT COUNT(*) FROM runs r WHERE r.question_id=pi.question_id) AS model_attempts "
+                    "FROM pipeline_items pi JOIN questions q ON q.id=pi.question_id "
+                    f"WHERE pi.pipeline_job_id IN ({placeholders}) "
+                    "ORDER BY pi.pipeline_job_id DESC,pi.question_no",
                     job_ids,
                 ).fetchall()
             else:
@@ -720,12 +816,16 @@ class ConsoleData:
         by_job: dict[int, list[dict]] = {}
         for item in items:
             by_job.setdefault(int(item["pipeline_job_id"]), []).append(dict(item))
+        latest_by_batch: dict[str, int] = {}
+        for job in jobs:
+            latest_by_batch.setdefault(str(job["batch_name"]), int(job["id"]))
         return [
             {
                 **dict(job),
                 "items": by_job.get(int(job["id"]), []),
                 "can_retry": (
                     job["status"] in {"failed", "interrupted"}
+                    and latest_by_batch.get(str(job["batch_name"])) == int(job["id"])
                 ),
             }
             for job in jobs
@@ -2394,12 +2494,19 @@ class ConsoleData:
                 "(SELECT COUNT(*) FROM records r WHERE r.question_id=q.id) AS record_count, "
                 "(SELECT COUNT(*) FROM records r WHERE r.question_id=q.id "
                 " AND r.delivery_qc_passed=1) AS passed_record_count, "
+                "(SELECT COUNT(*) FROM records r WHERE r.question_id=q.id "
+                " AND r.human_qc_approved=1 AND r.evidence_gate_passed=1 "
+                " AND r.history_gate_passed=1) AS human_approved_record_count, "
                 "(SELECT AVG((r.delivery_score+r.instruction_score+r.planning_score+"
                 " r.reasoning_score+r.execution_score)/5.0) FROM records r "
                 " WHERE r.question_id=q.id) AS average_score "
                 ",(SELECT COUNT(*) FROM records r JOIN solo2_submissions s "
                 " ON s.record_id=r.record_id WHERE r.question_id=q.id "
-                " AND s.status='succeeded') AS solo2_submitted_count "
+                " AND s.status='succeeded') AS solo2_submitted_count, "
+                "EXISTS(SELECT 1 FROM pipeline_items pi JOIN pipeline_jobs pj ON pj.id=pi.pipeline_job_id "
+                " WHERE pi.question_id=q.id AND pj.status IN ('queued','running') "
+                " AND pi.status IN ('queued','qc_running','qc_passed','model_running','model_completed',"
+                "'producing','produced','finalizing','awaiting_review')) AS pipeline_active "
                 "FROM questions q JOIN batches b ON b.id=q.batch_id "
                 "WHERE b.name=? ORDER BY q.question_no",
                 (batch_name,),
@@ -2423,9 +2530,12 @@ class ConsoleData:
                 record_count = int(row["record_count"] or 0)
                 passed_count = int(row["passed_record_count"] or 0)
                 delivery_qc = record_count > 0 and passed_count == record_count
-                exported = delivery_qc and int(row["question_no"]) in exported_numbers
+                human_approved_count = int(row["human_approved_record_count"] or 0)
+                human_qc = record_count > 0 and human_approved_count == record_count
+                exported = human_qc and int(row["question_no"]) in exported_numbers
                 solo2_submitted_count = int(row["solo2_submitted_count"] or 0)
                 solo2_submitted = record_count > 0 and solo2_submitted_count == record_count
+                pipeline_active = bool(row["pipeline_active"])
                 if not question_qc:
                     stage_index, stage_label = 1, "题目待质检"
                 elif not run_complete:
@@ -2433,16 +2543,20 @@ class ConsoleData:
                         stage_index, stage_label = 2, "模型跑题中"
                     elif run_status in {"failed", "timeout"}:
                         stage_index, stage_label = 2, "模型跑题待重试"
+                    elif pipeline_active:
+                        stage_index, stage_label = 2, "已加入流水线"
                     else:
                         stage_index, stage_label = 2, "待模型跑题"
                 elif record_count == 0:
                     stage_index, stage_label = 3, "待交付生产"
                 elif not delivery_qc:
                     stage_index, stage_label = 4, "待交付质检"
+                elif not human_qc:
+                    stage_index, stage_label = 5, "待交付复核"
                 elif not exported:
-                    stage_index, stage_label = 5, "待导出"
+                    stage_index, stage_label = 6, "待导出"
                 else:
-                    stage_index, stage_label = 6, "已交付"
+                    stage_index, stage_label = 7, "已交付"
                 if bool(row["maintenance_mode"]):
                     stage_index, stage_label = 2, "人工接管中"
                 questions.append({
@@ -2470,22 +2584,25 @@ class ConsoleData:
                     "record_count": record_count,
                     "passed_record_count": passed_count,
                     "delivery_qc": delivery_qc,
+                    "human_approved_record_count": human_approved_count,
+                    "human_qc": human_qc,
                     "average_score": round(float(row["average_score"]), 1)
                     if row["average_score"] is not None else None,
                     "exported": exported,
                     "solo2_submitted_count": solo2_submitted_count,
                     "solo2_submitted": solo2_submitted,
+                    "pipeline_active": pipeline_active,
                     "maintenance_mode": bool(row["maintenance_mode"]),
                     "maintenance_note": row["maintenance_note"] or "",
                     "reset_count": int(row["reset_count"] or 0),
                     "stage_index": stage_index,
                     "stage_label": stage_label,
-                    "can_launch": question_qc and row["status"] == "approved" and not run_complete and not bool(row["maintenance_mode"]),
+                    "can_launch": question_qc and row["status"] == "approved" and not run_complete and not pipeline_active and not bool(row["maintenance_mode"]),
                     "can_takeover": run_status in {"running", "failed", "timeout", "interrupted"}
                     and not solo2_submitted and not bool(row["maintenance_mode"]),
                     "can_finish_takeover": bool(row["maintenance_mode"]),
                     "can_reset": run_count > 0 and not solo2_submitted,
-                    "can_solo2_submit": delivery_qc and not solo2_submitted,
+                    "can_solo2_submit": human_qc and not solo2_submitted,
                 })
 
         total = len(questions)
@@ -2494,7 +2611,8 @@ class ConsoleData:
             {"id": 2, "label": "模型跑题", "complete": sum(q["run_status"] == "succeeded" for q in questions)},
             {"id": 3, "label": "交付生产", "complete": sum(q["record_count"] > 0 for q in questions)},
             {"id": 4, "label": "交付质检", "complete": sum(q["delivery_qc"] for q in questions)},
-            {"id": 5, "label": "Excel 交付", "complete": sum(q["exported"] for q in questions)},
+            {"id": 5, "label": "交付复核", "complete": sum(q["human_qc"] for q in questions)},
+            {"id": 6, "label": "Excel 交付", "complete": sum(q["exported"] for q in questions)},
         ]
         for stage in stages:
             stage["current"] = sum(q["stage_index"] == stage["id"] for q in questions)
@@ -2514,7 +2632,7 @@ class ConsoleData:
                 "delivered": sum(q["exported"] for q in questions),
                 "solo2_submitted": sum(q["solo2_submitted"] for q in questions),
                 "qc_passed": sum(q["delivery_qc"] for q in questions),
-                "waiting": sum(q["stage_index"] < 6 for q in questions),
+                "waiting": sum(q["stage_index"] < 7 for q in questions),
             },
         }
 
@@ -2539,6 +2657,8 @@ class ConsoleData:
                 "planning_score, planning_description, reasoning_score, reasoning_description, "
                 "execution_score, execution_description, other_issues, submitted_at, "
                 "delivery_qc_passed, delivery_qc_note, delivery_qc_checked_at,"
+                "human_qc_approved,human_qc_reviewer,human_qc_approved_at,human_qc_note,"
+                "evidence_gate_passed,history_gate_passed,evidence_ledger,requirement_coverage,"
                 "raw_user_prompt,raw_turn_id,is_continuation,continuation_count "
                 "FROM records WHERE question_id=? ORDER BY turn_no",
                 (question_id,),
@@ -2568,6 +2688,169 @@ class ConsoleData:
             "runs": [dict(row) for row in runs],
             "records": [dict(row) for row in records],
         }
+
+    def delivery_reviews(self, batch: object | None = None) -> dict:
+        batch_name = str(batch or "").strip() or None
+        if batch_name and not BATCH_RE.fullmatch(batch_name):
+            raise ValueError("批次名无效")
+        return review_queue(self.database, batch_name)
+
+    def approve_delivery_review(self, body: dict) -> dict:
+        return approve_delivery_record(
+            self.database,
+            str(body.get("record_id") or ""),
+            str(body.get("reviewer") or ""),
+            body.get("confirmations"),
+            str(body.get("note") or ""),
+        )
+
+    def reject_delivery_review(self, body: dict) -> dict:
+        return reject_delivery_record(
+            self.database,
+            str(body.get("record_id") or ""),
+            str(body.get("reviewer") or ""),
+            str(body.get("note") or ""),
+        )
+
+    def sync_description_history(self) -> dict:
+        with closing(self.connect()) as connection:
+            nodes = connection.execute(
+                "SELECT name,base_url FROM vps_nodes WHERE enabled=1 ORDER BY name"
+            ).fetchall()
+        imported = 0
+        failures = []
+        for node in nodes:
+            try:
+                payload, _headers = self._vps_request(dict(node), "/api/reviews/history")
+                parsed = json.loads(payload.decode("utf-8"))
+                result = import_history(
+                    self.database, str(node["name"]), parsed.get("descriptions")
+                )
+                imported += int(result["imported"])
+            except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+                failures.append(f"{node['name']}：{exc}")
+        if failures:
+            raise RuntimeError("部分节点历史同步失败：" + "；".join(failures))
+        return {"ok": True, "imported": imported, "nodes": len(nodes)}
+
+    def create_codex_delivery_review(self, body: dict) -> dict:
+        record_id = str(body.get("record_id") or "").strip()
+        if not record_id:
+            raise ValueError("请选择交付记录")
+        dossier = build_codex_review_dossier(self.database, record_id)
+        with closing(self.connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT r.record_id,r.human_qc_approved FROM records r WHERE r.record_id=?",
+                (record_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("交付记录不存在")
+            if bool(row["human_qc_approved"]):
+                raise ValueError("记录已经完成最终复核；如需重审，请先退回记录")
+            running = connection.execute(
+                "SELECT details FROM record_review_events WHERE record_id=? "
+                "AND action='codex_review_started' ORDER BY id DESC LIMIT 1",
+                (record_id,),
+            ).fetchone()
+            completed = connection.execute(
+                "SELECT id FROM record_review_events WHERE record_id=? "
+                "AND action IN ('codex_review_completed','codex_review_failed') "
+                "ORDER BY id DESC LIMIT 1",
+                (record_id,),
+            ).fetchone()
+            started = connection.execute(
+                "SELECT id FROM record_review_events WHERE record_id=? "
+                "AND action='codex_review_started' ORDER BY id DESC LIMIT 1",
+                (record_id,),
+            ).fetchone()
+            if running and started and (not completed or int(started["id"]) > int(completed["id"])):
+                raise ValueError("这条记录的 Codex 辅助复核正在运行")
+            connection.execute(
+                "INSERT INTO record_review_events(record_id,action,reviewer,note,details,created_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (
+                    record_id, "codex_review_started", "Codex 自动逐维复核", "",
+                    json.dumps({"record_id": dossier["record_id"]}, ensure_ascii=False),
+                    datetime.now().astimezone().isoformat(timespec="seconds"),
+                ),
+            )
+            connection.commit()
+        self.author_executor.submit(self._run_codex_delivery_review, record_id, dossier)
+        return {"ok": True, "record_id": record_id, "message": "Codex 自动逐维复核已启动"}
+
+    def _run_codex_delivery_review(self, record_id: str, dossier: dict) -> None:
+        prompt = (
+            "只读检查当前目录中的 review.json。资料已经过来源哈希和历史相似度机械校验。"
+            "你仍须逐句判断五维描述是否被所列证据原文直接支持，分数是否与事实一致，"
+            "需求是否覆盖，是否存在夸大、张冠李戴、套用句式、普通英文过多，或把后续结果算给目标轮次。"
+            "任何一句缺少直接依据、任何分数与依据冲突、任何维度无法确认，都必须拒绝。"
+            "只输出一个 JSON 对象，不要 Markdown 和额外文字。结构必须严格为："
+            '{"decision":"approved或rejected","summary":"中文总结",'
+            '"dimensions":{"delivery":{"approved":true,"reason":"中文依据"},'
+            '"instruction":{"approved":true,"reason":"中文依据"},'
+            '"planning":{"approved":true,"reason":"中文依据"},'
+            '"reasoning":{"approved":true,"reason":"中文依据"},'
+            '"execution":{"approved":true,"reason":"中文依据"}},'
+            '"issues":["具体阻断问题"]}。只有五维都可由资料直接验证且没有阻断问题时才可 approved。'
+        )
+        action = "codex_review_completed"
+        report = ""
+        review: dict | None = None
+        try:
+            with tempfile.TemporaryDirectory(prefix="ccusr-review-") as directory:
+                review_root = Path(directory)
+                output = review_root / "report.json"
+                schema = review_root / "review.schema.json"
+                (review_root / "review.json").write_text(
+                    json.dumps(dossier, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+                schema.write_text(
+                    json.dumps(codex_review_schema(), ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                result = subprocess.run(
+                    [
+                        "codex", "exec", "--sandbox", "read-only", "--ephemeral",
+                        "--skip-git-repo-check", "-C", str(review_root),
+                        "--output-schema", str(schema),
+                        "--output-last-message", str(output), prompt,
+                    ],
+                    cwd=review_root,
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    timeout=1800,
+                    check=False,
+                )
+                raw = output.read_text(encoding="utf-8").strip() if output.is_file() else ""
+                if result.returncode or not raw:
+                    raise RuntimeError((result.stdout or "Codex 未返回复核报告")[-4000:])
+                review = parse_codex_review(raw)
+                report = codex_review_report(review)
+                if review["decision"] == "approved":
+                    approve_codex_record(self.database, record_id, review)
+        except Exception as exc:
+            action = "codex_review_failed"
+            report = str(exc)[:4000]
+        try:
+            with closing(self.connect()) as connection:
+                connection.execute(
+                    "INSERT INTO record_review_events(record_id,action,reviewer,note,details,created_at) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (
+                        record_id, action, "Codex 自动逐维复核", "",
+                        json.dumps({
+                            "report": report,
+                            "decision": review.get("decision", "") if review and action == "codex_review_completed" else "",
+                            "dimensions": review.get("dimensions", {}) if review and action == "codex_review_completed" else {},
+                        }, ensure_ascii=False),
+                        datetime.now().astimezone().isoformat(timespec="seconds"),
+                    ),
+                )
+                connection.commit()
+        except sqlite3.Error:
+            pass
 
     def resolve_open_target(self, kind: str, target_id: object) -> Path:
         with closing(self.connect()) as connection:
@@ -2872,6 +3155,13 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 batch = parse_qs(parsed.query).get("batch", [None])[0]
                 self.send_json(self.data.solo2_status(batch))
                 return
+            if parsed.path == "/api/reviews":
+                batch = parse_qs(parsed.query).get("batch", [None])[0]
+                self.send_json(self.data.delivery_reviews(batch))
+                return
+            if parsed.path == "/api/reviews/history":
+                self.send_json(approved_history(self.data.database))
+                return
             if parsed.path == "/api/environment":
                 self.send_json(self.data.environment_status())
                 return
@@ -2999,6 +3289,20 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 result = self.data.solo2_login(body.get("username"), body.get("password"))
             elif self.path == "/api/actions/solo2-submit":
                 result = self.data.solo2_submit(body.get("batch"), body.get("numbers"))
+            elif self.path == "/api/reviews/approve":
+                result = self.data.approve_delivery_review(body)
+            elif self.path == "/api/reviews/reject":
+                result = self.data.reject_delivery_review(body)
+            elif self.path == "/api/reviews/codex":
+                result = self.data.create_codex_delivery_review(body)
+            elif self.path == "/api/reviews/history/import":
+                result = import_history(
+                    self.data.database,
+                    str(body.get("source_node") or ""),
+                    body.get("descriptions"),
+                )
+            elif self.path == "/api/reviews/history/sync":
+                result = self.data.sync_description_history()
             elif self.path == "/api/actions/takeover-question":
                 result = self.data.takeover_question(body.get("question_id"))
             elif self.path == "/api/actions/finish-takeover":

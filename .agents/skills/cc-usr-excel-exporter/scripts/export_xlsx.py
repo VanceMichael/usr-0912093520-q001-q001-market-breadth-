@@ -306,7 +306,12 @@ def main() -> int:
         connection.close()
         if not records:
             raise ValueError(f"batch has no delivery records: {args.batch}")
-        errors, warnings = validate_records(records, require_delivery_qc=True)
+        errors, warnings = validate_records(
+            records,
+            require_human_qc=True,
+            require_delivery_qc=True,
+            require_quality_gates=True,
+        )
         if errors:
             raise ValueError("QC-passed records failed export validation: " + "; ".join(errors))
         if warnings:

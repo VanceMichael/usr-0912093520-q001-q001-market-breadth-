@@ -9,7 +9,15 @@ from unittest import mock
 from pathlib import Path
 
 from tools.batch_pipeline import connect, create_batch, prompt_hash, set_repository
-from webapp.server import ConsoleData, open_local_path, runtime_info, safe_console_print, secure_file
+from webapp.server import (
+    ConsoleData,
+    codex_review_schema,
+    open_local_path,
+    parse_codex_review,
+    runtime_info,
+    safe_console_print,
+    secure_file,
+)
 
 
 def question_spec(batch: str) -> dict:
@@ -58,6 +66,72 @@ class WebConsoleTests(unittest.TestCase):
         with mock.patch("builtins.print", side_effect=[encoding_error, None]) as printer:
             safe_console_print("�")
         self.assertIn("\\ufffd", printer.call_args_list[1].args[0])
+
+    def test_codex_review_parser_requires_all_five_dimensions(self):
+        review = {
+            "decision": "approved",
+            "summary": "五项描述与对应证据能够逐项核对。",
+            "dimensions": {
+                name: {"approved": True, "reason": "所列原文能够直接支持当前描述中的判断。"}
+                for name in ("delivery", "instruction", "planning", "reasoning", "execution")
+            },
+            "issues": [],
+        }
+        parsed = parse_codex_review(json.dumps(review, ensure_ascii=False))
+        self.assertEqual(parsed["decision"], "approved")
+        review["dimensions"].pop("planning")
+        with self.assertRaisesRegex(ValueError, "完整包含五个维度"):
+            parse_codex_review(json.dumps(review, ensure_ascii=False))
+
+    def test_codex_review_schema_is_strict_for_all_five_dimensions(self):
+        schema = codex_review_schema()
+        dimensions = schema["properties"]["dimensions"]
+        self.assertFalse(schema["additionalProperties"])
+        self.assertEqual(
+            set(dimensions["required"]),
+            {"delivery", "instruction", "planning", "reasoning", "execution"},
+        )
+        self.assertFalse(dimensions["additionalProperties"])
+
+    def test_codex_review_runs_only_from_temporary_dossier(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = ConsoleData(root / "production.sqlite3", root)
+            review = {
+                "decision": "rejected",
+                "summary": "当前资料仍有一项事实无法直接确认。",
+                "dimensions": {
+                    name: {"approved": False, "reason": "当前证据不足以直接支持这项描述中的判断。"}
+                    for name in ("delivery", "instruction", "planning", "reasoning", "execution")
+                },
+                "issues": ["缺少能够直接支持描述的当前轮次证据"],
+            }
+
+            def run(command, **kwargs):
+                review_root = Path(kwargs["cwd"])
+                self.assertNotEqual(review_root, root)
+                self.assertEqual(Path(command[command.index("-C") + 1]), review_root)
+                self.assertEqual(command[command.index("--sandbox") + 1], "read-only")
+                self.assertIn("--ephemeral", command)
+                self.assertIn("--skip-git-repo-check", command)
+                schema_path = Path(command[command.index("--output-schema") + 1])
+                self.assertEqual(schema_path.parent, review_root)
+                self.assertEqual(json.loads(schema_path.read_text(encoding="utf-8")), codex_review_schema())
+                output = Path(command[command.index("--output-last-message") + 1])
+                output.write_text(json.dumps(review, ensure_ascii=False), encoding="utf-8")
+                return mock.Mock(returncode=0, stdout="")
+
+            try:
+                with mock.patch("webapp.server.subprocess.run", side_effect=run):
+                    data._run_codex_delivery_review("missing-record", {"record_id": "missing-record"})
+                with sqlite3.connect(data.database) as connection:
+                    event = connection.execute(
+                        "SELECT action,details FROM record_review_events ORDER BY id DESC LIMIT 1"
+                    ).fetchone()
+                self.assertIsNone(event)
+            finally:
+                data.author_executor.shutdown(wait=True)
+                data.pipeline_executor.shutdown(wait=True)
 
     def make_database(self, root: Path) -> Path:
         database = root / "production.sqlite3"
@@ -668,6 +742,10 @@ class WebConsoleTests(unittest.TestCase):
                 self.assertEqual(jobs[0]["model_concurrency"], 2)
                 self.assertEqual(len(jobs[0]["items"]), 1)
                 self.assertIn("heartbeat_at", jobs[0]["items"][0])
+                self.assertEqual(jobs[0]["items"][0]["title"], "跨模块状态服务")
+                dashboard = data.dashboard("0911")
+                self.assertEqual(dashboard["questions"][0]["stage_label"], "已加入流水线")
+                self.assertFalse(dashboard["questions"][0]["can_launch"])
             finally:
                 data.author_executor.shutdown(wait=True)
                 data.pipeline_executor.shutdown(wait=True)
@@ -732,7 +810,8 @@ class WebConsoleTests(unittest.TestCase):
                 self.assertEqual(jobs[0]["status"], "queued")
                 self.assertEqual(jobs[0]["retry_of_job_id"], first["job_id"])
                 self.assertEqual(jobs[0]["model_mode"], "local")
-                self.assertEqual(len(jobs), 1)
+                self.assertEqual([job["id"] for job in jobs], [retried["job_id"], first["job_id"]])
+                self.assertFalse(jobs[1]["can_retry"])
                 connection = sqlite3.connect(database)
                 source = connection.execute(
                     "SELECT status,error FROM pipeline_jobs WHERE id=?", (first["job_id"],)
@@ -801,7 +880,7 @@ class WebConsoleTests(unittest.TestCase):
                 data.author_executor.shutdown(wait=True)
                 data.pipeline_executor.shutdown(wait=True)
 
-    def test_pipeline_jobs_returns_only_latest_attempt_and_log_tail(self):
+    def test_pipeline_jobs_returns_history_and_log_tail(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             database = self.make_database(root)
@@ -826,7 +905,7 @@ class WebConsoleTests(unittest.TestCase):
                 data.author_executor.shutdown(wait=True)
                 data.pipeline_executor.shutdown(wait=True)
 
-        self.assertEqual([job["id"] for job in jobs], [2])
+        self.assertEqual([job["id"] for job in jobs], [2, 1])
         self.assertEqual(jobs[0]["output_length"], 40000)
         self.assertEqual(len(jobs[0]["output"]), 30000)
 

@@ -857,6 +857,8 @@ def solo2_pending_available(db: Path, max_attempts: int) -> bool:
         return connection.execute(
             "SELECT 1 FROM records r LEFT JOIN solo2_submissions s ON s.record_id=r.record_id "
             "WHERE r.delivery_qc_passed=1 AND r.delivery_qc_note='质检通过' "
+            "AND r.evidence_gate_passed=1 AND r.history_gate_passed=1 "
+            "AND r.human_qc_approved=1 "
             "AND COALESCE(s.status,'') NOT IN ('succeeded','auth_blocked','schema_blocked') "
             "AND (COALESCE(s.status,'')!='submitting' OR "
             "julianday(COALESCE(s.lease_expires_at,''))<julianday('now')) "
@@ -872,7 +874,9 @@ def batch_ready_to_finalize(db: Path, batch: str) -> bool:
     with closing(connect(db)) as connection:
         rows = connection.execute(
             "SELECT q.status,q.maintenance_mode,COUNT(r.id) AS records,"
-            "SUM(CASE WHEN r.delivery_qc_passed=1 AND r.delivery_qc_note='质检通过' THEN 1 ELSE 0 END) passed "
+            "SUM(CASE WHEN r.delivery_qc_passed=1 AND r.delivery_qc_note='质检通过' "
+            "AND r.evidence_gate_passed=1 AND r.history_gate_passed=1 "
+            "AND r.human_qc_approved=1 THEN 1 ELSE 0 END) passed "
             "FROM questions q JOIN batches b ON b.id=q.batch_id "
             "LEFT JOIN records r ON r.question_id=q.id WHERE b.name=? GROUP BY q.id",
             (batch,),
@@ -900,8 +904,10 @@ def deliver_one(
         prompt = (
             f"使用 $cc-usr-delivery-producer 只处理批次 {batch} 第 {number} 题。"
             f"原始 Claude JSONL 根目录为 {data_root.resolve()}。读取真实轨迹、SQLite、初始快照、Git diff 和实际产物，"
-            "按项目规范为全部有效轮次生成完整交付记录并写入 SQLite；不得修改题目代码、轨迹或仓库，"
-            "不得处理其他题目，不得执行交付质检或导出。完成后停止。"
+            "按项目规范为全部有效轮次生成完整交付记录并写入 SQLite。功能成功必须由目标轮次内的真实测试输出、"
+            "服务交互或其他运行证据支撑，静态阅读、文件存在和最终回复不能单独证明成功；测试失败仍要保留记录并如实降分。"
+            "五维描述必须各自为单段、至少 45 个汉字且不超过 420 个字符。不得修改题目代码、轨迹或仓库，"
+            "不得处理其他题目；完成生产后停止，保持质检与最终复核字段未通过，不得执行交付质检或导出。"
         )
         code = run_codex(codex, prompt, log_root / "delivery-producer.log", timeout)
         total, _passed = record_counts(db, int(row["id"]))
@@ -912,7 +918,9 @@ def deliver_one(
     if passed != total:
         prompt = (
             f"使用 $cc-usr-delivery-qc 只质检批次 {batch} 第 {number} 题的全部交付记录。"
-            f"原始 Claude JSONL 根目录为 {data_root.resolve()}。依据可核验证据修正不合规字段，"
+            f"原始 Claude JSONL 根目录为 {data_root.resolve()}。以 SQLite 已有生产记录为质检对象，不得重新生产。"
+            "成功结论必须有目标轮次原始 JSONL 中的真实运行证据；测试失败要保留记录、说明影响并降低对应分数。"
+            "五维描述必须各自为单段、至少 45 个汉字且不超过 420 个字符。依据可核验证据修正不合规字段，"
             f"显式使用 --select {number} 重新验证并执行 --finalize；不得修改目标模型代码，不得处理其他题目，"
             "不要导出 Excel。完成后停止。"
         )
@@ -936,7 +944,9 @@ def finalize_batch(
             "SELECT q.id,q.question_no,q.status,q.maintenance_mode,"
             "EXISTS(SELECT 1 FROM runs x WHERE x.question_id=q.id AND x.status='succeeded') AS model_succeeded,"
             "COUNT(r.id) AS record_count,"
-            "SUM(CASE WHEN r.delivery_qc_passed=1 AND r.delivery_qc_note='质检通过' THEN 1 ELSE 0 END) AS passed_count "
+            "SUM(CASE WHEN r.delivery_qc_passed=1 AND r.delivery_qc_note='质检通过' "
+            "AND r.evidence_gate_passed=1 AND r.history_gate_passed=1 "
+            "AND r.human_qc_approved=1 THEN 1 ELSE 0 END) AS passed_count "
             "FROM questions q LEFT JOIN records r ON r.question_id=q.id "
             "WHERE q.batch_id=? GROUP BY q.id ORDER BY q.question_no",
             (batch_row["id"],),
@@ -975,7 +985,7 @@ def finalize_batch(
     before = set(folder.glob("CC_Codex*.xlsx"))
     trajectories_before = set(folder.glob("轨迹_*.jsonl"))
     prompt = (
-        f"使用 $cc-usr-excel-exporter 只导出批次 {batch} 第 {selection} 题中已经通过交付质检的完整记录，"
+        f"使用 $cc-usr-excel-exporter 只导出批次 {batch} 第 {selection} 题中已经通过事实证据、历史去重、交付质检和最终五维复核的完整记录，"
         f"显式使用 --select {selection} 和 --claude-root {data_root.resolve()}，逐字节复制原始 JSONL，"
         "不得修改评分、记录或目标模型产物。完成后报告输出路径并停止。"
     )

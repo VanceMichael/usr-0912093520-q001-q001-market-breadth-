@@ -8,6 +8,7 @@ A question passes this skill when all of these duplicate checks pass:
 - After business nouns are mentally removed, the prompt does not reuse another question's sentence skeleton or request sequence.
 - The state transitions, entities, constraints, and acceptance evidence do not describe substantially the same task in different words.
 - The prompt is one natural Chinese paragraph with a concrete professional context and observable business result; it does not use a canned opening, headings, checklist labels, a reusable requirement tail, or internal evaluation language.
+- A standalone `TODO` token fails even in a negative requirement. Rewrite the clause as natural Chinese completed-delivery behavior and rerun both duplicate and mechanical checks.
 - Its sentence order and cadence are materially different from other prompts in the batch, rather than merely replacing nouns, technologies, and state names.
 - Its final sentence and final two clauses are not copied from another prompt or lightly paraphrased from a shared tail. Generic endings about startup methods, Docker, tests, validation, or documentation are blocking when reused.
 - It does not end with an implementation-summary recipe such as “storage keeps A/B/C + validate scenario A/B/C/D”. A checklist of three or more scenarios before “场景验证/用例验证”, or generic environment commentary, fails even when it appears only once.

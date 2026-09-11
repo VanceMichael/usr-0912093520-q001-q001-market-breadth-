@@ -29,6 +29,7 @@
   "parent_record": "",
   "human_authored": true,
   "human_qc_approved": true,
+  "review_method": "human",
   "delivery_qc_passed": true,
   "delivery_qc_note": "质检通过",
   "delivery_qc_checked_at": "2026-09-07T19:35:00+08:00",

@@ -15,6 +15,7 @@ const state = {
   authorJobs: [],
   mothers: [],
   pipelineJobs: [],
+  pipelineJobFilter: "all",
   schedulers: [],
   selectedScheduler: "local",
   schedulerLogMode: "events",
@@ -26,6 +27,7 @@ const state = {
   schedulerRunSource: "",
   schedulerFollowOutput: true,
   solo2: null,
+  reviews: null,
 };
 let drawerCloseTimer = null;
 let authorJobsTimer = null;
@@ -36,6 +38,7 @@ let schedulerEventSource = null;
 let schedulerRunTimer = null;
 let schedulerRunLoading = null;
 let schedulerRunRequest = 0;
+let reviewTimer = null;
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
@@ -91,7 +94,7 @@ function currentQuestions() {
   return state.data.questions.filter((question) => {
     if (state.view === "records" && question.record_count === 0) return false;
     if (state.stage && question.stage_index !== state.stage) return false;
-    if (state.filter === "pending" && question.stage_index >= 6) return false;
+    if (state.filter === "pending" && question.stage_index >= 7) return false;
     if (state.filter === "passed" && !question.delivery_qc) return false;
     if (state.filter === "delivered" && !question.exported) return false;
     if (!needle) return true;
@@ -182,7 +185,7 @@ function renderFiles() {
       <span class="file-icon"><i data-lucide="${file.type === "workbook" ? "file-spreadsheet" : "file-json"}"></i></span>
       <div class="file-info"><strong>${escapeHtml(file.name)}</strong><span>${formatBytes(file.size)} · ${formatDate(file.modified_at)}</span></div>
       <button class="button secondary" data-file-path="${escapeHtml(file.path)}"><i data-lucide="copy"></i>复制路径</button>
-    </div>`).join("") : `<div class="empty-state"><strong>还没有交付文件</strong><span>交付质检通过后即可导出。</span></div>`;
+    </div>`).join("") : `<div class="empty-state"><strong>还没有交付文件</strong><span>交付质检和最终五维复核通过后即可导出。</span></div>`;
   refreshIcons();
 }
 
@@ -215,13 +218,90 @@ async function loadSolo2() {
   } catch (error) { toast(error.message, true); }
 }
 
+const reviewDimensions = [
+  ["delivery", "交付完整性"], ["instruction", "指令遵循"],
+  ["planning", "任务规划"], ["reasoning", "推理能力"],
+  ["execution", "执行能力"],
+];
+
+function evidenceLocator(item) {
+  if (item.source_type === "trajectory") return `轨迹第 ${item.line} 行`;
+  if (item.source_type === "workspace") return item.path || "工作区文件";
+  return "原始要求";
+}
+
+function renderReviews() {
+  if (!state.reviews) return;
+  const summary = state.reviews.summary;
+  $("#review-summary").innerHTML = `
+    <span class="summary-chip">全部<strong>${summary.total}</strong></span>
+    <span class="summary-chip">等待确认<strong>${summary.waiting}</strong></span>
+    <span class="summary-chip success">复核通过<strong>${summary.approved}</strong></span>
+    <span class="summary-chip warning">门禁阻断<strong>${summary.blocked}</strong></span>`;
+  const reviewer = $("#review-reviewer");
+  const selectedReviewer = reviewer.value;
+  reviewer.innerHTML = state.reviews.reviewers.map((name) => (
+    `<option value="${escapeHtml(name)}">${escapeHtml(name)}</option>`
+  )).join("");
+  if (state.reviews.reviewers.includes(selectedReviewer)) reviewer.value = selectedReviewer;
+  const list = $("#review-list");
+  if (!state.reviews.records.length) {
+    list.innerHTML = `<div class="empty-state"><strong>当前批次没有交付记录</strong><span>完成模型跑题和交付生产后会出现在这里。</span></div>`;
+    return;
+  }
+  list.innerHTML = state.reviews.records.map((record) => {
+    const gateStatus = [
+      [record.delivery_qc_passed, "自动质检"],
+      [record.evidence_gate_passed, "事实证据"],
+      [record.history_gate_passed && !record.history_matches.length, "历史去重"],
+      [
+        record.human_qc_approved,
+        record.review_method === "codex" ? "Codex 复核" :
+          record.review_method === "human" ? "人工确认" : "最终复核",
+      ],
+    ];
+    const coverage = record.requirement_coverage.length ? record.requirement_coverage.map((item) => {
+      const labels = { met: "已满足", unmet: "未满足", uncertain: "无法确认" };
+      return `<li><span class="coverage-state ${escapeHtml(item.status)}">${labels[item.status] || "未知"}</span><p>${escapeHtml(item.requirement)}</p></li>`;
+    }).join("") : `<li><p>尚未建立需求覆盖表。</p></li>`;
+    const dimensions = reviewDimensions.map(([key, label]) => {
+      const evidence = record.evidence_ledger.filter((item) => item.dimension === key);
+      return `<section class="review-dimension">
+        <div class="review-dimension-head"><div><span>${label}</span><strong>${record[`${key}_score`]} 分</strong></div><label class="review-confirm"><input type="checkbox" data-review-confirm="${key}" ${record.human_qc_approved ? "checked disabled" : ""}><span>证据和描述已逐项核对</span></label></div>
+        <p class="review-description">${escapeHtml(record[`${key}_description`])}</p>
+        <div class="evidence-list">${evidence.length ? evidence.map((item) => `<details><summary><i data-lucide="link-2"></i>${escapeHtml(evidenceLocator(item))}</summary><p><strong>观察事实：</strong>${escapeHtml(item.fact)}</p><pre>${escapeHtml(item.excerpt)}</pre></details>`).join("") : `<p class="gate-message error">缺少该维度的结构化证据。</p>`}</div>
+      </section>`;
+    }).join("");
+    const history = record.history_matches.length ? `<div class="history-warning"><strong>发现历史相似描述</strong>${record.history_matches.slice(0, 5).map((item) => `<p>${escapeHtml(item.record_id)} · ${escapeHtml(item.dimension)} · 相似度 ${Math.round(item.similarity * 100)}%</p>`).join("")}</div>` : "";
+    const codex = record.codex_review ? `<div class="codex-review-report ${escapeHtml(record.codex_review.status)} ${escapeHtml(record.codex_review.decision)}"><div><strong>Codex 自动逐维复核${record.codex_review.decision === "approved" ? " · 已通过" : record.codex_review.decision === "rejected" ? " · 未通过" : ""}</strong><span>${escapeHtml(formatDate(record.codex_review.updated_at))}</span></div><pre>${escapeHtml(record.codex_review.report || (record.codex_review.status === "started" ? "正在读取全部复核资料…" : "暂无报告"))}</pre></div>` : "";
+    return `<article class="review-record" data-review-record="${escapeHtml(record.record_id)}">
+      <header class="review-record-head"><div><span>${escapeHtml(record.batch_name)} · 第 ${record.question_no} 题 · 第 ${record.turn_no} 轮</span><h3>${escapeHtml(record.title)}</h3><p>${escapeHtml(record.record_id)}</p></div><div class="gate-strip">${gateStatus.map(([passed, label]) => `<span class="tag ${passed ? "green" : "amber"}">${escapeHtml(label)}${passed ? "通过" : "待处理"}</span>`).join("")}</div></header>
+      <details class="review-prompt"><summary>查看原始要求和需求覆盖</summary><p>${escapeHtml(record.user_prompt)}</p><ul>${coverage}</ul></details>
+      ${history}${dimensions}${codex}
+      <footer class="review-actions"><textarea data-review-note rows="2" maxlength="500" placeholder="退回时填写具体问题；人工通过时可填写补充说明"></textarea><div><button class="button secondary" type="button" data-review-action="codex" ${record.ready_for_review && !record.human_qc_approved && record.codex_review?.status !== "started" ? "" : "disabled"}><i data-lucide="scan-search"></i>${record.codex_review?.status === "started" ? "Codex 复核中" : "Codex 代替人工复核"}</button><button class="button secondary" type="button" data-review-action="reject"><i data-lucide="undo-2"></i>退回重写</button><button class="button primary" type="button" data-review-action="approve" ${record.ready_for_review && !record.human_qc_approved ? "" : "disabled"}><i data-lucide="badge-check"></i>${record.human_qc_approved ? (record.review_method === "codex" ? "已由 Codex 通过" : "已人工确认") : "人工确认五维并通过"}</button></div></footer>
+    </article>`;
+  }).join("");
+  refreshIcons();
+}
+
+async function loadReviews({ quiet = false } = {}) {
+  try {
+    const query = state.batch ? `?batch=${encodeURIComponent(state.batch)}` : "";
+    state.reviews = await api(`/api/reviews${query}`);
+    renderReviews();
+  } catch (error) {
+    if (!quiet) toast(error.message, true);
+  }
+}
+
 function renderView() {
   const exportsView = state.view === "exports";
   const settingsView = state.view === "settings";
   const authorView = state.view === "author";
   const vpsView = state.view === "vps";
   const schedulerView = state.view === "scheduler";
-  const nonProductionView = exportsView || settingsView || authorView || vpsView || schedulerView;
+  const reviewView = state.view === "reviews";
+  const nonProductionView = exportsView || settingsView || authorView || vpsView || schedulerView || reviewView;
   $(".batch-toolbar").hidden = settingsView || authorView || vpsView || schedulerView;
   $(".pipeline-band").hidden = nonProductionView;
   $(".list-controls").hidden = nonProductionView;
@@ -231,11 +311,13 @@ function renderView() {
   $("#author-view").hidden = !authorView;
   $("#vps-view").hidden = !vpsView;
   $("#scheduler-view").hidden = !schedulerView;
+  $("#review-view").hidden = !reviewView;
   $("#pipeline-jobs-panel").hidden = nonProductionView;
   const titles = {
     author: ["生成题目", "填写批次信息和关键词，生成可复制的标准出题命令。"],
     production: ["生产批次", "从题目质检到 Excel 交付，状态直接来自本地生产库。"],
     records: ["交付记录", "查看已经生成评分记录的题目及交付质检状态。"],
+    reviews: ["交付复核", "人工确认或 Codex 严格逐维复核通过后，开放最终交付。"],
     exports: ["导出中心", "集中查看当前批次的工作簿和原始 JSONL 轨迹。"],
     settings: ["运行配置", "修改下一次 Claude Code 启动使用的中转地址、模型和提交人。"],
     vps: ["VPS 管理", "统一查看远程 VPS 节点状态、批次进度和交付物。"],
@@ -245,6 +327,7 @@ function renderView() {
   $("#page-subtitle").textContent = titles[state.view][1];
   $$(".nav-item").forEach((button) => button.classList.toggle("active", button.dataset.view === state.view));
   if (exportsView) { renderFiles(); loadSolo2(); }
+  else if (reviewView) { renderReviews(); loadReviews({ quiet: true }); }
   else if (settingsView) renderSettings();
   else if (vpsView) renderVps();
   else if (schedulerView) renderScheduler();
@@ -773,7 +856,8 @@ function pipelineStatus(status) {
     model_completed: "模型跑题完成",
     producing: "交付生产中",
     produced: "交付已生产",
-    finalizing: "交付质检与导出中",
+    finalizing: "交付质检中",
+    awaiting_review: "等待最终复核",
     completed: "已完成",
     failed: "失败",
     interrupted: "已中断",
@@ -797,19 +881,45 @@ function scrollJobLogsToLatest() {
   });
 }
 
+function formatDuration(start, end) {
+  if (!start) return "尚未开始";
+  const started = new Date(start).getTime();
+  const finished = end ? new Date(end).getTime() : Date.now();
+  if (!Number.isFinite(started) || !Number.isFinite(finished) || finished < started) return "耗时未知";
+  const seconds = Math.floor((finished - started) / 1000);
+  if (seconds < 60) return `${seconds} 秒`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} 分 ${seconds % 60} 秒`;
+  return `${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分`;
+}
+
+function renderPipelineJobFilter() {
+  const select = $("#pipeline-job-filter");
+  if (!select) return;
+  const selected = String(state.pipelineJobFilter);
+  select.innerHTML = '<option value="all">最近全部任务</option>' + state.pipelineJobs.map((job) => (
+    `<option value="${job.id}">#${job.id} · ${escapeHtml(job.batch_name)} · ${escapeHtml(pipelineStatus(job.status))}</option>`
+  )).join("");
+  if ([...select.options].some((option) => option.value === selected)) select.value = selected;
+  else state.pipelineJobFilter = "all";
+}
+
 function renderPipelineJobs() {
   const list = $("#pipeline-job-list");
   if (!list) return;
-  if (!state.pipelineJobs.length) {
+  renderPipelineJobFilter();
+  const jobs = state.pipelineJobFilter === "all"
+    ? state.pipelineJobs
+    : state.pipelineJobs.filter((job) => String(job.id) === String(state.pipelineJobFilter));
+  if (!jobs.length) {
     list.innerHTML = '<div class="empty-state"><strong>暂无自动流水线任务</strong><span>点击“ 一键全流程 ”后，状态和日志会保存在这里。</span></div>';
     return;
   }
-  list.innerHTML = state.pipelineJobs.map((job) => `
+  list.innerHTML = jobs.map((job) => `
     <article class="pipeline-job status-${escapeHtml(job.status)}">
       <div class="pipeline-job-head"><div><strong>#${job.id} · ${escapeHtml(job.batch_name)}</strong><span>${job.question_count} 题 · Docker ${escapeHtml(job.docker_image)}</span></div><div class="job-actions">${job.can_retry ? `<button class="button secondary compact" type="button" data-pipeline-retry="${job.id}"><i data-lucide="rotate-ccw"></i>从失败处重试</button>` : ""}<span class="job-status">${escapeHtml(pipelineStatus(job.status))}</span></div></div>
-      <div class="pipeline-job-meta"><span>质检并发 ${job.qc_concurrency}</span><span>模型并发 ${job.model_concurrency}</span><span>交付并发 ${job.codex_concurrency}</span>${job.retry_of_job_id ? `<span>重试自 #${job.retry_of_job_id}</span>` : ""}<span>${escapeHtml(formatDate(job.created_at))}</span></div>
-      <div class="pipeline-item-grid">${(job.items || []).map((item) => `<span class="pipeline-item status-${escapeHtml(item.status.replaceAll("_", "-"))} health-${escapeHtml(item.health_status || "unknown")}"${item.error ? ` title="${escapeHtml(item.error)}"` : ""}><span>第 ${item.question_no} 题：${escapeHtml(pipelineItemLabel(item))}</span>${item.status === "model_running" && item.health_detail ? `<small>${escapeHtml(item.health_detail)} · 最近活动 ${escapeHtml(formatDate(item.activity_at || item.heartbeat_at))}</small>` : ""}</span>`).join("")}</div>
-      ${job.can_retry ? `<div class="job-actions"><button class="button secondary compact" type="button" data-author-retry="${job.id}"><i data-lucide="rotate-ccw"></i>从失败处重试</button></div>` : ""}
+      <div class="pipeline-job-meta"><span>质检并发 ${job.qc_concurrency}</span><span>模型并发 ${job.model_concurrency}</span><span>交付并发 ${job.codex_concurrency}</span>${job.retry_of_job_id ? `<span>重试自 #${job.retry_of_job_id}</span>` : ""}<span>创建 ${escapeHtml(formatDate(job.created_at))}</span><span>耗时 ${escapeHtml(formatDuration(job.started_at, job.finished_at))}</span></div>
+      <div class="pipeline-item-grid">${(job.items || []).map((item) => `<article class="pipeline-item status-${escapeHtml(item.status.replaceAll("_", "-"))} health-${escapeHtml(item.health_status || "unknown")}"${item.error ? ` title="${escapeHtml(item.error)}"` : ""}><strong>${escapeHtml(item.task_id || `第 ${item.question_no} 题`)}</strong><span>${escapeHtml(item.title || `第 ${item.question_no} 题`)} · ${escapeHtml(pipelineItemLabel(item))}</span><small>模型尝试 ${item.model_attempts || 0} 次 · ${escapeHtml(formatDuration(item.started_at, item.finished_at))}${item.activity_at || item.heartbeat_at ? ` · 最近活动 ${escapeHtml(formatDate(item.activity_at || item.heartbeat_at))}` : ""}</small>${item.error ? `<small class="pipeline-item-error">${escapeHtml(item.error)}</small>` : ""}</article>`).join("")}</div>
       ${job.error ? `<div class="author-job-error">${escapeHtml(job.error)}</div>` : ""}
       <pre class="author-job-output">${escapeHtml(job.output || job.last_message || "等待流水线启动...")}</pre>
     </article>`).join("");
@@ -840,18 +950,14 @@ async function loadPipelineJobs() {
   if (document.hidden) return;
   try {
     const result = await api("/api/pipeline-jobs");
-    const seenBatches = new Set();
-    state.pipelineJobs = (result.jobs || []).filter((job) => {
-      if (seenBatches.has(job.batch_name)) return false;
-      seenBatches.add(job.batch_name);
-      return true;
-    }).map((job) => ({ ...job, output: (job.output || "").slice(-30000) }));
+    state.pipelineJobs = (result.jobs || []).map((job) => ({ ...job, output: (job.output || "").slice(-30000) }));
     const signature = JSON.stringify(state.pipelineJobs.map((job) => ({
       id: job.id, status: job.status, outputLength: job.output_length,
       lastMessage: job.last_message, error: job.error,
       items: (job.items || []).map((item) => [
         item.id, item.status, item.heartbeat_at, item.activity_at,
-        item.health_status, item.health_detail, item.error,
+        item.health_status, item.health_detail, item.error, item.title,
+        item.model_attempts, item.started_at, item.finished_at,
       ]),
     })));
     if (signature !== pipelineJobsSignature) {
@@ -1143,10 +1249,10 @@ function workflowPrompt() {
     return `使用 $cc-usr-claude-runner 启动批次 ${batch} 的${scope}。只启动已经通过题目质检的记录，不要分析轨迹或评分。`;
   }
   if (stage === 3) {
-    return `使用 $cc-usr-delivery-producer 处理批次 ${batch} 的${scope}。自动定位对应的 Claude Code 会话，提取每轮 SessionID、PromptID 和当前对话轮次排序，读取轨迹、回复、代码、diff 与验证结果，严格按照 项目规范.md 的五维标准逐轮评分并写入 production.sqlite3。不要修改目标模型的代码或轨迹。`;
+    return `使用 $cc-usr-delivery-producer 处理批次 ${batch} 的${scope}。自动定位对应的 Claude Code 会话，提取每轮 SessionID、PromptID 和当前对话轮次排序，读取轨迹、回复、代码、diff 与验证结果，严格按照 项目规范.md 的五维标准逐轮评分并写入 production.sqlite3。功能成功必须有目标轮次原始 JSONL 中的真实测试输出、服务交互或其他运行证据，不能只凭静态阅读、文件存在或最终回复判定；测试失败仍要保留记录、说明影响并降低对应维度。五维描述各自保持单段、至少 45 个汉字且不超过 420 个字符。不要修改目标模型的代码或轨迹；完成生产后停止，不要执行交付质检或导出。`;
   }
   if (stage === 4) {
-    return `使用 $cc-usr-delivery-qc 质检批次 ${batch} 的${scope}交付记录。逐项检查 28 个提交字段，包括当前对话轮次排序；遇到任何错误、警告、缺失字段或证据冲突都要立即根据 SQLite、对应会话和实际产物修正，并在同一任务中反复复检直到零错误零警告。只有全部符合规范后才将审核备注写为“质检通过”。不要导出 Excel。`;
+    return `使用 $cc-usr-delivery-qc 质检批次 ${batch} 的${scope}交付记录。以 production.sqlite3 中已经生产的记录为质检对象，不得重新生产。逐项检查 28 个提交字段、当前对话轮次排序和原始运行证据；静态阅读、文件存在或最终回复不能单独证明功能成功，测试失败必须保留记录并如实降低对应维度。五维描述各自保持单段、至少 45 个汉字且不超过 420 个字符。遇到任何错误、警告、缺失字段或证据冲突都要立即根据 SQLite、对应会话和实际产物修正，并反复复检直到零错误零警告。只有全部符合规范后才写入“质检通过”，随后停止，不要导出 Excel 或提交平台。`;
   }
   return `使用 $cc-usr-excel-exporter 导出批次 ${batch} 的${scope}。只导出已经通过交付质检的记录，按照 A:AB 28 列生成全新 Excel，同时复制对应原始 JSONL 轨迹，Excel 的“轨迹文件”列保持空白。`;
 }
@@ -1274,10 +1380,15 @@ function closeDrawer() {
   }, 180);
 }
 
-$("#refresh-button").addEventListener("click", () => state.view === "scheduler" ? loadSchedulers() : loadDashboard());
-$("#batch-select").addEventListener("change", (event) => {
+$("#refresh-button").addEventListener("click", () => {
+  if (state.view === "scheduler") return loadSchedulers();
+  if (state.view === "reviews") return loadReviews();
+  return loadDashboard();
+});
+$("#batch-select").addEventListener("change", async (event) => {
   state.stage = null;
-  loadDashboard(event.target.value);
+  await loadDashboard(event.target.value);
+  if (state.view === "reviews") loadReviews();
 });
 $("#search-input").addEventListener("input", (event) => { state.search = event.target.value; renderRows(); });
 $("#select-all").addEventListener("change", (event) => {
@@ -1402,7 +1513,87 @@ $(".nav-list").addEventListener("click", (event) => {
     if (schedulerRunTimer) clearInterval(schedulerRunTimer);
     schedulerRunTimer = null;
   }
+  if (state.view === "reviews") {
+    loadReviews();
+    if (!reviewTimer) reviewTimer = setInterval(() => loadReviews({ quiet: true }), 5000);
+  } else if (reviewTimer) {
+    clearInterval(reviewTimer);
+    reviewTimer = null;
+  }
   renderView();
+});
+$("#review-refresh").addEventListener("click", () => loadReviews());
+$("#review-history-sync").addEventListener("click", async () => {
+  const button = $("#review-history-sync");
+  const original = button.innerHTML;
+  button.disabled = true;
+  button.textContent = "同步中…";
+  try {
+    const result = await api("/api/reviews/history/sync", { method: "POST", body: "{}" });
+    toast(`已同步 ${result.nodes} 个节点，共 ${result.imported} 条描述`);
+    await loadReviews({ quiet: true });
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    button.innerHTML = original;
+    button.disabled = false;
+    refreshIcons();
+  }
+});
+$("#review-list").addEventListener("click", async (event) => {
+  const button = event.target.closest("[data-review-action]");
+  if (!button) return;
+  const card = button.closest("[data-review-record]");
+  const recordId = card.dataset.reviewRecord;
+  const reviewer = $("#review-reviewer").value;
+  const note = card.querySelector("[data-review-note]").value.trim();
+  const action = button.dataset.reviewAction;
+  const original = button.innerHTML;
+  button.disabled = true;
+  button.textContent = "处理中…";
+  try {
+    if (action === "codex") {
+      openModal(
+        "由 Codex 代替人工复核",
+        "Codex 将读取这条记录的原始要求、五维描述、证据账本、需求覆盖和历史相似结果。五项全部通过后会直接开放 Excel 与 SOLO2 交付；任一项无法确认则继续阻断。",
+        "开始严格复核",
+        async () => {
+          closeModal();
+          try {
+            await api("/api/reviews/codex", {
+              method: "POST", body: JSON.stringify({ record_id: recordId }),
+            });
+            toast("Codex 自动逐维复核已启动");
+            await loadReviews({ quiet: true });
+          } catch (error) {
+            toast(error.message, true);
+          }
+        },
+      );
+      return;
+    } else if (action === "reject") {
+      await api("/api/reviews/reject", {
+        method: "POST", body: JSON.stringify({ record_id: recordId, reviewer, note }),
+      });
+      toast("记录已退回重写");
+    } else if (action === "approve") {
+      const confirmations = Object.fromEntries(reviewDimensions.map(([key]) => [
+        key, Boolean(card.querySelector(`[data-review-confirm="${key}"]`)?.checked),
+      ]));
+      await api("/api/reviews/approve", {
+        method: "POST", body: JSON.stringify({ record_id: recordId, reviewer, note, confirmations }),
+      });
+      toast("五个维度已由人工确认");
+    }
+    await loadDashboard(state.batch);
+    await loadReviews({ quiet: true });
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    button.innerHTML = original;
+    button.disabled = false;
+    refreshIcons();
+  }
 });
 $("#settings-form").addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -1651,6 +1842,10 @@ $("#solo2-submit-batch").addEventListener("click", () => {
 });
 $("#auto-pipeline-button").addEventListener("click", startAutoPipeline);
 $("#pipeline-jobs-refresh").addEventListener("click", loadPipelineJobs);
+$("#pipeline-job-filter").addEventListener("change", (event) => {
+  state.pipelineJobFilter = event.target.value;
+  renderPipelineJobs();
+});
 $("#pipeline-job-list").addEventListener("click", (event) => {
   const button = event.target.closest("[data-pipeline-retry]");
   if (button) retryPipelineJob(Number(button.dataset.pipelineRetry));

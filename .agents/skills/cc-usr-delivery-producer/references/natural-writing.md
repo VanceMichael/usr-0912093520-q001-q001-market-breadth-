@@ -9,6 +9,7 @@ The exported five-dimensional descriptions are feedback written for another prog
 - Give each dimension a different job. Delivery explains what exists and what is still missing. Instruction following compares the output with explicit constraints. Planning discusses decomposition and state tracking. Reasoning discusses decisions and diagnosis. Execution discusses tool choice, failures, retries, and verification.
 - Use only evidence needed for the judgment. A test count, list of modules, or protocol name belongs in the description only when it helps establish completion, scope, or a defect. Do not turn the field into an inventory.
 - Read the five fields in sequence. If two can be swapped without changing meaning, rewrite at least one. Their first sentence, sentence length, connectors, and final sentence should not all line up.
+- Write explanatory prose in Chinese. Preserve unavoidable technical names such as APIs, commands, paths, classes, protocols, language names and exact error text, but translate ordinary English commentary and keep English outside those identifiers to a minimum.
 
 ## Forbidden wording and visible scaffolding
 

@@ -1,4 +1,6 @@
 import json
+import hashlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -16,12 +18,18 @@ from tools.batch_pipeline import connect, create_batch, set_repository  # noqa: 
 from tools.delivery_records import EXPORT_HEADERS  # noqa: E402
 from tools.solo2_client import Solo2Error  # noqa: E402
 from tools.solo2_service import submit_records  # noqa: E402
+from tools.human_review import (  # noqa: E402
+    approve_codex_record,
+    approve_record,
+    build_codex_review_dossier,
+)
 from tools import orchestrator  # noqa: E402
 
 
 COLLECTOR = ROOT / ".agents/skills/cc-usr-delivery-producer/scripts/collect_record.py"
 LOCATOR = ROOT / ".agents/skills/cc-usr-delivery-producer/scripts/find_claude_turns.py"
 QC = ROOT / ".agents/skills/cc-usr-delivery-qc/scripts/validate_records.py"
+STYLE_GATE = ROOT / ".agents/skills/cc-usr-delivery-producer/scripts/check_description_style.py"
 EXPORTER = ROOT / ".agents/skills/cc-usr-excel-exporter/scripts/export_xlsx.py"
 TEMPLATE = ROOT / ".agents/skills/cc-usr-excel-exporter/assets/CC_Codex 用户满意度标注（试标）.xlsx"
 NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
@@ -71,6 +79,35 @@ def spec(count: int = 1) -> dict:
     }
 
 
+def attach_evidence(record: dict, number: int = 1, line: int = 4, result_text: str = "实现与验证均已完成。") -> dict:
+    descriptions = {
+        prefix: record[f"{prefix}_description"]
+        for prefix in ("delivery", "instruction", "planning", "reasoning", "execution")
+    }
+    final_event = {
+        "type": "assistant", "sessionId": f"session-{number:03d}",
+        "message": {"role": "assistant", "content": [{"type": "text", "text": result_text}]},
+    }
+    final_line = json.dumps(final_event, ensure_ascii=False)
+    line_hash = hashlib.sha256(final_line.encode("utf-8")).hexdigest()
+    evidence = []
+    for prefix, description in descriptions.items():
+        sentences = [part.strip() for part in re.split(r"[。！？]", description) if part.strip()]
+        for index, sentence in enumerate(sentences, 1):
+            evidence.append({
+                "id": f"{prefix}-{index}", "dimension": prefix,
+                "source_type": "trajectory", "line": line,
+                "source_sha256": line_hash, "excerpt": result_text.rstrip("。"),
+                "claim": sentence, "fact": "目标轮次留下了完成和验证结果",
+            })
+    record["evidence_ledger"] = evidence
+    record["requirement_coverage"] = [{
+        "requirement": "覆盖事件接入、顺序处理、持久化、状态推送、断线重连和完整验证场景",
+        "status": "met", "evidence_ids": ["delivery-1"],
+    }]
+    return record
+
+
 def automated_record(number: int = 1) -> dict:
     values = {
         "session_id": f"session-{number:03d}",
@@ -89,10 +126,56 @@ def automated_record(number: int = 1) -> dict:
         "reasoning": "顺序处理与重连恢复共用同一套游标语义，边界判断和测试场景能够相互印证。关键取舍保持前后一致，异常分支没有引入与正常流程冲突的状态解释。",
         "execution": "文件检索、代码修改和验证命令都集中在目标模块，出现失败后能够根据错误位置及时修正。最终构建与完整测试均正常结束，没有重复执行无关操作拖慢交付。",
     }
+    if number % 2 == 0:
+        descriptions = {
+            "delivery": "断线恢复、事件落库和订阅推送已经形成连续处理链路，验收过程覆盖了连接恢复后的增量消息。运行结果没有暴露会阻断主要业务路径的缺失项。",
+            "instruction": "实现范围保持在题目约定的后端服务和验证代码内，指定的持久化及顺序约束均有对应落点。原始要求中的限制没有被额外功能或越界修改破坏。",
+            "planning": "工作先梳理事件进入后的状态变化，再分别推进存储、订阅和恢复路径，收尾阶段统一核对异常场景。每个阶段都有对应进展反馈，前后步骤能够互相衔接。",
+            "reasoning": "重连后的游标延续被作为状态一致性的关键条件，并用恢复场景验证这一判断。正常传输和连接中断采用同一顺序语义，没有出现互相矛盾的处理分支。",
+            "execution": "检索范围围绕事件处理目录展开，修改完成后依次运行构建和验收脚本。命令遇到问题时先定位对应位置再修正，结束前的验证正常返回且没有无关重复调用。",
+        }
     for prefix in ("delivery", "instruction", "planning", "reasoning", "execution"):
         values[f"{prefix}_score"] = 5
         values[f"{prefix}_description"] = descriptions[prefix]
-    return values
+    return attach_evidence(values, number)
+
+
+def approve_all(database: Path) -> None:
+    connection = connect(database)
+    record_ids = [str(row[0]) for row in connection.execute("SELECT record_id FROM records ORDER BY id")]
+    connection.close()
+    for record_id in record_ids:
+        approve_record(
+            database, record_id, "gaoyong",
+            {dimension: True for dimension in ("delivery", "instruction", "planning", "reasoning", "execution")},
+        )
+
+
+def codex_review(*, approved: bool = True) -> dict:
+    return {
+        "decision": "approved" if approved else "rejected",
+        "summary": "五个维度的描述、分数和来源证据能够逐项对应。" if approved else "任务规划的描述缺少当前轮次直接证据。",
+        "dimensions": {
+            dimension: {
+                "approved": approved,
+                "reason": "描述中的判断能够由当前轮次的原始轨迹内容直接核对。" if approved else "当前资料没有提供足够的原始轨迹内容支持该项判断。",
+            }
+            for dimension in ("delivery", "instruction", "planning", "reasoning", "execution")
+        },
+        "issues": [] if approved else ["任务规划缺少直接证据"],
+    }
+
+
+def bind_evidence_to_line(record: dict, trajectory: Path, line: int, excerpt: str) -> dict:
+    raw = trajectory.read_bytes().splitlines()[line - 1]
+    for item in record["evidence_ledger"]:
+        item.update({
+            "line": line,
+            "source_sha256": hashlib.sha256(raw).hexdigest(),
+            "excerpt": excerpt,
+            "fact": "目标轮次中的原始事件可以直接核对",
+        })
+    return record
 
 
 def valid_trajectory(question: object, number: int = 1) -> str:
@@ -152,10 +235,10 @@ class DeliveryPipelineTests(unittest.TestCase):
         )
         for question in questions:
             connection.execute(
-                "INSERT INTO runs(question_id, batch_run_id, launched_at, harness, harness_version,status) "
+                "INSERT INTO runs(question_id, batch_run_id, launched_at, harness, harness_version,status,trajectory_root) "
                 "VALUES(?, ?, '2026-09-07T09:00:00+08:00', "
-                "'Claude Code', '2.1.259','succeeded')",
-                (question["id"], f"run-{question['question_no']:03d}"),
+                "'Claude Code', '2.1.259','succeeded',?)",
+                (question["id"], f"run-{question['question_no']:03d}", str(root / "0911")),
             )
             (root / "0911" / f"session-{question['question_no']:03d}.jsonl").write_text(
                 valid_trajectory(question, question["question_no"]), encoding="utf-8",
@@ -168,6 +251,27 @@ class DeliveryPipelineTests(unittest.TestCase):
         return subprocess.run(
             command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False
         )
+
+    def test_description_style_gate_rejects_multiline_or_overlong_description(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record = automated_record()
+            record["delivery_description"] += "\n补充说明"
+            input_path = root / "score.json"
+            input_path.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+            result = self.run_command([
+                sys.executable, str(STYLE_GATE), "--input", str(input_path),
+            ])
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("delivery_description must be a single paragraph", result.stdout)
+
+            record["delivery_description"] = "接口测试确认服务返回一致结果。" * 30
+            input_path.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+            result = self.run_command([
+                sys.executable, str(STYLE_GATE), "--input", str(input_path),
+            ])
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("delivery_description must not exceed 420 characters", result.stdout)
 
     def test_delivery_descriptions_reject_stock_and_model_wording(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -226,6 +330,7 @@ class DeliveryPipelineTests(unittest.TestCase):
             self.assertEqual(qc_record["delivery_qc_passed"], 1)
             self.assertEqual(qc_record["delivery_qc_note"], "质检通过")
             self.assertTrue(qc_record["delivery_qc_checked_at"])
+            approve_all(database)
 
             claude_root = root / "claude-projects"
             claude_root.mkdir()
@@ -288,6 +393,117 @@ class DeliveryPipelineTests(unittest.TestCase):
                 2,
             )
 
+    def test_codex_five_dimension_review_can_release_final_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = self.prepare(root)
+            input_path = root / "score.json"
+            input_path.write_text(json.dumps(automated_record(), ensure_ascii=False), encoding="utf-8")
+            self.assertEqual(self.run_command([
+                sys.executable, str(COLLECTOR), "--db", str(database), "--batch", "0911",
+                "--question", "1", "--turn", "1", "--from-json", str(input_path),
+            ]).returncode, 0)
+            self.assertEqual(self.run_command([
+                sys.executable, str(QC), "--db", str(database), "--batch", "0911", "--finalize",
+            ]).returncode, 0)
+            dossier = build_codex_review_dossier(database, "0911-001-T01")
+            self.assertEqual(set(dossier["scores"]), {
+                "delivery", "instruction", "planning", "reasoning", "execution",
+            })
+
+            result = approve_codex_record(database, "0911-001-T01", codex_review())
+
+            self.assertEqual(result["review_method"], "codex")
+            with connect(database) as connection:
+                record = connection.execute(
+                    "SELECT human_qc_approved,human_qc_reviewer,review_method FROM records"
+                ).fetchone()
+                dimensions = connection.execute(
+                    "SELECT dimension,reviewer FROM record_dimension_reviews ORDER BY dimension"
+                ).fetchall()
+            self.assertEqual(record["human_qc_approved"], 1)
+            self.assertEqual(record["review_method"], "codex")
+            self.assertIn("Codex", record["human_qc_reviewer"])
+            self.assertEqual(len(dimensions), 5)
+            self.assertTrue(all("Codex" in row["reviewer"] for row in dimensions))
+            with self.assertRaisesRegex(ValueError, "已经完成最终复核"):
+                approve_codex_record(database, "0911-001-T01", codex_review())
+            with self.assertRaisesRegex(ValueError, "已经完成最终复核"):
+                approve_record(
+                    database,
+                    "0911-001-T01",
+                    "gaoyong",
+                    {
+                        dimension: True
+                        for dimension in ("delivery", "instruction", "planning", "reasoning", "execution")
+                    },
+                )
+
+    def test_codex_review_rejects_partial_or_blocked_verdict(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = self.prepare(root)
+            input_path = root / "score.json"
+            input_path.write_text(json.dumps(automated_record(), ensure_ascii=False), encoding="utf-8")
+            self.assertEqual(self.run_command([
+                sys.executable, str(COLLECTOR), "--db", str(database), "--batch", "0911",
+                "--question", "1", "--turn", "1", "--from-json", str(input_path),
+            ]).returncode, 0)
+            with connect(database) as connection:
+                connection.execute(
+                    "UPDATE records SET delivery_qc_passed=1,delivery_qc_note='质检通过',"
+                    "delivery_qc_checked_at='2026-09-07T12:00:00+08:00'"
+                )
+                connection.commit()
+            partial = codex_review()
+            partial["dimensions"].pop("planning")
+            with self.assertRaisesRegex(ValueError, "五维结论|未通过维度"):
+                approve_codex_record(database, "0911-001-T01", partial)
+            blocked = codex_review()
+            blocked["issues"] = ["仍有一项事实不能确认"]
+            with self.assertRaisesRegex(ValueError, "阻断问题"):
+                approve_codex_record(database, "0911-001-T01", blocked)
+            with connect(database) as connection:
+                approved = connection.execute(
+                    "SELECT human_qc_approved FROM records"
+                ).fetchone()[0]
+            self.assertEqual(approved, 0)
+
+    def test_trajectory_evidence_cannot_use_a_later_turn(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = self.prepare(root)
+            with connect(database) as connection:
+                question = connection.execute("SELECT * FROM questions").fetchone()
+            trajectory = root / "0911/session-001.jsonl"
+            later_user = {
+                "type": "user", "sessionId": "session-001", "promptId": "turn-002",
+                "message": {"role": "user", "content": "继续完善异常处理"},
+            }
+            later_assistant = {
+                "type": "assistant", "sessionId": "session-001",
+                "message": {"role": "assistant", "content": "后续验证已经完成。"},
+            }
+            with trajectory.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(later_user, ensure_ascii=False) + "\n")
+                stream.write(json.dumps(later_assistant, ensure_ascii=False) + "\n")
+            record = automated_record()
+            raw = trajectory.read_bytes().splitlines()[5]
+            for item in record["evidence_ledger"]:
+                item.update({
+                    "line": 6,
+                    "source_sha256": hashlib.sha256(raw).hexdigest(),
+                    "excerpt": "后续验证已经完成",
+                })
+            input_path = root / "score.json"
+            input_path.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+            result = self.run_command([
+                sys.executable, str(COLLECTOR), "--db", str(database), "--batch", "0911",
+                "--question", "1", "--turn", "1", "--from-json", str(input_path),
+            ])
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("不属于当前轮次范围", result.stdout)
+
     def test_later_failed_retry_does_not_hide_successful_session_trajectory(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -335,6 +551,7 @@ class DeliveryPipelineTests(unittest.TestCase):
                 "--finalize",
             ])
             self.assertEqual(result.returncode, 0, result.stdout)
+            approve_all(database)
             claude_root = root / "claude-projects"
             claude_root.mkdir()
             for question_no in (1, 2):
@@ -735,11 +952,12 @@ class DeliveryPipelineTests(unittest.TestCase):
                     }]},
                 },
             ]
-            (root / "0911/session-001.jsonl").write_text(
+            trajectory_path = root / "0911/session-001.jsonl"
+            trajectory_path.write_text(
                 "\n".join(json.dumps(event, ensure_ascii=False) for event in events) + "\n",
                 encoding="utf-8",
             )
-            first = automated_record()
+            first = bind_evidence_to_line(automated_record(), trajectory_path, 2, "tool-continue")
             first_path = root / "first.json"
             first_path.write_text(json.dumps(first, ensure_ascii=False), encoding="utf-8")
             first_result = self.run_command([
@@ -748,10 +966,11 @@ class DeliveryPipelineTests(unittest.TestCase):
             ])
             self.assertEqual(first_result.returncode, 0, first_result.stdout)
 
-            continued = automated_record()
+            continued = automated_record(2)
             continued.update({
                 "record_id": "0911-001-T02",
                 "session_id": "session-001",
+                "trajectory_file": "session-001.jsonl",
                 "turn_id": "turn-001",
                 "user_prompt": question["prompt"],
                 "raw_user_prompt": "继续",
@@ -763,6 +982,7 @@ class DeliveryPipelineTests(unittest.TestCase):
                 "languages": question["languages"],
                 "other_issues": "执行过程因响应限制发生中断，输入一次继续后恢复处理并完成剩余工作。",
             })
+            bind_evidence_to_line(continued, trajectory_path, 5, "中断后已经恢复工作并完成实现")
             continued_path = root / "continued.json"
             continued_path.write_text(
                 json.dumps(continued, ensure_ascii=False), encoding="utf-8",
@@ -816,6 +1036,7 @@ class DeliveryPipelineTests(unittest.TestCase):
             self.assertEqual(self.run_command([
                 sys.executable, str(QC), "--db", str(database), "--batch", "0911", "--finalize",
             ]).returncode, 0)
+            approve_all(database)
 
             client = Client()
             factory = lambda *_args: client
@@ -859,6 +1080,7 @@ class DeliveryPipelineTests(unittest.TestCase):
             self.assertEqual(self.run_command([
                 sys.executable, str(QC), "--db", str(database), "--batch", "0911", "--finalize",
             ]).returncode, 0)
+            approve_all(database)
             client = Client()
             factory = lambda *_args: client
             failed = submit_records(
@@ -908,6 +1130,7 @@ class DeliveryPipelineTests(unittest.TestCase):
             self.assertEqual(self.run_command([
                 sys.executable, str(QC), "--db", str(database), "--batch", "0911", "--finalize",
             ]).returncode, 0)
+            approve_all(database)
             with connect(database) as connection:
                 first = connection.execute(
                     "SELECT record_id,question_id FROM records ORDER BY question_id LIMIT 1"
@@ -949,6 +1172,7 @@ class DeliveryPipelineTests(unittest.TestCase):
             self.assertEqual(self.run_command([
                 sys.executable, str(QC), "--db", str(database), "--batch", "0911", "--finalize",
             ]).returncode, 0)
+            approve_all(database)
 
             result = submit_records(
                 database, root / "cookies", "https://solo2.example.com", manual=False,

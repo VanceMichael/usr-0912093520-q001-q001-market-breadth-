@@ -11,6 +11,8 @@ from datetime import datetime, time, timedelta, timezone
 from difflib import SequenceMatcher
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from tools.delivery_quality import prose_english_issues, validate_evidence_structure
+
 
 try:
     PROJECT_TIMEZONE = ZoneInfo("Asia/Shanghai")
@@ -54,6 +56,7 @@ EXPORT_KEYS = [
 ]
 SCORE_KEYS = {f"{prefix}_score" for prefix in SCORE_PREFIXES}
 MIN_DESCRIPTION_CHINESE = 45
+MAX_DESCRIPTION_CHARS = 420
 DESCRIPTION_META_PATTERNS = (
     re.compile(r"(?i)(?:^|[^A-Za-z])AI\s*(?:分析|生成|评分|撰写|认为)"),
     re.compile(r"(?:由|作为|本)\s*(?:AI|Codex)\b", re.IGNORECASE),
@@ -84,6 +87,8 @@ def as_record(row: sqlite3.Row | dict) -> dict:
     record = dict(row)
     record["human_authored"] = bool(record.get("human_authored"))
     record["human_qc_approved"] = bool(record.get("human_qc_approved"))
+    record["evidence_gate_passed"] = bool(record.get("evidence_gate_passed"))
+    record["history_gate_passed"] = bool(record.get("history_gate_passed"))
     record["delivery_qc_passed"] = bool(record.get("delivery_qc_passed"))
     record["is_continuation"] = bool(record.get("is_continuation"))
     return record
@@ -101,7 +106,10 @@ def load_records(
         clauses.append("b.name = ?")
         parameters.append(batch)
     if only_human_approved:
-        clauses.append("r.human_qc_approved = 1")
+        clauses.extend([
+            "r.human_qc_approved = 1",
+            "r.review_method IN ('human','codex')",
+        ])
     where = " WHERE " + " AND ".join(clauses) if clauses else ""
     rows = connection.execute(
         "SELECT r.*, b.name AS batch_name, q.question_no, q.task_id "
@@ -135,6 +143,10 @@ def _description_style_errors(description: str, *, minimum: int = MIN_DESCRIPTIO
     chinese_count = len(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]", description))
     if chinese_count < minimum:
         errors.append(f"必须包含至少 {minimum} 个中文字符并使用自然、完整的书面语")
+    if "\n" in description or "\r" in description:
+        errors.append("五维描述必须是单段文本")
+    if len(description) > MAX_DESCRIPTION_CHARS:
+        errors.append(f"五维描述不得超过 {MAX_DESCRIPTION_CHARS} 个字符")
     sentences = [part for part in re.split(r"[。！？!?]+", description) if part.strip()]
     if minimum >= MIN_DESCRIPTION_CHINESE and len(sentences) < 2:
         errors.append("必须用至少两个完整句子分别说明证据和工程影响")
@@ -145,6 +157,7 @@ def _description_style_errors(description: str, *, minimum: int = MIN_DESCRIPTIO
     prose = re.sub(r"```.*?```|`[^`]*`|https?://\S+", " ", description, flags=re.DOTALL)
     if UNNECESSARY_ENGLISH_RE.search(prose):
         errors.append("不得使用可由中文直接表达的英文评价或衔接词")
+    errors.extend(prose_english_issues(description))
     return errors
 
 
@@ -152,6 +165,7 @@ def validate_one(
     record: dict,
     require_human_qc: bool = False,
     require_delivery_qc: bool = False,
+    require_quality_gates: bool = False,
 ) -> tuple[list[str], list[str]]:
     record_id = str(record.get("record_id") or "<unknown>")
     errors: list[str] = []
@@ -230,8 +244,20 @@ def validate_one(
         errors.append(f"{record_id}: human_authored must be boolean")
     if not isinstance(record.get("human_qc_approved"), bool):
         errors.append(f"{record_id}: human_qc_approved must be boolean")
-    elif require_human_qc and record["human_qc_approved"] is not True:
-        errors.append(f"{record_id}: human qualitative QC is not approved")
+    elif record["human_qc_approved"] is True:
+        review_method = str(record.get("review_method") or "")
+        if review_method not in {"human", "codex"}:
+            errors.append(f"{record_id}: final review method must be human or codex")
+        if not str(record.get("human_qc_reviewer") or "").strip():
+            errors.append(f"{record_id}: final reviewer is missing")
+        _parse_timestamp(
+            record.get("human_qc_approved_at"),
+            "human_qc_approved_at",
+            record_id,
+            errors,
+        )
+    elif require_human_qc:
+        errors.append(f"{record_id}: final five-dimension review is not approved")
     if not isinstance(record.get("delivery_qc_passed"), bool):
         errors.append(f"{record_id}: delivery_qc_passed must be boolean")
     elif require_delivery_qc and record["delivery_qc_passed"] is not True:
@@ -256,6 +282,17 @@ def validate_one(
         else:
             if not isinstance(parsed_changes, list):
                 errors.append(f"{record_id}: delivery_qc_changes must contain an array")
+
+    evidence_errors, _evidence, _coverage = validate_evidence_structure(record)
+    errors.extend(evidence_errors)
+    for field, label in (
+        ("evidence_gate_passed", "事实证据门禁"),
+        ("history_gate_passed", "历史反模板门禁"),
+    ):
+        if not isinstance(record.get(field), bool):
+            errors.append(f"{record_id}: {field} must be boolean")
+        elif require_quality_gates and record[field] is not True:
+            errors.append(f"{record_id}: {label}未通过")
 
     is_continuation = record.get("is_continuation", False)
     if not isinstance(is_continuation, bool):
@@ -318,12 +355,13 @@ def validate_records(
     records: list[dict],
     require_human_qc: bool = False,
     require_delivery_qc: bool = False,
+    require_quality_gates: bool = False,
 ) -> tuple[list[str], list[str]]:
     errors: list[str] = []
     warnings: list[str] = []
     for record in records:
         item_errors, item_warnings = validate_one(
-            record, require_human_qc, require_delivery_qc
+            record, require_human_qc, require_delivery_qc, require_quality_gates
         )
         errors.extend(item_errors)
         warnings.extend(item_warnings)

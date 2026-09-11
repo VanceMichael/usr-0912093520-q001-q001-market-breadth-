@@ -22,6 +22,7 @@ from tools.delivery_records import (  # noqa: E402
     TASK_TYPES,
     validate_one,
 )
+from tools.delivery_quality import history_matches, verify_evidence_sources  # noqa: E402
 
 
 def now() -> str:
@@ -82,6 +83,10 @@ def collect_fields(turn_no: int) -> dict:
         label = labels[prefix]
         data[f"{prefix}_score"] = ask_score(label)
         data[f"{prefix}_description"] = ask(f"{label} - 描述")
+    print("请粘贴证据账本 JSON 数组；每句话都要关联原始要求、轨迹行或工作区文件。")
+    data["evidence_ledger"] = ask_json_array("五维证据账本")
+    print("请粘贴需求覆盖表 JSON 数组。")
+    data["requirement_coverage"] = ask_json_array("需求覆盖表")
     data.update({
         "other_issues": ask("其他问题（没有可留空）", allow_blank=True),
         "submitter": ask("提交人"),
@@ -90,6 +95,19 @@ def collect_fields(turn_no: int) -> dict:
         "human_authored": ask("评分和描述是否完全由人工撰写，输入 YES 或 NO") == "YES",
     })
     return data
+
+
+def ask_json_array(label: str) -> list:
+    while True:
+        raw = ask(label)
+        try:
+            value = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            print(f"JSON 格式错误：{exc}")
+            continue
+        if isinstance(value, list):
+            return value
+        print("必须填写 JSON 数组。")
 
 
 def load_input(path: Path | None, turn_no: int) -> dict:
@@ -141,7 +159,7 @@ def build_record(
         "instruction_score", "instruction_description", "planning_score",
         "planning_description", "reasoning_score", "reasoning_description",
         "execution_score", "execution_description", "other_issues", "submitter",
-        "turn_completed_at", "human_authored",
+        "turn_completed_at", "human_authored", "evidence_ledger", "requirement_coverage",
     }
     if turn_no > 1:
         required_input.update({"user_prompt", "task_type", "difficulty", "languages"})
@@ -183,6 +201,14 @@ def build_record(
         "human_qc_approved": False,
         "human_qc_reviewer": "",
         "human_qc_approved_at": "",
+        "human_qc_note": "",
+        "review_method": "",
+        "evidence_ledger": json.dumps(supplied["evidence_ledger"], ensure_ascii=False),
+        "requirement_coverage": json.dumps(supplied["requirement_coverage"], ensure_ascii=False),
+        "evidence_gate_passed": False,
+        "evidence_checked_at": "",
+        "history_gate_passed": False,
+        "history_checked_at": "",
         "delivery_qc_passed": False,
         "delivery_qc_note": "",
         "delivery_qc_checked_at": "",
@@ -240,6 +266,32 @@ def main() -> int:
         errors, _warnings = validate_one(record)
         if errors:
             raise ValueError("; ".join(errors))
+        trajectory_root = str(run["trajectory_root"] or "").strip()
+        if not trajectory_root:
+            raise ValueError("registered run has no authoritative trajectory_root")
+        evidence_errors = verify_evidence_sources(
+            record,
+            question_folder=Path(str(question["folder_path"])),
+            trajectory_root=Path(trajectory_root),
+        )
+        if evidence_errors:
+            raise ValueError("事实证据门禁未通过：" + "; ".join(evidence_errors))
+        duplicate_descriptions = history_matches(
+            connection, record, exclude_record_id=record["record_id"]
+        )
+        if duplicate_descriptions:
+            first = duplicate_descriptions[0]
+            raise ValueError(
+                "历史反模板门禁未通过："
+                f"{first['dimension']} 与 {first['source_node']}的 {first['record_id']} 过于相似"
+            )
+        checked_at = now()
+        record.update({
+            "evidence_gate_passed": True,
+            "evidence_checked_at": checked_at,
+            "history_gate_passed": True,
+            "history_checked_at": checked_at,
+        })
         register_session(connection, run, record["session_id"])
         insert_record(connection, record)
     except (OSError, ValueError, sqlite3.Error) as exc:
@@ -249,7 +301,7 @@ def main() -> int:
         if connection is not None:
             connection.close()
     print(f"Stored draft record {record['record_id']} in {args.db.resolve()}")
-    print("下一步：按顺序录入其余有效轮次；批次全部录入后执行交付质检。")
+    print("下一步：按顺序录入其余有效轮次；批次全部录入后停止，等待独立交付质检任务。")
     return 0
 
 

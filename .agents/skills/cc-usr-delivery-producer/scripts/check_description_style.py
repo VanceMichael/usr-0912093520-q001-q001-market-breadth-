@@ -6,9 +6,17 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sqlite3
 import sys
 from difflib import SequenceMatcher
 from pathlib import Path
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[4]
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from tools.batch_pipeline import connect  # noqa: E402
+from tools.delivery_quality import history_matches, prose_english_issues  # noqa: E402
 
 
 PREFIXES = ("delivery", "instruction", "planning", "reasoning", "execution")
@@ -51,6 +59,7 @@ ENGLISH_EVALUATOR_LABEL_RE = re.compile(
 )
 STYLE_FIELDS = tuple(f"{prefix}_description" for prefix in PREFIXES)
 MIN_DESCRIPTION_CHINESE = 45
+MAX_DESCRIPTION_CHARS = 420
 NON_MAX_EVIDENCE_RE = re.compile(
     r"(?:第[一二三四五六七八九十\d]+(?:步|次|轮)|"
     r"(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+|[A-Za-z][A-Za-z0-9_.-]+\.(?:go|java|py|ts|tsx|js|jsx|sql|md)|"
@@ -129,11 +138,20 @@ def check_record(path: Path, record: dict, record_index: int) -> list[str]:
             errors.append(f"{path} record {record_index}: {field} contains scaffolding or an arrow")
         if ENGLISH_EVALUATOR_LABEL_RE.search(text):
             errors.append(f"{path} record {record_index}: {field} contains an English evaluator label")
+        for issue in prose_english_issues(text):
+            errors.append(f"{path} record {record_index}: {field} {issue}")
         chinese_count = len(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]", text))
         if chinese_count < MIN_DESCRIPTION_CHINESE:
             errors.append(
                 f"{path} record {record_index}: {field} must contain at least "
                 f"{MIN_DESCRIPTION_CHINESE} Chinese characters"
+            )
+        if "\n" in text or "\r" in text:
+            errors.append(f"{path} record {record_index}: {field} must be a single paragraph")
+        if len(text) > MAX_DESCRIPTION_CHARS:
+            errors.append(
+                f"{path} record {record_index}: {field} must not exceed "
+                f"{MAX_DESCRIPTION_CHARS} characters"
             )
         if text.count("；") + text.count(";") > 1:
             errors.append(f"{path} record {record_index}: {field} has repeated semicolon joins")
@@ -207,6 +225,7 @@ def check_record(path: Path, record: dict, record_index: int) -> list[str]:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Reject formulaic delivery descriptions before SQLite insertion")
     parser.add_argument("--input", nargs="+", type=Path, required=True, help="one or more temporary record JSON files")
+    parser.add_argument("--db", type=Path, help="compare with every description already stored in SQLite")
     args = parser.parse_args()
     try:
         records = load_records(args.input)
@@ -243,6 +262,20 @@ def main() -> int:
                     errors.append(
                         f"{field}: exact long fragment {duplicate!r} is repeated across {left_path} and {right_path}"
                     )
+    if args.db:
+        try:
+            with connect(args.db.resolve()) as connection:
+                for path, record in records:
+                    for match in history_matches(
+                        connection, record, exclude_record_id=str(record.get("record_id") or "")
+                    ):
+                        errors.append(
+                            f"{path}: {match['dimension']} 与 {match['source_node']}的 "
+                            f"{match['record_id']} 过于相似（相似度 {match['similarity']:.3f}，"
+                            f"最长重复片段 {match['longest_fragment']} 字）"
+                        )
+        except (OSError, sqlite3.Error, ValueError) as exc:
+            errors.append(f"历史描述读取失败：{exc}")
     if errors:
         print("STYLE GATE BLOCKED", file=sys.stderr)
         for error in errors:

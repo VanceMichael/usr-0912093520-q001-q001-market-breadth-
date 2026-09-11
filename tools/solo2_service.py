@@ -60,7 +60,11 @@ def _records(
     numbers: set[int] | None = None,
     pending_only: bool = False,
 ) -> list[sqlite3.Row]:
-    clauses = ["r.delivery_qc_passed=1", "r.delivery_qc_note='质检通过'"]
+    clauses = [
+        "r.delivery_qc_passed=1", "r.delivery_qc_note='质检通过'",
+        "r.evidence_gate_passed=1", "r.history_gate_passed=1",
+        "r.human_qc_approved=1", "r.review_method IN ('human','codex')",
+    ]
     parameters: list[object] = []
     if batch:
         clauses.append("b.name=?")
@@ -205,7 +209,12 @@ def submit_records(
                 if not fingerprint:
                     raise Solo2Error("平台表单缺少 schema_fingerprint")
             record = as_record(row)
-            errors, warnings = validate_one(record, require_delivery_qc=True)
+            errors, warnings = validate_one(
+                record,
+                require_human_qc=True,
+                require_delivery_qc=True,
+                require_quality_gates=True,
+            )
             if errors or warnings:
                 raise Solo2Error("本地交付校验未通过：" + "；".join(errors + warnings))
             with connect(database) as connection:

@@ -1,6 +1,6 @@
 # Delivery QC checklist
 
-Check every record and correct every supported noncompliance before finalizing the batch.
+Check every stored production record and correct every supported noncompliance before finalizing the batch. Do not regenerate the batch during delivery QC.
 
 发现即处理：任何错误、警告、缺失字段、证据冲突或链路不一致都要在当前质检任务中立即核对、修正并复检。不能只把问题列在报告里，不能等导出阶段再处理，也不能在仍有问题时写入“质检通过”。
 
@@ -17,7 +17,9 @@ Check every record and correct every supported noncompliance before finalizing t
 - The matched JSONL must be clean for this question. Reject it if any nested tool event invokes `Skill`/slash-command loading or reads external skill, `CLAUDE.md`, `AGENTS.md`, Claude settings, or Codex config outside the current question workspace. Such contamination cannot be repaired in SQLite; require a new clean model run.
 - Reproducibility, harness, harness version, operating system, task type, difficulty, and languages use the project-approved values and describe this turn accurately.
 - All five scores are integers from 1 through 5 and agree with their descriptions and the rubric. No plan/status evidence caps `任务规划` at 2; substantial failed/repeated/unverified execution caps `执行能力` at 3 unless the evidence clearly shows an external-only failure and precise recovery. A description-score contradiction is a blocking error, not a style preference.
-- All five descriptions are non-empty, factual, dimension-specific Chinese professional prose. Every conclusion names verifiable evidence from a file, function, command, error, test result, explicit requirement, or exact trajectory action. A deduction makes the problem location, actual behavior, and impact clear without visible labels or a fixed sentence frame.
+- All five descriptions are non-empty, factual, dimension-specific Chinese professional prose. Each one is a single paragraph with at least 45 Chinese characters and no more than 420 total characters. Every conclusion names verifiable evidence from a file, function, command, error, test result, explicit requirement, or exact trajectory action. A deduction makes the problem location, actual behavior, and impact clear without visible labels or a fixed sentence frame.
+- A successful behavior claim requires a real test result, service interaction, or equivalent runtime evidence from the target turn. Static inspection, file existence, and final-response prose cannot prove success by themselves. A failed verification remains part of the delivery record and must lower the affected score instead of making the record disappear.
+- Every sentence is bound in `evidence_ledger`; source excerpts and hashes still match, trajectory lines fall inside the record's own user-turn boundary, and every material prompt requirement appears in `requirement_coverage`. A later turn's result cannot support an earlier record.
 - All descriptions and non-empty `其他问题` reject AI/evaluator/scoring/generation language and non-technical English evaluator words such as `rationale`, `overall`, `generally`, and `basically`; necessary file names, classes, commands, frameworks, protocols, paths, and code identifiers remain valid.
 - `其他问题` is text and is empty when there is nothing additional. When non-empty, it follows the same Chinese, evidence, and natural-writing requirements as the five descriptions and must add an issue outside the five score dimensions.
 - `提交人` is the real configured person, never a tool or model name.
@@ -32,6 +34,7 @@ Check every record and correct every supported noncompliance before finalizing t
 - Scores and descriptions do not contradict each other or omit an obvious issue visible in the evidence.
 - Descriptions contain no evaluator self-reference, model-performance wording, generation-process wording, scoring/QC language, fixed element labels, stock openings, arrows, placeholders, or verbatim reuse across dimensions. They do not read like translated or mechanically assembled prose.
 - Internal provenance remains truthful. Corrections never change `human_authored` or claim a human action that did not occur.
+- Final approval is separate from this skill. Export requires either five explicit human confirmations (`review_method=human`) or a five-dimension Codex approval (`review_method=codex`); Codex provenance must remain visible in audit fields.
 
 ## Repair loop
 
