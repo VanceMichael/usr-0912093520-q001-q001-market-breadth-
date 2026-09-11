@@ -747,19 +747,19 @@ def maintain_ready_buffer(
     """Keep authoring in parallel until control state asks the global pool to drain."""
     try:
         author_failures = 0
+        next_news_refill_at = 0.0
         while not stop_event.is_set():
             desired = str(store.state().get("desired_state") or "running")
             if desired != "running":
                 break
-            if count_ready(database) >= args.ready_watermark:
-                stop_event.wait(2)
-                continue
             batch_size = author_batch_size()
             available_topics = count_new_topics(database)
-            if available_topics < args.news_watermark:
+            refill_delay = min(60, max(5, args.poll_seconds))
+            if available_topics < args.news_watermark and time.monotonic() >= next_news_refill_at:
                 feeds = configured_feeds(database) if args.dynamic_feeds else args.feeds
                 added, errors = ingest(database, feeds, args.feed_timeout)
                 available_topics = count_new_topics(database)
+                next_news_refill_at = time.monotonic() + refill_delay
                 if added or errors:
                     store.event(
                         "news_refill",
@@ -773,16 +773,18 @@ def maintain_ready_buffer(
                             "feed_errors": errors,
                         },
                     )
+            if count_ready(database) >= args.ready_watermark:
+                stop_event.wait(2)
+                continue
             if available_topics < batch_size:
-                delay = min(60, max(5, args.poll_seconds))
                 store.heartbeat(
                     phase="idle", batch="",
                     detail=(
                         f"新闻待用 {available_topics}/{args.news_watermark} 条，"
-                        f"不足单批 {batch_size} 条，{delay} 秒后重新抓取"
+                        f"不足单批 {batch_size} 条，{refill_delay} 秒后重新抓取"
                     ),
                 )
-                stop_event.wait(delay)
+                stop_event.wait(refill_delay)
                 continue
             code, batch = create_next_batch(database, args, store)
             if code:

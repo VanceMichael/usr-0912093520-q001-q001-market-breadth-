@@ -264,6 +264,31 @@ def test_news_below_watermark_still_creates_batch_when_enough_exist() -> None:
         create_next.assert_called_once()
 
 
+def test_news_refill_runs_even_when_question_buffer_is_full() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        database = root / "production.sqlite3"
+        stop = StopAfterFirstWait()
+        args = Namespace(
+            news_watermark=40, ready_watermark=40, dynamic_feeds=False,
+            feeds=["https://news.example"], feed_timeout=1, poll_seconds=60,
+        )
+        store = mock.Mock()
+        store.state.return_value = {"desired_state": "running"}
+        with mock.patch(
+            "tools.pipeline_daemon.count_ready", return_value=40
+        ), mock.patch(
+            "tools.pipeline_daemon.ingest", return_value=(0, [])
+        ) as ingest_news, mock.patch(
+            "tools.pipeline_daemon.create_next_batch"
+        ) as create_next:
+            maintain_ready_buffer(database, args, store, stop, root / "producer.done", {})
+
+        ingest_news.assert_called_once()
+        create_next.assert_not_called()
+        assert stop.waits == [2]
+
+
 def test_recover_interrupted_authoring_releases_incomplete_claims() -> None:
     with tempfile.TemporaryDirectory() as raw:
         root = Path(raw)
