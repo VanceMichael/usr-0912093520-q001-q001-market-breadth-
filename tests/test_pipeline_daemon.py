@@ -26,8 +26,10 @@ from tools.pipeline_daemon import (
     maintain_ready_buffer,
     manual_jobs_active,
     pipeline_batch_timeout,
+    recover_interrupted_authoring,
 )
 from tools.batch_pipeline import connect
+from tools.scheduler_state import SchedulerStore
 
 
 def test_runtime_env_loads_escaped_difficulty_weights() -> None:
@@ -260,6 +262,74 @@ def test_news_below_watermark_still_creates_batch_when_enough_exist() -> None:
 
         ingest_news.assert_called_once()
         create_next.assert_called_once()
+
+
+def test_recover_interrupted_authoring_releases_incomplete_claims() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        database = root / "production.sqlite3"
+        SchedulerStore(database)
+        with connect(database) as connection:
+            connection.execute(
+                "INSERT INTO batches(name,folder_path,markdown_path,question_count,status,created_at,updated_at) "
+                "VALUES('batch',?,?,2,'draft','now','now')",
+                (str(root / "batch"), str(root / "batch.md")),
+            )
+            for topic_id in (1, 2):
+                connection.execute(
+                    "INSERT INTO news_topics(id,source_url,article_url,title,topic_hash,status,created_at,updated_at) "
+                    "VALUES(?,?,?,?,?,'claimed','now','now')",
+                    (topic_id, "https://news.example", f"https://news.example/{topic_id}", "topic", f"hash-{topic_id}"),
+                )
+            connection.execute(
+                "INSERT INTO scheduler_events(created_at,event_type,batch_name,message,details_json) "
+                "VALUES('now','topics_claimed','batch','claimed',?)",
+                ('{"topic_ids":[1,2]}',),
+            )
+            connection.commit()
+
+        assert recover_interrupted_authoring(database) == (2, 0)
+        with connect(database) as connection:
+            assert connection.execute("SELECT status FROM batches WHERE name='batch'").fetchone()[0] == "failed"
+            assert connection.execute("SELECT COUNT(*) FROM news_topics WHERE status='new'").fetchone()[0] == 2
+
+
+def test_recover_interrupted_authoring_preserves_complete_batch() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        database = root / "production.sqlite3"
+        SchedulerStore(database)
+        with connect(database) as connection:
+            connection.execute(
+                "INSERT INTO batches(name,folder_path,markdown_path,question_count,status,created_at,updated_at) "
+                "VALUES('batch',?,?,1,'draft','now','now')",
+                (str(root / "batch"), str(root / "batch.md")),
+            )
+            batch_id = connection.execute("SELECT id FROM batches WHERE name='batch'").fetchone()[0]
+            connection.execute(
+                "INSERT INTO questions(batch_id,question_no,task_id,folder_name,folder_path,title,prompt,prompt_sha256,"
+                "task_type,difficulty,languages,repo_url,initial_snapshot,local_initial_sha,reproducibility,"
+                "mechanical_qc,qc_decision,qc_prompt_sha256,status,created_at,updated_at) "
+                "VALUES(?,1,'task','q001',?,'title','prompt','hash','0-1 代码生成','中等','Python',"
+                "'https://github.com/org/repo','https://github.com/org/repo/commit/sha','sha','ok',"
+                "'pass','pass','hash','approved','now','now')",
+                (batch_id, str(root / "q001")),
+            )
+            connection.execute(
+                "INSERT INTO news_topics(id,source_url,article_url,title,topic_hash,status,created_at,updated_at) "
+                "VALUES(1,'https://news.example','https://news.example/1','topic','hash','claimed','now','now')"
+            )
+            connection.execute(
+                "INSERT INTO scheduler_events(created_at,event_type,batch_name,message,details_json) "
+                "VALUES('now','topics_claimed','batch','claimed','{\"topic_ids\":[1]}')"
+            )
+            connection.commit()
+
+        assert recover_interrupted_authoring(database) == (0, 1)
+        with connect(database) as connection:
+            assert connection.execute("SELECT status FROM batches WHERE name='batch'").fetchone()[0] == "ready"
+            topic = connection.execute("SELECT status,used_batch FROM news_topics WHERE id=1").fetchone()
+            assert tuple(topic) == ("used", "batch")
 
 
 def test_create_batch_rejects_topic_count_mismatch() -> None:

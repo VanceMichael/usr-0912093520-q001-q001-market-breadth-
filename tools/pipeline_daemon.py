@@ -163,6 +163,89 @@ def recover_interrupted_runs(database: Path) -> int:
     return len(rows)
 
 
+def recover_interrupted_authoring(database: Path) -> tuple[int, int]:
+    """Resolve topic claims left behind when an author process was interrupted."""
+    released = 0
+    preserved = 0
+    with closing(connect(database.resolve())) as connection:
+        claimed_ids = {
+            int(row["id"])
+            for row in connection.execute(
+                "SELECT id FROM news_topics WHERE status='claimed'"
+            )
+        }
+        if not claimed_ids:
+            return 0, 0
+        events = connection.execute(
+            "SELECT batch_name,details_json FROM scheduler_events "
+            "WHERE event_type='topics_claimed' ORDER BY id DESC"
+        ).fetchall()
+        mapped_ids: set[int] = set()
+        timestamp = now()
+        for event in events:
+            try:
+                details = json.loads(str(event["details_json"] or "{}"))
+                topic_ids = {
+                    int(value) for value in details.get("topic_ids", [])
+                    if int(value) in claimed_ids
+                }
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            topic_ids -= mapped_ids
+            if not topic_ids:
+                continue
+            mapped_ids.update(topic_ids)
+            batch = str(event["batch_name"] or "")
+            row = connection.execute(
+                "SELECT id,status,question_count FROM batches WHERE name=?", (batch,),
+            ).fetchone()
+            complete = False
+            if row is not None:
+                expected = int(row["question_count"] or 0)
+                total, ready = connection.execute(
+                    "SELECT COUNT(*),SUM(CASE WHEN status='approved' AND mechanical_qc='pass' "
+                    "AND qc_decision='pass' AND qc_prompt_sha256=prompt_sha256 "
+                    "AND repo_url<>'' AND initial_snapshot<>'' AND local_initial_sha<>'' "
+                    "THEN 1 ELSE 0 END) FROM questions WHERE batch_id=?",
+                    (row["id"],),
+                ).fetchone()
+                complete = expected > 0 and int(total or 0) == expected and int(ready or 0) == expected
+                if complete and str(row["status"]) == "draft":
+                    connection.execute(
+                        "UPDATE batches SET status='ready',updated_at=? WHERE id=?",
+                        (timestamp, row["id"]),
+                    )
+                elif not complete and str(row["status"]) == "draft":
+                    connection.execute(
+                        "UPDATE batches SET status='failed',updated_at=? WHERE id=?",
+                        (timestamp, row["id"]),
+                    )
+            if complete:
+                connection.executemany(
+                    "UPDATE news_topics SET status='used',used_batch=?,updated_at=? "
+                    "WHERE id=? AND status='claimed'",
+                    [(batch, timestamp, topic_id) for topic_id in topic_ids],
+                )
+                preserved += len(topic_ids)
+            else:
+                connection.executemany(
+                    "UPDATE news_topics SET status='new',used_batch='',updated_at=? "
+                    "WHERE id=? AND status='claimed'",
+                    [(timestamp, topic_id) for topic_id in topic_ids],
+                )
+                released += len(topic_ids)
+        orphaned = claimed_ids - mapped_ids
+        if orphaned:
+            connection.executemany(
+                "UPDATE news_topics SET status='new',used_batch='',updated_at=? "
+                "WHERE id=? AND status='claimed'",
+                [(timestamp, topic_id) for topic_id in orphaned],
+            )
+            released += len(orphaned)
+        connection.commit()
+    return released, preserved
+
+
 def wait_with_heartbeat(store: SchedulerStore, seconds: int) -> None:
     deadline = time.monotonic() + max(1, seconds)
     while time.monotonic() < deadline:
@@ -933,11 +1016,20 @@ def main() -> int:
     try:
         store.startup()
         recovered = recover_interrupted_runs(args.db.resolve())
+        released_topics, preserved_topics = recover_interrupted_authoring(args.db.resolve())
         clear_question_leases(args.db.resolve())
         if recovered:
             store.event(
                 "runs_recovered", f"已回收 {recovered} 个中断的 Claude 任务",
                 level="warning", details={"count": recovered},
+            )
+        if released_topics or preserved_topics:
+            store.event(
+                "authoring_recovered",
+                f"已恢复中断出题：释放 {released_topics} 条新闻，保留 {preserved_topics} 条已完成新闻",
+                level="warning" if released_topics else "info",
+                phase="author",
+                details={"released_topics": released_topics, "preserved_topics": preserved_topics},
             )
         cleaned, reclaimed = cleanup_logs(args.log_dir.resolve(), args.log_retention_days, args.max_log_gb)
         if cleaned:
