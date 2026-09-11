@@ -123,8 +123,12 @@ def review_queue(database: Path, batch: str | None = None) -> dict:
         "records": items,
         "summary": {
             "total": len(items),
-            "waiting": sum(not item["human_qc_approved"] for item in items),
+            "waiting": sum(
+                not item["human_qc_approved"] and item["solo2_status"] != "succeeded"
+                for item in items
+            ),
             "approved": sum(item["human_qc_approved"] for item in items),
+            "delivered": sum(item["solo2_status"] == "succeeded" for item in items),
             "human_approved": sum(
                 item["human_qc_approved"] and item.get("review_method") == "human"
                 for item in items
@@ -134,7 +138,9 @@ def review_queue(database: Path, batch: str | None = None) -> dict:
                 for item in items
             ),
             "blocked": sum(
-                not item["human_qc_approved"] and not item["ready_for_review"]
+                not item["human_qc_approved"]
+                and item["solo2_status"] != "succeeded"
+                and not item["ready_for_review"]
                 for item in items
             ),
         },

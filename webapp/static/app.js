@@ -96,7 +96,7 @@ function currentQuestions() {
     if (state.stage && question.stage_index !== state.stage) return false;
     if (state.filter === "pending" && question.stage_index >= 7) return false;
     if (state.filter === "passed" && !question.delivery_qc) return false;
-    if (state.filter === "delivered" && !question.exported) return false;
+    if (state.filter === "delivered" && !question.delivered) return false;
     if (!needle) return true;
     return [question.title, question.task_id, question.languages, question.task_type]
       .join(" ").toLowerCase().includes(needle);
@@ -251,6 +251,7 @@ function renderReviews() {
     <span class="summary-chip">全部<strong>${summary.total}</strong></span>
     <span class="summary-chip">等待确认<strong>${summary.waiting}</strong></span>
     <span class="summary-chip success">复核通过<strong>${summary.approved}</strong></span>
+    <span class="summary-chip success">历史已交付<strong>${summary.delivered || 0}</strong></span>
     <span class="summary-chip warning">门禁阻断<strong>${summary.blocked}</strong></span>`;
   const reviewer = $("#review-reviewer");
   const selectedReviewer = reviewer.value;
@@ -265,13 +266,15 @@ function renderReviews() {
   }
   list.innerHTML = state.reviews.records.map((record) => {
     const [deliveryLabel, deliveryTone, deliveryDetail] = reviewDeliveryState(record);
+    const historicallyDelivered = record.solo2_status === "succeeded";
     const gateStatus = [
       [record.delivery_qc_passed, "自动质检"],
       [record.evidence_gate_passed, "事实证据"],
       [record.history_gate_passed && !record.history_matches.length, "历史去重"],
       [
-        record.human_qc_approved,
-        record.review_method === "codex" ? "Codex 复核" :
+        record.human_qc_approved || historicallyDelivered,
+        historicallyDelivered ? "历史 SOLO2 交付" :
+          record.review_method === "codex" ? "Codex 复核" :
           record.review_method === "human" ? "人工确认" : "最终复核",
       ],
     ];

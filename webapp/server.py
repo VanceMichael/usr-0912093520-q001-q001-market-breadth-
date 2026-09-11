@@ -2535,8 +2535,11 @@ class ConsoleData:
                 exported = human_qc and int(row["question_no"]) in exported_numbers
                 solo2_submitted_count = int(row["solo2_submitted_count"] or 0)
                 solo2_submitted = record_count > 0 and solo2_submitted_count == record_count
+                delivered = exported or solo2_submitted
                 pipeline_active = bool(row["pipeline_active"])
-                if not question_qc:
+                if delivered:
+                    stage_index, stage_label = 7, "已交付"
+                elif not question_qc:
                     stage_index, stage_label = 1, "题目待质检"
                 elif not run_complete:
                     if run_status == "running":
@@ -2589,6 +2592,7 @@ class ConsoleData:
                     "average_score": round(float(row["average_score"]), 1)
                     if row["average_score"] is not None else None,
                     "exported": exported,
+                    "delivered": delivered,
                     "solo2_submitted_count": solo2_submitted_count,
                     "solo2_submitted": solo2_submitted,
                     "pipeline_active": pipeline_active,
@@ -2612,7 +2616,7 @@ class ConsoleData:
             {"id": 3, "label": "交付生产", "complete": sum(q["record_count"] > 0 for q in questions)},
             {"id": 4, "label": "交付质检", "complete": sum(q["delivery_qc"] for q in questions)},
             {"id": 5, "label": "交付复核", "complete": sum(q["human_qc"] for q in questions)},
-            {"id": 6, "label": "Excel 交付", "complete": sum(q["exported"] for q in questions)},
+            {"id": 6, "label": "Excel / SOLO2 交付", "complete": sum(q["delivered"] for q in questions)},
         ]
         for stage in stages:
             stage["current"] = sum(q["stage_index"] == stage["id"] for q in questions)
@@ -2629,7 +2633,7 @@ class ConsoleData:
             "stages": stages,
             "summary": {
                 "total": total,
-                "delivered": sum(q["exported"] for q in questions),
+                "delivered": sum(q["delivered"] for q in questions),
                 "solo2_submitted": sum(q["solo2_submitted"] for q in questions),
                 "qc_passed": sum(q["delivery_qc"] for q in questions),
                 "waiting": sum(q["stage_index"] < 7 for q in questions),

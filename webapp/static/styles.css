@@ -451,7 +451,7 @@ th:nth-child(6) { width: 12%; }
 .review-heading-actions { display: flex; align-items: end; gap: 9px; }
 .reviewer-select { display: grid; gap: 5px; color: var(--muted); font-size: 10px; font-weight: 700; }
 .reviewer-select select { height: 38px; min-width: 154px; padding: 0 30px 0 10px; border: 1px solid var(--line); border-radius: 6px; background: #fff; color: var(--ink); }
-.review-summary { display: grid; grid-template-columns: repeat(4, minmax(110px, 1fr)); gap: 8px; margin: 14px 0; }
+.review-summary { display: grid; grid-template-columns: repeat(5, minmax(110px, 1fr)); gap: 8px; margin: 14px 0; }
 .summary-chip.warning { color: var(--amber); border-color: #ead19b; background: var(--amber-soft); }
 .summary-chip.warning strong { color: var(--amber); }
 .review-list { display: grid; gap: 14px; }

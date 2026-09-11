@@ -26,6 +26,7 @@ from tools.human_review import (  # noqa: E402
     review_queue,
 )
 from tools import orchestrator  # noqa: E402
+from webapp.server import ConsoleData  # noqa: E402
 
 
 COLLECTOR = ROOT / ".agents/skills/cc-usr-delivery-producer/scripts/collect_record.py"
@@ -1103,6 +1104,20 @@ class DeliveryPipelineTests(unittest.TestCase):
             self.assertEqual(after["0911-002-T01"]["solo2_remote_id"], "remote-exact")
             self.assertFalse(after["0911-002-T01"]["can_solo2_submit"])
             self.assertTrue(after["0911-001-T01"]["can_solo2_submit"])
+            self.assertEqual(review_queue(database, "0911")["summary"]["delivered"], 1)
+            with connect(database) as connection:
+                connection.execute(
+                    "UPDATE records SET human_qc_approved=0,human_qc_reviewer='',"
+                    "human_qc_approved_at='',review_method='' WHERE record_id='0911-002-T01'"
+                )
+                connection.commit()
+            console = ConsoleData(database, root)
+            try:
+                question = console.dashboard("0911")["questions"][1]
+                self.assertTrue(question["delivered"])
+                self.assertEqual(question["stage_label"], "已交付")
+            finally:
+                console.shutdown()
             with self.assertRaisesRegex(ValueError, "已经提交到 SOLO2"):
                 reject_record(database, "0911-002-T01", "gaoyong", "需要重新修改评分描述")
 
