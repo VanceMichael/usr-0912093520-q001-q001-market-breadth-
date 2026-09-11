@@ -292,15 +292,24 @@ function renderReviews() {
     }).join("");
     const history = record.history_matches.length ? `<div class="history-warning"><strong>发现历史相似描述</strong>${record.history_matches.slice(0, 5).map((item) => `<p>${escapeHtml(item.record_id)} · ${escapeHtml(item.dimension)} · 相似度 ${Math.round(item.similarity * 100)}%</p>`).join("")}</div>` : "";
     const codex = record.codex_review ? `<div class="codex-review-report ${escapeHtml(record.codex_review.status)} ${escapeHtml(record.codex_review.decision)}"><div><strong>Codex 自动逐维复核${record.codex_review.decision === "approved" ? " · 已通过" : record.codex_review.decision === "rejected" ? " · 未通过" : ""}</strong><span>${escapeHtml(formatDate(record.codex_review.updated_at))}</span></div><pre>${escapeHtml(record.codex_review.report || (record.codex_review.status === "started" ? "正在读取全部复核资料…" : "暂无报告"))}</pre></div>` : "";
+    const regenerationLabels = {
+      started: "正在根据已有证据生成新交付产物",
+      quality_checking: "新交付产物已生成，正在执行交付质检",
+      completed: "新交付产物和交付质检均已完成",
+      failed: "重新生成或交付质检失败",
+    };
+    const regeneration = record.delivery_regeneration ? `<div class="codex-review-report ${escapeHtml(record.delivery_regeneration.status)}"><div><strong>${escapeHtml(regenerationLabels[record.delivery_regeneration.status] || "交付产物重新生成")}</strong><span>${escapeHtml(formatDate(record.delivery_regeneration.updated_at))}</span></div>${record.delivery_regeneration.report ? `<pre>${escapeHtml(record.delivery_regeneration.report)}</pre>` : ""}</div>` : "";
+    const regenerationRunning = ["started", "quality_checking"].includes(record.delivery_regeneration?.status);
+    const codexReviewRunning = record.codex_review?.status === "started";
     const submitLabel = record.solo2_status === "succeeded" ? "已提交此条" :
       record.solo2_status === "submitting" ? "正在提交" :
       record.solo2_status ? "重试提交此条" : "提交此条到 SOLO2";
     return `<article class="review-record" data-review-record="${escapeHtml(record.record_id)}">
       <header class="review-record-head"><div><span>${escapeHtml(record.batch_name)} · 第 ${record.question_no} 题 · 第 ${record.turn_no} 轮</span><h3>${escapeHtml(record.title)}</h3><p>${escapeHtml(record.record_id)}</p></div><div class="gate-strip">${gateStatus.map(([passed, label]) => `<span class="tag ${passed ? "green" : "amber"}">${escapeHtml(label)}${passed ? "通过" : "待处理"}</span>`).join("")}</div></header>
       <details class="review-prompt"><summary>查看原始要求和需求覆盖</summary><p>${escapeHtml(record.user_prompt)}</p><ul>${coverage}</ul></details>
-      ${history}${dimensions}${codex}
+      ${history}${dimensions}${regeneration}${codex}
       <div class="review-delivery-state"><div><span>单条交付状态${record.solo2_attempt_count ? ` · 已尝试 ${record.solo2_attempt_count} 次` : ""}</span><strong>${escapeHtml(deliveryDetail)}</strong>${record.solo2_last_error ? `<small>${escapeHtml(record.solo2_last_error)}</small>` : ""}</div><span class="tag ${escapeHtml(deliveryTone)}">${escapeHtml(deliveryLabel)}</span></div>
-      <footer class="review-actions"><textarea data-review-note rows="2" maxlength="500" placeholder="退回时填写具体问题；人工通过时可填写补充说明"></textarea><div><button class="button secondary" type="button" data-review-action="codex" ${record.ready_for_review && !record.human_qc_approved && record.codex_review?.status !== "started" ? "" : "disabled"}><i data-lucide="scan-search"></i>${record.codex_review?.status === "started" ? "Codex 复核中" : "Codex 代替人工复核"}</button><button class="button secondary" type="button" data-review-action="reject" ${["submitting", "succeeded"].includes(record.solo2_status) ? "disabled" : ""}><i data-lucide="undo-2"></i>退回重写</button><button class="button primary" type="button" data-review-action="approve" ${record.ready_for_review && !record.human_qc_approved ? "" : "disabled"}><i data-lucide="badge-check"></i>${record.human_qc_approved ? (record.review_method === "codex" ? "已由 Codex 通过" : "已人工确认") : "人工确认五维并通过"}</button><button class="button delivery-submit" type="button" data-review-action="solo2" ${record.can_solo2_submit ? "" : "disabled"}><i data-lucide="send"></i>${escapeHtml(submitLabel)}</button></div></footer>
+      <footer class="review-actions"><textarea data-review-note rows="2" maxlength="500" placeholder="退回时填写具体问题；人工通过时可填写补充说明"></textarea><div><button class="button secondary" type="button" data-review-action="regenerate" ${["submitting", "succeeded"].includes(record.solo2_status) || record.human_qc_approved || regenerationRunning || codexReviewRunning ? "disabled" : ""}><i data-lucide="refresh-cw"></i>${regenerationRunning ? "正在重新生成" : "根据已有证据重新生成"}</button><button class="button secondary" type="button" data-review-action="codex" ${record.ready_for_review && !record.human_qc_approved && !codexReviewRunning && !regenerationRunning ? "" : "disabled"}><i data-lucide="scan-search"></i>${codexReviewRunning ? "Codex 复核中" : "Codex 代替人工复核"}</button><button class="button secondary" type="button" data-review-action="reject" ${["submitting", "succeeded"].includes(record.solo2_status) || regenerationRunning ? "disabled" : ""}><i data-lucide="undo-2"></i>退回重写</button><button class="button primary" type="button" data-review-action="approve" ${record.ready_for_review && !record.human_qc_approved && !regenerationRunning ? "" : "disabled"}><i data-lucide="badge-check"></i>${record.human_qc_approved ? (record.review_method === "codex" ? "已由 Codex 通过" : "已人工确认") : "人工确认五维并通过"}</button><button class="button delivery-submit" type="button" data-review-action="solo2" ${record.can_solo2_submit && !regenerationRunning ? "" : "disabled"}><i data-lucide="send"></i>${escapeHtml(submitLabel)}</button></div></footer>
     </article>`;
   }).join("");
   refreshIcons();
@@ -486,7 +495,17 @@ function renderScheduler() {
   const failureDetail = [runtime.failure_kind ? `故障类型：${runtime.failure_kind}` : "", runtime.last_error || "", circuitDetail].filter(Boolean).join(" · ");
   $("#scheduler-overview").innerHTML = `<div class="scheduler-status-line ${escapeHtml(status)}"><div><span class="node-signal ${online ? "online" : ""}"></span><div><strong>${escapeHtml(selected.name)} · ${online ? schedulerStateLabel(runtime.actual_state) : "守护进程离线"}</strong><p>${escapeHtml(schedulerModeLabel(runtime.run_mode))} · ${escapeHtml(schedulerPhaseLabel(runtime.phase))}${runtime.batch_name ? ` · ${escapeHtml(runtime.batch_name)}` : ""} · ${escapeHtml(runtime.detail || "暂无运行详情")}</p></div></div><dl><div><dt>心跳</dt><dd>${runtime.heartbeat_age_seconds === null ? "暂无" : `${runtime.heartbeat_age_seconds} 秒前`}</dd></div><div><dt>PID</dt><dd>${runtime.pid || "-"}</dd></div><div><dt>已完成周期</dt><dd>${runtime.cycle_count || 0}</dd></div><div><dt>连续失败</dt><dd>${runtime.consecutive_failures || 0}</dd></div><div><dt>数据库</dt><dd>${runtime.database_status === "unavailable" ? "不可用" : "正常"}</dd></div><div><dt>最近成功</dt><dd>${escapeHtml(runtime.last_success_at || "暂无")}</dd></div></dl></div>${failureDetail ? `<div class="scheduler-error"><i data-lucide="triangle-alert"></i><span>${escapeHtml(failureDetail)}</span></div>` : ""}`;
   const queue = snapshot.queue || {};
-  const stats = [["新闻待用", queue.news_ready], ["活跃批次", queue.batches_active], ["待跑题", queue.questions_ready], ["运行中", queue.questions_running], ["已完成题", queue.questions_completed], ["质检记录", queue.deliveries_passed]];
+  const stats = [
+    ["新闻待用", queue.news_ready],
+    ["活跃批次", queue.batches_active],
+    ["模型可领取", queue.questions_ready],
+    ["模型运行", `${queue.questions_running || 0} / ${snapshot.config?.model_concurrency || 0}`],
+    ["重试已耗尽", queue.questions_exhausted],
+    ["待交付处理", queue.deliveries_pending],
+    ["模型已成功", queue.questions_completed],
+    ["交付质检通过", queue.deliveries_passed],
+    ["SOLO2 已交付", queue.solo2_delivered],
+  ];
   $("#scheduler-queue").innerHTML = stats.map(([label, value]) => `<div class="scheduler-stat"><span>${label}</span><strong>${value || 0}</strong></div>`).join("");
   $("#scheduler-current-batch").textContent = runtime.batch_name ? `当前 ${runtime.batch_name}` : schedulerPhaseLabel(runtime.phase);
   const batches = snapshot.batches || [];
@@ -720,6 +739,7 @@ function renderSettings() {
   $("#config-ready-target").value = state.config.ready_target || 40;
   $("#config-worker-cpus").value = state.config.worker_cpus || 1;
   $("#config-worker-memory").value = state.config.worker_memory || "2g";
+  $("#config-worker-timeout").value = state.config.worker_timeout || 3600;
   $("#config-gateway-max-attempts").value = state.config.gateway_max_attempts || 3;
   $("#config-gateway-backoff-base").value = state.config.gateway_backoff_base || 30;
   $("#config-gateway-backoff-max").value = state.config.gateway_backoff_max || 300;
@@ -1574,7 +1594,26 @@ $("#review-list").addEventListener("click", async (event) => {
   button.disabled = true;
   button.textContent = "处理中…";
   try {
-    if (action === "codex") {
+    if (action === "regenerate") {
+      openModal(
+        "根据已有证据重新生成交付",
+        "不会重新运行 Claude，也不会修改题目代码或原始轨迹。Codex 将单独读取已有要求、证据账本、需求覆盖和复核历史，重新生成五维内容，完成后自动进入单题交付质检。",
+        "开始重新生成",
+        async () => {
+          closeModal();
+          try {
+            await api("/api/reviews/regenerate", {
+              method: "POST", body: JSON.stringify({ record_id: recordId }),
+            });
+            toast("新的交付产物生成已启动");
+            await loadReviews({ quiet: true });
+          } catch (error) {
+            toast(error.message, true);
+          }
+        },
+      );
+      return;
+    } else if (action === "codex") {
       openModal(
         "由 Codex 代替人工复核",
         "Codex 将读取这条记录的原始要求、五维描述、证据账本、需求覆盖和历史相似结果。五项全部通过后会直接开放 Excel 与 SOLO2 交付；任一项无法确认则继续阻断。",
@@ -1665,6 +1704,7 @@ $("#settings-form").addEventListener("submit", async (event) => {
         ready_target: Number($("#config-ready-target").value),
         worker_cpus: Number($("#config-worker-cpus").value),
         worker_memory: $("#config-worker-memory").value,
+        worker_timeout: Number($("#config-worker-timeout").value),
         gateway_max_attempts: Number($("#config-gateway-max-attempts").value),
         gateway_backoff_base: Number($("#config-gateway-backoff-base").value),
         gateway_backoff_max: Number($("#config-gateway-backoff-max").value),

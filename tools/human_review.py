@@ -70,6 +70,15 @@ def review_queue(database: Path, batch: str | None = None) -> dict:
             "ORDER BY id DESC"
         ).fetchall():
             codex_events.setdefault(str(event["record_id"]), dict(event))
+        regeneration_events = {}
+        for event in connection.execute(
+            "SELECT record_id,action,details,created_at FROM record_review_events "
+            "WHERE action IN ("
+            "'delivery_regeneration_started','delivery_regeneration_completed',"
+            "'delivery_regeneration_qc_completed','delivery_regeneration_failed') "
+            "ORDER BY id DESC"
+        ).fetchall():
+            regeneration_events.setdefault(str(event["record_id"]), dict(event))
         items: list[dict] = []
         for row in rows:
             record = as_record(row)
@@ -93,6 +102,32 @@ def review_queue(database: Path, batch: str | None = None) -> dict:
                 }
             else:
                 record["codex_review"] = None
+            regeneration_event = regeneration_events.get(record["record_id"])
+            if regeneration_event:
+                try:
+                    regeneration_details = json.loads(
+                        str(regeneration_event.get("details") or "{}")
+                    )
+                except json.JSONDecodeError:
+                    regeneration_details = {}
+                regeneration_action = str(regeneration_event["action"])
+                regeneration_status = {
+                    "delivery_regeneration_started": "started",
+                    "delivery_regeneration_completed": "quality_checking",
+                    "delivery_regeneration_qc_completed": "completed",
+                    "delivery_regeneration_failed": "failed",
+                }[regeneration_action]
+                record["delivery_regeneration"] = {
+                    "status": regeneration_status,
+                    "report": str(
+                        regeneration_details.get("error")
+                        or regeneration_details.get("message")
+                        or ""
+                    ),
+                    "updated_at": str(regeneration_event["created_at"]),
+                }
+            else:
+                record["delivery_regeneration"] = None
             record["history_matches"] = history_matches(
                 connection, record, exclude_record_id=record["record_id"]
             )
@@ -212,6 +247,64 @@ def build_codex_review_dossier(database: Path, record_id: str) -> dict:
                 "evidence_gate_passed": bool(record["evidence_gate_passed"]),
                 "history_gate_passed": bool(record["history_gate_passed"]),
             },
+        }
+
+
+def build_codex_delivery_regeneration_dossier(database: Path, record_id: str) -> dict:
+    """Build the evidence-only input for regenerating one delivery record.
+
+    This deliberately includes the existing evidence and coverage tables instead
+    of granting the regeneration task access to the question workspace.  Codex
+    can rewrite unsupported prose, but it cannot invent a new source or modify
+    the Claude result.
+    """
+    with closing(connect(database)) as connection:
+        row = _record_context(connection, record_id)
+        if row is None:
+            raise ValueError("交付记录不存在")
+        submission = connection.execute(
+            "SELECT status FROM solo2_submissions WHERE record_id=?", (record_id,)
+        ).fetchone()
+        if submission and str(submission["status"] or "") in {"submitting", "succeeded"}:
+            raise ValueError("记录正在提交或已经提交到 SOLO2，不能重新生成")
+        record = as_record(row)
+        evidence, evidence_errors = json_array(record.get("evidence_ledger"), "evidence_ledger")
+        coverage, coverage_errors = json_array(record.get("requirement_coverage"), "requirement_coverage")
+        if evidence_errors or coverage_errors:
+            raise ValueError("；".join(evidence_errors + coverage_errors))
+        events = connection.execute(
+            "SELECT action,note,details,created_at FROM record_review_events "
+            "WHERE record_id=? ORDER BY id DESC LIMIT 10", (record_id,)
+        ).fetchall()
+        return {
+            "record_id": record_id,
+            "batch": str(row["batch_name"]),
+            "question_no": int(row["question_no"]),
+            "turn_no": int(record["turn_no"]),
+            "title": str(row["title"]),
+            "user_prompt": str(record["user_prompt"]),
+            "question_folder": str(row["question_folder"]),
+            "trajectory_root": str(row["trajectory_root"] or ""),
+            "current": {
+                "delivery_score": int(record["delivery_score"]),
+                "delivery_description": str(record["delivery_description"]),
+                "instruction_score": int(record["instruction_score"]),
+                "instruction_description": str(record["instruction_description"]),
+                "planning_score": int(record["planning_score"]),
+                "planning_description": str(record["planning_description"]),
+                "reasoning_score": int(record["reasoning_score"]),
+                "reasoning_description": str(record["reasoning_description"]),
+                "execution_score": int(record["execution_score"]),
+                "execution_description": str(record["execution_description"]),
+                "other_issues": str(record.get("other_issues") or ""),
+            },
+            "evidence_ledger": evidence,
+            "requirement_coverage": coverage,
+            "review_history": [
+                {"action": str(event["action"]), "note": str(event["note"] or ""),
+                 "details": str(event["details"] or "{}"), "created_at": str(event["created_at"])}
+                for event in events
+            ],
         }
 
 

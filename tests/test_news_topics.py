@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 
 from tools.batch_pipeline import connect
-from tools.news_topics import ingest, parse_feed
+from tools.news_topics import ingest, ingest_report, parse_feed
 
 
 RSS = b'''<?xml version="1.0"?><rss><channel>
@@ -52,6 +52,25 @@ class NewsTopicTest(unittest.TestCase):
             news_topics.fetch = lambda *_args, **_kwargs: items
             self.assertEqual(ingest(database, ["https://example.test/rss"]), (1, []))
             self.assertEqual(ingest(database, ["https://example.test/rss"]), (0, []))
+
+    def test_ingest_report_explains_duplicates_when_nothing_is_added(self):
+        items = [{
+            "source_url": "https://example.test/rss",
+            "article_url": "https://example.test/a",
+            "title": "A meaningful article title",
+            "summary": "",
+            "published_at": "",
+        }]
+        with tempfile.TemporaryDirectory() as raw:
+            database = Path(raw) / "production.sqlite3"
+            import tools.news_topics as news_topics
+            news_topics.fetch = lambda *_args, **_kwargs: items
+            self.assertEqual(ingest(database, ["https://example.test/rss"]), (1, []))
+            report = ingest_report(database, ["https://example.test/rss"])
+            self.assertEqual(report["parsed"], 1)
+            self.assertEqual(report["added"], 0)
+            self.assertEqual(report["duplicates"], 1)
+            self.assertEqual(report["feeds"][0]["duplicates"], 1)
 
     def test_parse_china_news_embedded_docarr(self):
         html = b'''<script>var docArr=[{"title":"Embedded article title","content":"Summary","pubtime":"2026-09-08 10:00:00","url":"http:\\/\\/www.chinanews.com.cn\\/gn\\/2026\\/09-08\\/123.shtml"}];</script>'''

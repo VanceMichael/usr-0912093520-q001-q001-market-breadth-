@@ -191,31 +191,63 @@ def configured_feeds(database: Path, *, enabled_only: bool = True) -> list[str]:
         return [str(row["url"]) for row in connection.execute(query)]
 
 
-def ingest(database: Path, feeds: list[str], timeout: int = 20) -> tuple[int, list[str]]:
+def ingest_report(database: Path, feeds: list[str], timeout: int = 20) -> dict:
+    """Ingest feeds and explain how parsed items became new or duplicate topics."""
     added = 0
     errors: list[str] = []
+    parsed = 0
+    duplicates = 0
+    feed_reports: list[dict] = []
     with closing(connect(database.resolve())) as connection:
         for source_url in feeds:
             try:
                 items = fetch(source_url, timeout)
             except Exception as exc:  # noqa: BLE001 - one bad feed must not stop the cycle
                 errors.append(f"{source_url}: {exc}")
+                feed_reports.append({
+                    "url": source_url, "parsed": 0, "added": 0,
+                    "duplicates": 0, "error": str(exc),
+                })
                 continue
+            parsed += len(items)
+            feed_added = 0
+            feed_duplicates = 0
             for item in items:
                 timestamp = now()
                 result = connection.execute(
                     "INSERT OR IGNORE INTO news_topics(source_url,article_url,title,summary,published_at,topic_hash,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
                     (item["source_url"], item["article_url"], item["title"], item["summary"], item["published_at"], topic_hash(item), timestamp, timestamp),
                 )
-                added += int(result.rowcount == 1)
+                if result.rowcount == 1:
+                    added += 1
+                    feed_added += 1
+                else:
+                    duplicates += 1
+                    feed_duplicates += 1
             # A feed that was successfully parsed but only contained topics
             # already present in SQLite is healthy; do not report it as an
             # outage on subsequent daemon cycles.  Warn only when parsing
             # yielded no article-like entries at all.
             if not items:
                 errors.append(f"{source_url}: no article-like topics found")
+            feed_reports.append({
+                "url": source_url, "parsed": len(items), "added": feed_added,
+                "duplicates": feed_duplicates, "error": "",
+            })
         connection.commit()
-    return added, errors
+    return {
+        "added": added,
+        "parsed": parsed,
+        "duplicates": duplicates,
+        "errors": errors,
+        "feeds": feed_reports,
+    }
+
+
+def ingest(database: Path, feeds: list[str], timeout: int = 20) -> tuple[int, list[str]]:
+    """Compatibility wrapper for callers that only need totals and errors."""
+    report = ingest_report(database, feeds, timeout)
+    return int(report["added"]), list(report["errors"])
 
 
 def main() -> int:

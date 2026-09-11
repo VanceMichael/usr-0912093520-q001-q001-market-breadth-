@@ -133,6 +133,62 @@ class WebConsoleTests(unittest.TestCase):
                 data.author_executor.shutdown(wait=True)
                 data.pipeline_executor.shutdown(wait=True)
 
+    def test_delivery_regeneration_runs_from_a_path_free_temporary_dossier(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = ConsoleData(root / "production.sqlite3", root)
+            dimensions = ("delivery", "instruction", "planning", "reasoning", "execution")
+            payload = {
+                "dimensions": {
+                    name: {"score": 3, "description": "一段足够长的中文描述" * 6}
+                    for name in dimensions
+                },
+                "other_issues": "",
+                "evidence_ledger": [],
+                "requirement_coverage": [],
+            }
+            dossier = {
+                "record_id": "0911-001-T01",
+                "batch": "0911",
+                "question_no": 1,
+                "question_folder": str(root / "0911" / "q001"),
+                "trajectory_root": str(root / "runs" / "isolated"),
+                "evidence_ledger": [],
+            }
+
+            def run(command, **kwargs):
+                task_root = Path(kwargs["cwd"])
+                self.assertNotEqual(task_root, root)
+                self.assertEqual(Path(command[command.index("-C") + 1]), task_root)
+                self.assertEqual(command[command.index("--sandbox") + 1], "read-only")
+                self.assertIn("--ephemeral", command)
+                source = json.loads(
+                    (task_root / "delivery-source.json").read_text(encoding="utf-8")
+                )
+                self.assertNotIn("question_folder", source)
+                self.assertNotIn("trajectory_root", source)
+                output = Path(command[command.index("--output-last-message") + 1])
+                output.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+                return mock.Mock(returncode=0, stdout="")
+
+            try:
+                with mock.patch("webapp.server.subprocess.run", side_effect=run), mock.patch.object(
+                    data, "_apply_regenerated_delivery", return_value={"record_id": "0911-001-T01"}
+                ) as apply_delivery, mock.patch.object(
+                    data, "_record_regeneration_event"
+                ) as record_event, mock.patch.object(
+                    data, "_run_delivery_regeneration_qc"
+                ) as run_qc:
+                    data._run_codex_delivery_regeneration(
+                        "0911-001-T01", dossier, "codex"
+                    )
+                apply_delivery.assert_called_once()
+                record_event.assert_called_once()
+                run_qc.assert_called_once_with("0911-001-T01", dossier, "codex")
+            finally:
+                data.author_executor.shutdown(wait=True)
+                data.pipeline_executor.shutdown(wait=True)
+
     def test_codex_review_start_event_uses_a_writable_connection(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -353,6 +409,7 @@ class WebConsoleTests(unittest.TestCase):
                 "model": "claude-new",
                 "api_key": "new-secret",
                 "submitter": "新提交人",
+                "worker_timeout": 7200,
             })
             self.assertEqual(result["config"]["model"], "claude-new")
             self.assertEqual(result["config"]["model_mode"], "local")
@@ -361,6 +418,7 @@ class WebConsoleTests(unittest.TestCase):
             self.assertIn('CC_SWITCH_API_KEY="new-secret"', content)
             self.assertIn('CC_PIPELINE_MODEL_MODE="local"', content)
             self.assertIn('CC_AUTHOR_BATCH_SIZE="10"', content)
+            self.assertIn('CC_PIPELINE_WORKER_TIMEOUT="7200"', content)
             self.assertIn('CC_SOLO2_AUTO_SUBMIT="false"', content)
             self.assertNotIn("old-secret", content)
             self.assertEqual(len(result["config"]["news_feeds"]), 3)
@@ -436,6 +494,35 @@ class WebConsoleTests(unittest.TestCase):
                 result = data.scheduler_control("author_only")
                 self.assertEqual(result["run_mode"], "author_only")
                 self.assertEqual(data.scheduler_snapshot()["state"]["run_mode"], "author_only")
+            finally:
+                data.shutdown()
+
+    def test_scheduler_queue_excludes_terminal_and_retry_exhausted_questions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = self.make_database(root)
+            with connect(database) as connection:
+                question_id = connection.execute("SELECT id FROM questions LIMIT 1").fetchone()[0]
+                for attempt in (1, 2):
+                    connection.execute(
+                        "INSERT INTO runs(question_id,batch_run_id,launched_at,status) "
+                        "VALUES(?,?,?,'timeout')",
+                        (question_id, f"attempt-{attempt}", f"time-{attempt}"),
+                    )
+                connection.commit()
+            data = ConsoleData(database, root)
+            try:
+                with mock.patch.object(data, "_scheduler_containers", return_value=[]):
+                    queue = data.scheduler_snapshot()["queue"]
+                self.assertEqual(queue["questions_ready"], 0)
+                self.assertEqual(queue["questions_exhausted"], 1)
+                with connect(database) as connection:
+                    connection.execute("UPDATE batches SET status='failed'")
+                    connection.commit()
+                with mock.patch.object(data, "_scheduler_containers", return_value=[]):
+                    queue = data.scheduler_snapshot()["queue"]
+                self.assertEqual(queue["questions_ready"], 0)
+                self.assertEqual(queue["questions_exhausted"], 0)
             finally:
                 data.shutdown()
 

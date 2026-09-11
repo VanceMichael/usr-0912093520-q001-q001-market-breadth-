@@ -87,6 +87,7 @@ from tools.human_review import (  # noqa: E402
     approve_codex_record,
     approve_record as approve_delivery_record,
     approved_history,
+    build_codex_delivery_regeneration_dossier,
     build_codex_review_dossier,
     import_history,
     reject_record as reject_delivery_record,
@@ -1609,16 +1610,58 @@ class ConsoleData:
             except ValueError:
                 pass
         process_online = heartbeat_age is not None and heartbeat_age <= 15
+        config = self.env_config()
+        gateway_attempts = int(config["gateway_max_attempts"])
         with closing(self.connect()) as connection:
             queue = {
                 "news_ready": int(connection.execute("SELECT COUNT(*) FROM news_topics WHERE status='new'").fetchone()[0]),
                 "batches_active": int(connection.execute(
                     "SELECT COUNT(*) FROM batches WHERE status NOT IN ('completed','partial','failed')"
                 ).fetchone()[0]),
-                "questions_ready": int(connection.execute("SELECT COUNT(*) FROM questions WHERE status='approved'").fetchone()[0]),
-                "questions_running": int(connection.execute("SELECT COUNT(*) FROM questions WHERE status='running'").fetchone()[0]),
-                "questions_completed": int(connection.execute("SELECT COUNT(*) FROM questions WHERE status='completed'").fetchone()[0]),
+                "questions_ready": int(connection.execute(
+                    "SELECT COUNT(*) FROM questions q JOIN batches b ON b.id=q.batch_id "
+                    "WHERE b.status NOT IN ('completed','partial','failed') "
+                    "AND q.maintenance_mode=0 AND q.status='approved' "
+                    "AND q.mechanical_qc='pass' AND q.qc_decision='pass' "
+                    "AND q.qc_prompt_sha256=q.prompt_sha256 "
+                    "AND NOT EXISTS(SELECT 1 FROM runs s WHERE s.question_id=q.id AND s.status='succeeded') "
+                    "AND (SELECT COUNT(*) FROM runs f WHERE f.question_id=q.id "
+                    "AND f.status IN ('failed','timeout') AND COALESCE(f.failure_kind,'')!='transient_gateway')<2 "
+                    "AND (SELECT COUNT(*) FROM runs g WHERE g.question_id=q.id "
+                    "AND g.status='failed' AND g.failure_kind='transient_gateway')<?",
+                    (gateway_attempts,),
+                ).fetchone()[0]),
+                "questions_running": int(connection.execute(
+                    "SELECT COUNT(DISTINCT r.question_id) FROM runs r "
+                    "JOIN questions q ON q.id=r.question_id JOIN batches b ON b.id=q.batch_id "
+                    "WHERE b.status NOT IN ('completed','partial','failed') AND r.status='running'"
+                ).fetchone()[0]),
+                "questions_exhausted": int(connection.execute(
+                    "SELECT COUNT(*) FROM questions q JOIN batches b ON b.id=q.batch_id "
+                    "WHERE b.status NOT IN ('completed','partial','failed') "
+                    "AND NOT EXISTS(SELECT 1 FROM runs s WHERE s.question_id=q.id AND s.status='succeeded') "
+                    "AND ((SELECT COUNT(*) FROM runs f WHERE f.question_id=q.id "
+                    "AND f.status IN ('failed','timeout') AND COALESCE(f.failure_kind,'')!='transient_gateway')>=2 "
+                    "OR (SELECT COUNT(*) FROM runs g WHERE g.question_id=q.id "
+                    "AND g.status='failed' AND g.failure_kind='transient_gateway')>=?)",
+                    (gateway_attempts,),
+                ).fetchone()[0]),
+                "deliveries_pending": int(connection.execute(
+                    "SELECT COUNT(*) FROM questions q JOIN batches b ON b.id=q.batch_id "
+                    "WHERE b.status NOT IN ('completed','partial','failed') "
+                    "AND EXISTS(SELECT 1 FROM runs s WHERE s.question_id=q.id AND s.status='succeeded') "
+                    "AND ((SELECT COUNT(*) FROM records r WHERE r.question_id=q.id)=0 "
+                    "OR (SELECT COUNT(*) FROM records r WHERE r.question_id=q.id "
+                    "AND r.delivery_qc_passed=1 AND r.delivery_qc_note='质检通过') "
+                    "!=(SELECT COUNT(*) FROM records r WHERE r.question_id=q.id))"
+                ).fetchone()[0]),
+                "questions_completed": int(connection.execute(
+                    "SELECT COUNT(DISTINCT question_id) FROM runs WHERE status='succeeded'"
+                ).fetchone()[0]),
                 "deliveries_passed": int(connection.execute("SELECT COUNT(*) FROM records WHERE delivery_qc_passed=1").fetchone()[0]),
+                "solo2_delivered": int(connection.execute(
+                    "SELECT COUNT(*) FROM solo2_submissions WHERE status='succeeded'"
+                ).fetchone()[0]),
             }
             batch_rows = connection.execute(
                 "SELECT b.name,b.status,b.created_at,COUNT(DISTINCT q.id) AS total,"
@@ -1632,7 +1675,6 @@ class ConsoleData:
                 "GROUP BY b.id ORDER BY CASE WHEN b.status IN ('completed','partial','failed') THEN 1 ELSE 0 END,b.created_at DESC LIMIT 12"
             ).fetchall()
             batches = [dict(row) for row in batch_rows]
-        config = self.env_config()
         return {
             "node": {"id": "local", "name": socket.gethostname(), "kind": "local", "base_url": ""},
             "state": {**state, "process_online": process_online, "heartbeat_age_seconds": heartbeat_age},
@@ -1906,6 +1948,7 @@ class ConsoleData:
             "ready_target": env_bounded("CC_PIPELINE_READY_TARGET", 40, 200),
             "worker_cpus": values.get("CC_CLAUDE_WORKER_CPUS", "1").strip() or "1",
             "worker_memory": values.get("CC_CLAUDE_WORKER_MEMORY", "2g").strip().lower() or "2g",
+            "worker_timeout": env_bounded("CC_PIPELINE_WORKER_TIMEOUT", 3600, 28800),
             "gateway_max_attempts": env_bounded("CC_GATEWAY_MAX_ATTEMPTS", 3, 10),
             "gateway_backoff_base": env_bounded("CC_GATEWAY_BACKOFF_BASE", 30),
             "gateway_backoff_max": env_bounded("CC_GATEWAY_BACKOFF_MAX", 300),
@@ -2214,6 +2257,14 @@ class ConsoleData:
         )).strip().lower()
         if not re.fullmatch(r"[1-9][0-9]*[mg]", worker_memory):
             raise ValueError("单容器内存必须使用正整数加 m 或 g，例如 2g")
+        try:
+            worker_timeout = int(body.get(
+                "worker_timeout", current.get("CC_PIPELINE_WORKER_TIMEOUT", "3600") or "3600"
+            ))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("单题硬超时配置无效") from exc
+        if not 600 <= worker_timeout <= 28800:
+            raise ValueError("单题硬超时必须是 600-28800 秒")
         gateway_values = {}
         for field, env_key, default, maximum in (
             ("gateway_max_attempts", "CC_GATEWAY_MAX_ATTEMPTS", 3, 10),
@@ -2283,6 +2334,7 @@ class ConsoleData:
             "CC_PIPELINE_READY_TARGET": str(ready_target),
             "CC_CLAUDE_WORKER_CPUS": str(worker_cpus).rstrip("0").rstrip("."),
             "CC_CLAUDE_WORKER_MEMORY": worker_memory,
+            "CC_PIPELINE_WORKER_TIMEOUT": str(worker_timeout),
             **concurrency_values,
             **gateway_values,
             "CC_SOLO2_ORIGIN": solo2_origin,
@@ -2293,7 +2345,6 @@ class ConsoleData:
             ("CC_CLAUDE_HEARTBEAT_SECONDS", "5"),
             ("CC_CLAUDE_START_TIMEOUT", "300"),
             ("CC_CLAUDE_STALLED_TIMEOUT", "900"),
-            ("CC_PIPELINE_WORKER_TIMEOUT", "3600"),
         ):
             output_values[key] = current.get(key, "").strip() or default
         lines = read_portable_text(self.env_file).splitlines() if self.env_file.exists() else []
@@ -2762,6 +2813,18 @@ class ConsoleData:
                 raise ValueError("交付记录不存在")
             if bool(row["human_qc_approved"]):
                 raise ValueError("记录已经完成最终复核；如需重审，请先退回记录")
+            regeneration = connection.execute(
+                "SELECT action FROM record_review_events WHERE record_id=? "
+                "AND action IN ("
+                "'delivery_regeneration_started','delivery_regeneration_completed',"
+                "'delivery_regeneration_qc_completed','delivery_regeneration_failed') "
+                "ORDER BY id DESC LIMIT 1",
+                (record_id,),
+            ).fetchone()
+            if regeneration and regeneration["action"] in {
+                "delivery_regeneration_started", "delivery_regeneration_completed"
+            }:
+                raise ValueError("这条记录正在重新生成交付产物，请等待交付质检完成")
             running = connection.execute(
                 "SELECT details FROM record_review_events WHERE record_id=? "
                 "AND action='codex_review_started' ORDER BY id DESC LIMIT 1",
@@ -2792,6 +2855,331 @@ class ConsoleData:
             connection.commit()
         self.author_executor.submit(self._run_codex_delivery_review, record_id, dossier)
         return {"ok": True, "record_id": record_id, "message": "Codex 自动逐维复核已启动"}
+
+    def regenerate_codex_delivery(self, body: dict) -> dict:
+        """Start a read-only Codex rewrite of one existing delivery record."""
+        record_id = str(body.get("record_id") or "").strip()
+        if not record_id:
+            raise ValueError("请选择交付记录")
+        dossier = build_codex_delivery_regeneration_dossier(self.database, record_id)
+        with closing(self.connect_rw()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT r.record_id,r.human_qc_approved,"
+                "(SELECT status FROM solo2_submissions s WHERE s.record_id=r.record_id) AS solo2_status "
+                "FROM records r WHERE r.record_id=?", (record_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("交付记录不存在")
+            if bool(row["human_qc_approved"]):
+                raise ValueError("记录已经完成最终复核，请先退回后再生成")
+            if str(row["solo2_status"] or "") in {"submitting", "succeeded"}:
+                raise ValueError("记录正在提交或已经提交到 SOLO2，不能重新生成")
+            codex_review = connection.execute(
+                "SELECT action FROM record_review_events WHERE record_id=? "
+                "AND action IN ('codex_review_started','codex_review_completed','codex_review_failed') "
+                "ORDER BY id DESC LIMIT 1", (record_id,),
+            ).fetchone()
+            if codex_review and codex_review["action"] == "codex_review_started":
+                raise ValueError("这条记录正在执行 Codex 最终复核，请等待复核结束")
+            latest = connection.execute(
+                "SELECT action FROM record_review_events WHERE record_id=? "
+                "AND action IN ("
+                "'delivery_regeneration_started','delivery_regeneration_completed',"
+                "'delivery_regeneration_qc_completed','delivery_regeneration_failed') "
+                "ORDER BY id DESC LIMIT 1", (record_id,),
+            ).fetchone()
+            if latest and latest["action"] in {
+                "delivery_regeneration_started", "delivery_regeneration_completed"
+            }:
+                raise ValueError("这条记录的交付产物正在重新生成")
+            timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+            connection.execute(
+                "INSERT INTO record_review_events(record_id,action,reviewer,note,details,created_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (record_id, "delivery_regeneration_started", "Codex 交付生产", "",
+                 json.dumps({"record_id": record_id}, ensure_ascii=False), timestamp),
+            )
+            connection.commit()
+        codex = shutil.which("codex")
+        if not codex:
+            self._record_regeneration_failure(record_id, "未找到 Codex CLI")
+            raise RuntimeError("未找到 Codex CLI，请先安装并确保 codex 在 PATH 中")
+        self.author_executor.submit(self._run_codex_delivery_regeneration, record_id, dossier, codex)
+        return {"ok": True, "record_id": record_id, "message": "新的交付产物生成已启动，完成后将进入交付质检"}
+
+    @staticmethod
+    def _regeneration_schema() -> dict:
+        dimension = {
+            "type": "object", "additionalProperties": False,
+            "properties": {"score": {"type": "integer", "minimum": 1, "maximum": 5},
+                           "description": {"type": "string", "minLength": 45, "maxLength": 420}},
+            "required": ["score", "description"],
+        }
+        return {
+            "type": "object", "additionalProperties": False,
+            "properties": {
+                "dimensions": {
+                    "type": "object", "additionalProperties": False,
+                    "properties": {name: dimension for name in ("delivery", "instruction", "planning", "reasoning", "execution")},
+                    "required": ["delivery", "instruction", "planning", "reasoning", "execution"],
+                },
+                "other_issues": {"type": "string", "maxLength": 420},
+                "evidence_ledger": {"type": "array"},
+                "requirement_coverage": {"type": "array"},
+            },
+            "required": ["dimensions", "other_issues", "evidence_ledger", "requirement_coverage"],
+        }
+
+    def _record_regeneration_failure(self, record_id: str, detail: str) -> None:
+        try:
+            redacted = self._redact_log(detail)
+            with closing(self.connect_rw()) as connection:
+                connection.execute(
+                    "INSERT INTO record_review_events(record_id,action,reviewer,note,details,created_at) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (record_id, "delivery_regeneration_failed", "Codex 交付生产", "",
+                     json.dumps({"error": redacted[-4000:]}, ensure_ascii=False),
+                     datetime.now().astimezone().isoformat(timespec="seconds")),
+                )
+                connection.commit()
+        except sqlite3.Error:
+            pass
+
+    def _run_codex_delivery_regeneration(self, record_id: str, dossier: dict, codex: str) -> None:
+        dimensions = ("delivery", "instruction", "planning", "reasoning", "execution")
+        try:
+            with tempfile.TemporaryDirectory(prefix="ccusr-delivery-regeneration-") as directory:
+                root = Path(directory)
+                source = root / "delivery-source.json"
+                output = root / "delivery.json"
+                schema = root / "delivery.schema.json"
+                codex_dossier = {
+                    key: value for key, value in dossier.items()
+                    if key not in {"question_folder", "trajectory_root"}
+                }
+                codex_dossier["review_history"] = [
+                    {
+                        **event,
+                        "note": self._redact_log(str(event.get("note") or "")),
+                        "details": self._redact_log(str(event.get("details") or "{}")),
+                    }
+                    for event in dossier.get("review_history", [])
+                    if isinstance(event, dict)
+                ]
+                source.write_text(
+                    json.dumps(codex_dossier, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                schema.write_text(json.dumps(self._regeneration_schema(), ensure_ascii=False, indent=2), encoding="utf-8")
+                prompt = (
+                    "只读取当前目录的 delivery-source.json，根据其中已有的原始要求、现有五维记录、证据账本、"
+                    "需求覆盖表和复核历史，重新生成一份更准确的交付产物。不得访问网络，不得修改仓库、轨迹或数据库，"
+                    "不得添加资料中没有的事实；每个分数必须与证据一致，描述使用自然中文，英文只保留必要技术标识，"
+                    "删掉无法直接证明的结论，并保持证据来源、行号、文件路径和哈希不变。若某需求只能判定为无法确认，"
+                    "在覆盖表中使用 uncertain 并降低相关分数。输出必须严格符合 delivery.schema.json，只输出 JSON。"
+                )
+                result = subprocess.run(
+                    [codex, "exec", "--sandbox", "read-only", "--ephemeral", "--skip-git-repo-check",
+                     "-C", str(root), "--output-schema", str(schema), "--output-last-message", str(output), prompt],
+                    cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    timeout=1800, check=False,
+                )
+                raw = output.read_text(encoding="utf-8").strip() if output.is_file() else ""
+                if result.returncode or not raw:
+                    raise RuntimeError((result.stdout or "Codex 未返回交付产物")[-4000:])
+                payload = json.loads(raw)
+                if not isinstance(payload, dict) or set(payload) != {"dimensions", "other_issues", "evidence_ledger", "requirement_coverage"}:
+                    raise ValueError("交付产物字段不完整")
+                updated = self._apply_regenerated_delivery(record_id, dossier, payload, dimensions)
+                self._record_regeneration_event(record_id, "delivery_regeneration_completed", updated)
+            self._run_delivery_regeneration_qc(record_id, dossier, codex)
+        except Exception as exc:
+            self._record_regeneration_failure(record_id, str(exc))
+
+    def _apply_regenerated_delivery(self, record_id: str, dossier: dict, payload: dict, dimensions: tuple[str, ...]) -> dict:
+        from tools.delivery_quality import history_matches, verify_evidence_sources
+        from tools.delivery_records import as_record, validate_one
+        with closing(self.connect_rw()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT r.*,q.folder_path AS question_folder,"
+                "(SELECT x.trajectory_root FROM runs x WHERE x.question_id=q.id "
+                " AND x.status='succeeded' AND x.session_id=r.session_id "
+                " ORDER BY x.launched_at DESC,x.id DESC LIMIT 1) AS trajectory_root,"
+                "(SELECT s.status FROM solo2_submissions s "
+                " WHERE s.record_id=r.record_id) AS solo2_status "
+                "FROM records r JOIN questions q ON q.id=r.question_id "
+                "WHERE r.record_id=?",
+                (record_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("交付记录不存在")
+            if bool(row["human_qc_approved"]):
+                raise ValueError("记录已在生成期间完成最终复核，不能覆盖")
+            if str(row["solo2_status"] or "") in {"submitting", "succeeded"}:
+                raise ValueError("记录已在生成期间开始提交 SOLO2，不能覆盖")
+            trajectory_root = str(row["trajectory_root"] or "").strip()
+            if not trajectory_root:
+                raise ValueError("缺少权威 Claude 轨迹目录")
+            candidate = as_record(row)
+            candidate["human_authored"] = False
+            candidate["human_qc_approved"] = False
+            candidate["human_qc_reviewer"] = ""
+            candidate["human_qc_approved_at"] = ""
+            candidate["human_qc_note"] = ""
+            candidate["review_method"] = ""
+            candidate["delivery_qc_passed"] = False
+            candidate["delivery_qc_note"] = ""
+            candidate["delivery_qc_checked_at"] = ""
+            candidate["delivery_qc_changes"] = "[]"
+            candidate["evidence_gate_passed"] = False
+            candidate["evidence_checked_at"] = ""
+            candidate["history_gate_passed"] = False
+            candidate["history_checked_at"] = ""
+            original_evidence = {
+                str(item.get("id") or ""): item
+                for item in dossier.get("evidence_ledger", [])
+                if isinstance(item, dict)
+            }
+            supplied_evidence = payload.get("evidence_ledger")
+            if not isinstance(supplied_evidence, list):
+                raise ValueError("evidence_ledger 必须是数组")
+            immutable_source_fields = (
+                "source_type", "line", "path", "source_sha256", "excerpt"
+            )
+            for item in supplied_evidence:
+                if not isinstance(item, dict):
+                    raise ValueError("证据账本包含无效项目")
+                evidence_id = str(item.get("id") or "")
+                source = original_evidence.get(evidence_id)
+                if source is None:
+                    raise ValueError(f"证据 {evidence_id or '<空>'} 不在原证据账本中")
+                if any(item.get(field) != source.get(field) for field in immutable_source_fields):
+                    raise ValueError(f"证据 {evidence_id} 的权威来源被修改")
+            for name in dimensions:
+                item = payload.get("dimensions", {}).get(name)
+                if not isinstance(item, dict) or not isinstance(item.get("score"), int) or isinstance(item.get("score"), bool):
+                    raise ValueError(f"{name} 的分数无效")
+                candidate[f"{name}_score"] = int(item["score"])
+                candidate[f"{name}_description"] = str(item.get("description") or "")
+            candidate["other_issues"] = str(payload.get("other_issues") or "")
+            candidate["evidence_ledger"] = json.dumps(supplied_evidence, ensure_ascii=False)
+            candidate["requirement_coverage"] = json.dumps(payload["requirement_coverage"], ensure_ascii=False)
+            errors, _warnings = validate_one(candidate, require_delivery_qc=False, require_quality_gates=False)
+            errors.extend(verify_evidence_sources(
+                candidate,
+                question_folder=Path(str(row["question_folder"])),
+                trajectory_root=Path(trajectory_root),
+            ))
+            if history_matches(connection, candidate, exclude_record_id=record_id):
+                errors.append("重新生成的描述触发历史相似门禁")
+            if errors:
+                raise ValueError("；".join(errors[:12]))
+            fields = [f"{name}_score=?" for name in dimensions] + [f"{name}_description=?" for name in dimensions]
+            fields.extend(["other_issues=?", "evidence_ledger=?", "requirement_coverage=?", "human_authored=0",
+                           "human_qc_approved=0", "human_qc_reviewer=''", "human_qc_approved_at=''", "human_qc_note=''",
+                           "review_method=''", "delivery_qc_passed=0", "delivery_qc_note=''", "delivery_qc_checked_at=''",
+                           "delivery_qc_changes='[]'", "evidence_gate_passed=0", "evidence_checked_at=''",
+                           "history_gate_passed=0", "history_checked_at=''"])
+            values = [candidate[f"{name}_score"] for name in dimensions] + [candidate[f"{name}_description"] for name in dimensions]
+            values.extend([candidate["other_issues"], candidate["evidence_ledger"], candidate["requirement_coverage"], record_id])
+            before = {
+                "dimensions": {
+                    name: {
+                        "score": int(row[f"{name}_score"]),
+                        "description": str(row[f"{name}_description"]),
+                    }
+                    for name in dimensions
+                },
+                "other_issues": str(row["other_issues"] or ""),
+                "evidence_ledger": dossier.get("evidence_ledger", []),
+                "requirement_coverage": dossier.get("requirement_coverage", []),
+            }
+            dimension_reviews = [
+                dict(item) for item in connection.execute(
+                    "SELECT dimension,approved,reviewer,reviewed_at "
+                    "FROM record_dimension_reviews WHERE record_id=? ORDER BY dimension",
+                    (record_id,),
+                ).fetchall()
+            ]
+            previous_audit = {
+                "delivery_qc_changes": str(row["delivery_qc_changes"] or "[]"),
+                "delivery_qc_passed": bool(row["delivery_qc_passed"]),
+                "delivery_qc_note": str(row["delivery_qc_note"] or ""),
+                "delivery_qc_checked_at": str(row["delivery_qc_checked_at"] or ""),
+                "evidence_gate_passed": bool(row["evidence_gate_passed"]),
+                "evidence_checked_at": str(row["evidence_checked_at"] or ""),
+                "history_gate_passed": bool(row["history_gate_passed"]),
+                "history_checked_at": str(row["history_checked_at"] or ""),
+                "human_qc_approved": bool(row["human_qc_approved"]),
+                "human_qc_reviewer": str(row["human_qc_reviewer"] or ""),
+                "human_qc_approved_at": str(row["human_qc_approved_at"] or ""),
+                "human_qc_note": str(row["human_qc_note"] or ""),
+                "review_method": str(row["review_method"] or ""),
+                "dimension_reviews": dimension_reviews,
+            }
+            after = {
+                "dimensions": {
+                    name: {
+                        "score": candidate[f"{name}_score"],
+                        "description": candidate[f"{name}_description"],
+                    }
+                    for name in dimensions
+                },
+                "other_issues": candidate["other_issues"],
+                "evidence_ledger": supplied_evidence,
+                "requirement_coverage": payload["requirement_coverage"],
+            }
+            connection.execute(
+                "DELETE FROM record_dimension_reviews WHERE record_id=?", (record_id,)
+            )
+            connection.execute(f"UPDATE records SET {', '.join(fields)} WHERE record_id=?", values)
+            connection.commit()
+            return {
+                "record_id": record_id,
+                "scores": {name: candidate[f"{name}_score"] for name in dimensions},
+                "message": "新交付产物已写入，原交付质检和最终复核状态已清空",
+                "before": before,
+                "after": after,
+                "previous_audit": previous_audit,
+            }
+
+    def _record_regeneration_event(self, record_id: str, action: str, details: dict) -> None:
+        with closing(self.connect_rw()) as connection:
+            connection.execute(
+                "INSERT INTO record_review_events(record_id,action,reviewer,note,details,created_at) VALUES(?,?,?,?,?,?)",
+                (record_id, action, "Codex 交付生产", "", json.dumps(details, ensure_ascii=False), datetime.now().astimezone().isoformat(timespec="seconds")),
+            )
+            connection.commit()
+
+    def _run_delivery_regeneration_qc(self, record_id: str, dossier: dict, codex: str) -> None:
+        batch = str(dossier["batch"])
+        number = int(dossier["question_no"])
+        prompt = (
+            f"使用 $cc-usr-delivery-qc 只质检批次 {batch} 第 {number} 题的交付记录。"
+            f"原始 Claude JSONL 根目录为 {dossier.get('trajectory_root') or '<缺少权威轨迹目录>'}。"
+            "以 SQLite 中已经重新生成的记录为对象，"
+            "逐项核对真实轨迹、证据、需求覆盖和五维自然中文描述；发现问题必须依据权威来源修正，"
+            f"显式使用 --select {number} 重新验证并执行 --finalize。不得重新跑 Claude、不得修改题目代码或轨迹，不要导出文件。"
+        )
+        try:
+            result = subprocess.run(
+                [codex, "exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "--skip-git-repo-check",
+                 "-C", str(self.project_root), prompt], cwd=self.project_root, text=True,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=1800, check=False,
+            )
+            with closing(self.connect_rw()) as connection:
+                passed = connection.execute("SELECT delivery_qc_passed FROM records WHERE record_id=?", (record_id,)).fetchone()
+            if result.returncode or not passed or not bool(passed[0]):
+                raise RuntimeError((result.stdout or "交付质检未完成")[-4000:])
+            self._record_regeneration_event(
+                record_id,
+                "delivery_regeneration_qc_completed",
+                {"output": self._redact_log(result.stdout or "")[-2000:]},
+            )
+        except Exception as exc:
+            self._record_regeneration_failure(record_id, f"交付质检未完成：{exc}")
 
     def _run_codex_delivery_review(self, record_id: str, dossier: dict) -> None:
         prompt = (
@@ -3338,6 +3726,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 result = self.data.reject_delivery_review(body)
             elif self.path == "/api/reviews/codex":
                 result = self.data.create_codex_delivery_review(body)
+            elif self.path == "/api/reviews/regenerate":
+                result = self.data.regenerate_codex_delivery(body)
             elif self.path == "/api/reviews/history/import":
                 result = import_history(
                     self.data.database,

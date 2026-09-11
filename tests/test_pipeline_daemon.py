@@ -215,7 +215,10 @@ def test_news_below_watermark_refills_then_waits_for_a_complete_batch() -> None:
         with mock.patch.dict(os.environ, {"CC_AUTHOR_BATCH_SIZE": "20"}), mock.patch(
             "tools.pipeline_daemon.count_ready", return_value=0
         ), mock.patch(
-            "tools.pipeline_daemon.ingest", return_value=(0, [])
+            "tools.pipeline_daemon.ingest_report", return_value={
+                "added": 0, "parsed": 18, "duplicates": 18,
+                "errors": [], "feeds": [],
+            }
         ) as ingest_news, mock.patch(
             "tools.pipeline_daemon.create_next_batch"
         ) as create_next:
@@ -225,6 +228,9 @@ def test_news_below_watermark_refills_then_waits_for_a_complete_batch() -> None:
         create_next.assert_not_called()
         assert stop.waits == [60]
         assert "新闻待用 18/40 条" in store.heartbeat.call_args.kwargs["detail"]
+        assert store.event.call_args.args[0] == "news_refill"
+        assert "新增 0 条" in store.event.call_args.args[1]
+        assert store.event.call_args.kwargs["details"]["duplicates"] == 18
 
 
 def test_news_below_watermark_still_creates_batch_when_enough_exist() -> None:
@@ -254,7 +260,10 @@ def test_news_below_watermark_still_creates_batch_when_enough_exist() -> None:
         with mock.patch.dict(os.environ, {"CC_AUTHOR_BATCH_SIZE": "20"}), mock.patch(
             "tools.pipeline_daemon.count_ready", return_value=0
         ), mock.patch(
-            "tools.pipeline_daemon.ingest", return_value=(0, [])
+            "tools.pipeline_daemon.ingest_report", return_value={
+                "added": 0, "parsed": 39, "duplicates": 39,
+                "errors": [], "feeds": [],
+            }
         ) as ingest_news, mock.patch(
             "tools.pipeline_daemon.create_next_batch", side_effect=create_and_stop
         ) as create_next:
@@ -278,7 +287,10 @@ def test_news_refill_runs_even_when_question_buffer_is_full() -> None:
         with mock.patch(
             "tools.pipeline_daemon.count_ready", return_value=40
         ), mock.patch(
-            "tools.pipeline_daemon.ingest", return_value=(0, [])
+            "tools.pipeline_daemon.ingest_report", return_value={
+                "added": 0, "parsed": 40, "duplicates": 40,
+                "errors": [], "feeds": [],
+            }
         ) as ingest_news, mock.patch(
             "tools.pipeline_daemon.create_next_batch"
         ) as create_next:

@@ -33,7 +33,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from tools.batch_pipeline import connect  # noqa: E402
 from tools.authoring_policy import backend_only_requirement  # noqa: E402
-from tools.news_topics import DEFAULT_FEEDS, configured_feeds, ingest  # noqa: E402
+from tools.news_topics import DEFAULT_FEEDS, configured_feeds, ingest, ingest_report  # noqa: E402
 from tools.orchestrator import clear_question_leases  # noqa: E402
 from tools.scheduler_state import SchedulerStore  # noqa: E402
 from tools.text_encoding import read_portable_text  # noqa: E402
@@ -757,22 +757,32 @@ def maintain_ready_buffer(
             refill_delay = min(60, max(5, args.poll_seconds))
             if available_topics < args.news_watermark and time.monotonic() >= next_news_refill_at:
                 feeds = configured_feeds(database) if args.dynamic_feeds else args.feeds
-                added, errors = ingest(database, feeds, args.feed_timeout)
+                report = ingest_report(database, feeds, args.feed_timeout)
+                added = int(report["added"])
+                errors = list(report["errors"])
                 available_topics = count_new_topics(database)
                 next_news_refill_at = time.monotonic() + refill_delay
-                if added or errors:
-                    store.event(
-                        "news_refill",
-                        f"新闻待用低于 {args.news_watermark} 条，抓取新增 {added} 条，当前 {available_topics} 条",
-                        level="warning" if errors and not added else "info",
-                        phase="news",
-                        details={
-                            "added": added,
-                            "available": available_topics,
-                            "target": args.news_watermark,
-                            "feed_errors": errors,
-                        },
-                    )
+                parsed = int(report["parsed"])
+                duplicates = int(report["duplicates"])
+                store.event(
+                    "news_refill",
+                    (
+                        f"新闻补充完成：解析 {parsed} 条，新增 {added} 条，"
+                        f"重复 {duplicates} 条，当前待用 {available_topics}/{args.news_watermark} 条"
+                    ),
+                    level="warning" if errors and not added else "info",
+                    phase="news",
+                    details={
+                        "added": added,
+                        "parsed": parsed,
+                        "duplicates": duplicates,
+                        "available": available_topics,
+                        "target": args.news_watermark,
+                        "next_refill_seconds": refill_delay,
+                        "feed_errors": errors,
+                        "feeds": report["feeds"],
+                    },
+                )
             if count_ready(database) >= args.ready_watermark:
                 stop_event.wait(2)
                 continue

@@ -285,6 +285,7 @@
               <label class="settings-field"><span>已质检题目缓冲水位</span><input id="config-ready-target" type="number" min="1" max="200" value="40"></label>
               <label class="settings-field"><span>单容器 CPU</span><input id="config-worker-cpus" type="number" min="0.25" max="4" step="0.25" value="1"></label>
               <label class="settings-field"><span>单容器内存</span><input id="config-worker-memory" value="2g" placeholder="2g"></label>
+              <label class="settings-field"><span>单题硬超时（秒）</span><input id="config-worker-timeout" type="number" min="600" max="28800" step="60" value="3600"></label>
             </div>
             <div id="capacity-result" class="capacity-result" hidden></div>
             <div class="pipeline-concurrency-fields" aria-label="网关重试配置">

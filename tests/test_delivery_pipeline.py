@@ -21,6 +21,7 @@ from tools.solo2_service import submit_records  # noqa: E402
 from tools.human_review import (  # noqa: E402
     approve_codex_record,
     approve_record,
+    build_codex_delivery_regeneration_dossier,
     build_codex_review_dossier,
     reject_record,
     review_queue,
@@ -471,6 +472,122 @@ class DeliveryPipelineTests(unittest.TestCase):
                     "SELECT human_qc_approved FROM records"
                 ).fetchone()[0]
             self.assertEqual(approved, 0)
+
+    def test_codex_delivery_regeneration_reuses_record_and_resets_review_gates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = self.prepare(root)
+            input_path = root / "score.json"
+            input_path.write_text(
+                json.dumps(automated_record(), ensure_ascii=False), encoding="utf-8"
+            )
+            self.assertEqual(self.run_command([
+                sys.executable, str(COLLECTOR), "--db", str(database), "--batch", "0911",
+                "--question", "1", "--turn", "1", "--from-json", str(input_path),
+            ]).returncode, 0)
+            self.assertEqual(self.run_command([
+                sys.executable, str(QC), "--db", str(database), "--batch", "0911", "--finalize",
+            ]).returncode, 0)
+
+            dossier = build_codex_delivery_regeneration_dossier(
+                database, "0911-001-T01"
+            )
+            self.assertEqual(Path(dossier["trajectory_root"]), root / "0911")
+            self.assertEqual(Path(dossier["question_folder"]), root / "0911" / "q001")
+            payload = {
+                "dimensions": {
+                    name: {
+                        "score": dossier["current"][f"{name}_score"],
+                        "description": dossier["current"][f"{name}_description"],
+                    }
+                    for name in ("delivery", "instruction", "planning", "reasoning", "execution")
+                },
+                "other_issues": dossier["current"]["other_issues"],
+                "evidence_ledger": dossier["evidence_ledger"],
+                "requirement_coverage": dossier["requirement_coverage"],
+            }
+            data = ConsoleData(database, root)
+            try:
+                result = data._apply_regenerated_delivery(
+                    "0911-001-T01", dossier, payload,
+                    ("delivery", "instruction", "planning", "reasoning", "execution"),
+                )
+            finally:
+                data.shutdown()
+
+            self.assertEqual(result["record_id"], "0911-001-T01")
+            self.assertEqual(
+                result["before"]["other_issues"], dossier["current"]["other_issues"]
+            )
+            self.assertEqual(
+                result["before"]["evidence_ledger"], dossier["evidence_ledger"]
+            )
+            self.assertEqual(
+                result["before"]["requirement_coverage"], dossier["requirement_coverage"]
+            )
+            self.assertIn("delivery_qc_note", result["previous_audit"])
+            self.assertIn("dimension_reviews", result["previous_audit"])
+            with connect(database) as connection:
+                count = connection.execute("SELECT COUNT(*) FROM records").fetchone()[0]
+                record = connection.execute(
+                    "SELECT delivery_qc_passed,evidence_gate_passed,history_gate_passed,"
+                    "human_qc_approved,review_method FROM records WHERE record_id=?",
+                    ("0911-001-T01",),
+                ).fetchone()
+            self.assertEqual(count, 1)
+            self.assertEqual(tuple(record), (0, 0, 0, 0, ""))
+
+    def test_codex_delivery_regeneration_rejects_modified_evidence_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = self.prepare(root)
+            input_path = root / "score.json"
+            input_path.write_text(
+                json.dumps(automated_record(), ensure_ascii=False), encoding="utf-8"
+            )
+            self.assertEqual(self.run_command([
+                sys.executable, str(COLLECTOR), "--db", str(database), "--batch", "0911",
+                "--question", "1", "--turn", "1", "--from-json", str(input_path),
+            ]).returncode, 0)
+
+            dossier = build_codex_delivery_regeneration_dossier(
+                database, "0911-001-T01"
+            )
+            payload = {
+                "dimensions": {
+                    name: {
+                        "score": dossier["current"][f"{name}_score"],
+                        "description": dossier["current"][f"{name}_description"],
+                    }
+                    for name in ("delivery", "instruction", "planning", "reasoning", "execution")
+                },
+                "other_issues": dossier["current"]["other_issues"],
+                "evidence_ledger": [dict(item) for item in dossier["evidence_ledger"]],
+                "requirement_coverage": dossier["requirement_coverage"],
+            }
+            payload["evidence_ledger"][0]["excerpt"] = "Codex 改写后的虚假证据"
+            with connect(database) as connection:
+                before = connection.execute(
+                    "SELECT delivery_description,evidence_ledger FROM records WHERE record_id=?",
+                    ("0911-001-T01",),
+                ).fetchone()
+
+            data = ConsoleData(database, root)
+            try:
+                with self.assertRaisesRegex(ValueError, "权威来源被修改"):
+                    data._apply_regenerated_delivery(
+                        "0911-001-T01", dossier, payload,
+                        ("delivery", "instruction", "planning", "reasoning", "execution"),
+                    )
+            finally:
+                data.shutdown()
+
+            with connect(database) as connection:
+                after = connection.execute(
+                    "SELECT delivery_description,evidence_ledger FROM records WHERE record_id=?",
+                    ("0911-001-T01",),
+                ).fetchone()
+            self.assertEqual(tuple(after), tuple(before))
 
     def test_trajectory_evidence_cannot_use_a_later_turn(self):
         with tempfile.TemporaryDirectory() as directory:
