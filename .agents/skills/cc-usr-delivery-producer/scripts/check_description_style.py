@@ -45,13 +45,42 @@ SELF_REFERENCE_RE = re.compile(
     re.IGNORECASE,
 )
 PLACEHOLDER_RE = re.compile(r"\[[^\]]+\]|=>|→|->")
-UNNECESSARY_ENGLISH_RE = re.compile(
-    r"(?<![/\\._'\"\w])(?:rationale|overall|generally|basically|summary|conclusion)"
-    r"\b(?!\s*[:=])",
+ENGLISH_EVALUATOR_LABEL_RE = re.compile(
+    r"(?:^|[。；;\s])(?:Rationale|Reasoning|Summary|Overall|Conclusion)\s*[:：]",
     re.IGNORECASE,
 )
 STYLE_FIELDS = tuple(f"{prefix}_description" for prefix in PREFIXES)
 MIN_DESCRIPTION_CHINESE = 45
+NON_MAX_EVIDENCE_RE = re.compile(
+    r"(?:第[一二三四五六七八九十\d]+(?:步|次|轮)|"
+    r"(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+|[A-Za-z][A-Za-z0-9_.-]+\.(?:go|java|py|ts|tsx|js|jsx|sql|md)|"
+    r"文件|模块|函数|方法|类|配置|命令|脚本|测试|用例|接口|页面|"
+    r"数据库|数据表|服务|构建|编译|安装|迁移|事务|路由|规则|存储|查询|调度|依赖)"
+)
+NON_MAX_IMPACT_RE = re.compile(
+    r"(?:导致|使得|造成|增加|延长|无法|不能|未能|风险|返工|中断|冲突|偏差|"
+    r"遗漏|限制|不一致|重复|仍需|影响|缺少|缺失|不足|耗时|误判|重做|未完成)"
+)
+PERFECT_SCORE_CONTRADICTION_RE = re.compile(
+    r"(?:仍然?|依然|还)(?:存在|有|未|没有)|"
+    r"(?:未实现|未完成|未覆盖|未遵守|违反|遗漏了|漏掉了|缺少|缺失)"
+    r"[^，。；]{0,18}(?:要求|约束|功能|场景|验证|处理|能力)"
+)
+PERFECT_ACTION_RE = re.compile(r"(?:核对|比对|断言|检查|读取|查询|执行|运行|复验|验证|构建|编译|测试)")
+PERFECT_RESULT_RE = re.compile(r"(?:通过|成功|正常|一致|返回|结束|拒绝|保留|生效|恢复|完成|符合|零失败|零错误)")
+PLANNING_EVIDENCE_RE = re.compile(r"(?:计划|规划|拆解|步骤|阶段|顺序|状态追踪|进度|收尾|歧义|节点|安排)")
+REASONING_PREMISE_RE = re.compile(
+    r"(?:假设|前提|推断|推导|误判|误以为|错误地(?:认为|认定|假设)|没有解释|未说明|"
+    r"没有区分|未区分|遗漏[^，。；]{0,12}(?:分支|条件|先后关系|边界)|(?:把|将)[^，。；]{0,48}(?:当作|当成))"
+)
+EXECUTION_TOOL_ACTION_RE = re.compile(
+    r"(?:(?:使用|调用)[^，。；]{0,20}(?:工具|命令|脚本)|"
+    r"(?:读取|写入|修改|编辑|检索|搜索|执行|运行|重试|重跑|复验|验证|启动)"
+    r"[^，。；]{0,16}(?:工具|命令|脚本|文件|构建|测试))"
+)
+EXECUTION_FOLLOWUP_RE = re.compile(
+    r"(?:随后|之后|紧接着|又|再|直到|才|连续|重复|重试|重跑|复验|补充|修正|修改|覆盖|作废)"
+)
 
 
 def load_records(paths: list[Path]) -> list[tuple[Path, dict]]:
@@ -98,24 +127,38 @@ def check_record(path: Path, record: dict, record_index: int) -> list[str]:
             errors.append(f"{path} record {record_index}: {field} exposes generation or evaluator language")
         if PLACEHOLDER_RE.search(text):
             errors.append(f"{path} record {record_index}: {field} contains scaffolding or an arrow")
-        prose = re.sub(r"```.*?```|`[^`]*`|https?://\S+", " ", text, flags=re.DOTALL)
-        if UNNECESSARY_ENGLISH_RE.search(prose):
-            errors.append(f"{path} record {record_index}: {field} contains unnecessary English evaluator wording")
+        if ENGLISH_EVALUATOR_LABEL_RE.search(text):
+            errors.append(f"{path} record {record_index}: {field} contains an English evaluator label")
         chinese_count = len(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]", text))
         if chinese_count < MIN_DESCRIPTION_CHINESE:
             errors.append(
                 f"{path} record {record_index}: {field} must contain at least "
                 f"{MIN_DESCRIPTION_CHINESE} Chinese characters"
             )
-        sentences = [part for part in re.split(r"[。！？!?]+", text) if part.strip()]
-        if len(sentences) < 2:
-            errors.append(
-                f"{path} record {record_index}: {field} must contain at least two complete sentences"
-            )
         if text.count("；") + text.count(";") > 1:
             errors.append(f"{path} record {record_index}: {field} has repeated semicolon joins")
         if text.count("，") >= 10 and text.count("、") >= 3:
             errors.append(f"{path} record {record_index}: {field} reads as a dense inventory")
+        score = record.get(field.replace("_description", "_score"))
+        if score == 5:
+            if PERFECT_SCORE_CONTRADICTION_RE.search(text):
+                errors.append(f"{path} record {record_index}: {field} admits an unmet requirement with a perfect score")
+            if not PERFECT_ACTION_RE.search(text) or not PERFECT_RESULT_RE.search(text):
+                errors.append(f"{path} record {record_index}: {field} lacks a concrete verification action and result for a perfect score")
+        if isinstance(score, int) and not isinstance(score, bool) and score < 5:
+            if not NON_MAX_EVIDENCE_RE.search(text):
+                errors.append(f"{path} record {record_index}: {field} lacks a concrete evidence location")
+            if not NON_MAX_IMPACT_RE.search(text):
+                errors.append(f"{path} record {record_index}: {field} lacks an objective consequence")
+            if field == "planning_description" and not PLANNING_EVIDENCE_RE.search(text):
+                errors.append(f"{path} record {record_index}: {field} lacks planning or state-tracking evidence")
+            if field == "reasoning_description" and not REASONING_PREMISE_RE.search(text):
+                errors.append(f"{path} record {record_index}: {field} lacks a false premise, inference, or omitted branch")
+            if field == "execution_description":
+                if not EXECUTION_TOOL_ACTION_RE.search(text):
+                    errors.append(f"{path} record {record_index}: {field} lacks a concrete tool action")
+                if not EXECUTION_FOLLOWUP_RE.search(text):
+                    errors.append(f"{path} record {record_index}: {field} lacks retry, recovery, or verification sequence evidence")
 
     openers = [first_words(text) for text in descriptions]
     for left in range(len(openers)):
@@ -140,9 +183,8 @@ def check_record(path: Path, record: dict, record_index: int) -> list[str]:
             errors.append(f"{path} record {record_index}: other_issues exposes generation or evaluator language")
         if PLACEHOLDER_RE.search(text):
             errors.append(f"{path} record {record_index}: other_issues contains scaffolding or an arrow")
-        prose = re.sub(r"```.*?```|`[^`]*`|https?://\S+", " ", text, flags=re.DOTALL)
-        if UNNECESSARY_ENGLISH_RE.search(prose):
-            errors.append(f"{path} record {record_index}: other_issues contains unnecessary English evaluator wording")
+        if ENGLISH_EVALUATOR_LABEL_RE.search(text):
+            errors.append(f"{path} record {record_index}: other_issues contains an English evaluator label")
         if len(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]", text)) < 12:
             errors.append(f"{path} record {record_index}: other_issues must use complete Chinese prose")
         if text.count("；") + text.count(";") > 1:
@@ -173,16 +215,34 @@ def main() -> int:
         return 1
     errors: list[str] = []
     opener_by_field: dict[str, dict[str, list[str]]] = {}
+    descriptions_by_field: dict[str, list[tuple[str, str]]] = {}
     for record_index, (path, record) in enumerate(records, 1):
         errors.extend(check_record(path, record, record_index))
         for field in STYLE_FIELDS:
             value = record.get(field)
             if isinstance(value, str) and value.strip():
                 opener_by_field.setdefault(field, {}).setdefault(first_words(value), []).append(str(path))
+                descriptions_by_field.setdefault(field, []).append((str(path), value.strip()))
     for field, openers in opener_by_field.items():
         for opener, paths in openers.items():
             if opener and len(paths) > 1:
                 errors.append(f"{field}: opener {opener!r} is repeated across {len(paths)} pending record(s)")
+    for field, entries in descriptions_by_field.items():
+        for left in range(len(entries)):
+            left_path, left_text = entries[left]
+            normalized_left = re.sub(r"[\s，。；：、,.!?！？;:'\"“”‘’（）()]", "", left_text)
+            fragments = {
+                normalized_left[index:index + 18]
+                for index in range(max(0, len(normalized_left) - 17))
+            }
+            for right in range(left + 1, len(entries)):
+                right_path, right_text = entries[right]
+                normalized_right = re.sub(r"[\s，。；：、,.!?！？;:'\"“”‘’（）()]", "", right_text)
+                duplicate = next((part for part in fragments if part in normalized_right), None)
+                if duplicate:
+                    errors.append(
+                        f"{field}: exact long fragment {duplicate!r} is repeated across {left_path} and {right_path}"
+                    )
     if errors:
         print("STYLE GATE BLOCKED", file=sys.stderr)
         for error in errors:

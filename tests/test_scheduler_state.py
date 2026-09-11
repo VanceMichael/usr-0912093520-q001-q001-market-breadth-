@@ -46,7 +46,10 @@ def test_scheduler_failure_and_retry_clear_circuit_state() -> None:
     with tempfile.TemporaryDirectory() as raw:
         store = make_store(Path(raw))
         cycle_id = store.begin_cycle()
-        store.finish_cycle(cycle_id, status="failed", error="network unavailable")
+        store.finish_cycle(
+            cycle_id, status="failed", error="network unavailable",
+            failure_kind="environment",
+        )
         assert store.state()["consecutive_failures"] == 1
         assert store.state()["last_error"] == "network unavailable"
 
@@ -55,6 +58,45 @@ def test_scheduler_failure_and_retry_clear_circuit_state() -> None:
         assert state["desired_state"] == "running"
         assert state["consecutive_failures"] == 0
         assert state["last_error"] == ""
+        assert state["failure_kind"] == ""
+        assert state["circuit_reason"] == ""
+
+
+def test_scheduler_degraded_cycle_does_not_increment_systemic_failures() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        store = make_store(Path(raw))
+        cycle_id = store.begin_cycle()
+        store.finish_cycle(
+            cycle_id, status="degraded", error="author timed out",
+            failure_kind="authoring",
+        )
+        state = store.state()
+        assert state["actual_state"] == "running"
+        assert state["consecutive_failures"] == 0
+        assert state["failure_kind"] == "authoring"
+        assert store.cycles()[0]["status"] == "degraded"
+
+
+def test_scheduler_failure_count_resets_when_failure_kind_changes() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        store = make_store(Path(raw))
+        first = store.begin_cycle()
+        store.finish_cycle(first, status="failed", error="auth", failure_kind="permanent_auth")
+        second = store.begin_cycle()
+        store.finish_cycle(second, status="failed", error="auth", failure_kind="permanent_auth")
+        assert store.state()["consecutive_failures"] == 2
+        third = store.begin_cycle()
+        store.finish_cycle(third, status="failed", error="docker", failure_kind="environment")
+        assert store.state()["consecutive_failures"] == 1
+
+
+def test_scheduler_database_healthcheck_is_read_write() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        store = make_store(Path(raw))
+        healthy, detail = store.database_healthcheck()
+        assert healthy is True
+        assert detail == "ok"
+        assert store.state()["database_status"] == "ok"
 
 
 def test_scheduler_author_only_mode_is_persistent_until_full_start() -> None:
@@ -95,6 +137,7 @@ def test_scheduler_store_migrates_run_mode_for_existing_database() -> None:
         with store.connect() as connection:
             columns = {row["name"] for row in connection.execute("PRAGMA table_info(scheduler_state)")}
         assert "run_mode" in columns
+        assert {"failure_kind", "circuit_reason", "last_success_at", "database_status"} <= columns
 
 
 def test_scheduler_startup_marks_previous_running_cycles_interrupted() -> None:

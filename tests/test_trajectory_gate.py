@@ -108,6 +108,58 @@ class TrajectoryGateTests(unittest.TestCase):
             with self.assertRaisesRegex(TrajectoryGateError, "没有任何代码变化"):
                 validate_effective_trajectory(root / "claude", prompt, repo, sha)
 
+    def test_internal_task_notification_is_not_a_prompt_candidate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, sha = self.make_repo(root)
+            prompt = "实现后端功能"
+            self.write_trajectory(root / "claude", prompt, useful=True)
+            path = root / "claude" / "projects" / "-workspace" / "session-1.jsonl"
+            notification = {
+                "type": "user", "sessionId": "session-1", "promptId": "internal-1",
+                "message": {"role": "user", "content": (
+                    "<task-notification><task-id>1</task-id><tool-use-id>t</tool-use-id>"
+                    "<status>completed</status></task-notification>"
+                )},
+            }
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(notification, ensure_ascii=False) + "\n")
+            (repo / "app.py").write_text("print('ok')\n", encoding="utf-8")
+            evidence = validate_effective_trajectory(root / "claude", prompt, repo, sha)
+            self.assertEqual(evidence.prompt_id, "prompt-1")
+
+    def test_foreign_session_in_primary_file_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, sha = self.make_repo(root)
+            prompt = "实现后端功能"
+            self.write_trajectory(root / "claude", prompt, useful=True)
+            path = root / "claude" / "projects" / "-workspace" / "session-1.jsonl"
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({
+                    "type": "assistant", "sessionId": "session-2",
+                    "message": {"role": "assistant", "model": "m", "content": "other"},
+                }) + "\n")
+            (repo / "app.py").write_text("print('ok')\n", encoding="utf-8")
+            with self.assertRaisesRegex(TrajectoryGateError, "混入其他 SessionID"):
+                validate_effective_trajectory(root / "claude", prompt, repo, sha)
+
+    def test_duplicate_primary_trajectory_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, sha = self.make_repo(root)
+            prompt = "实现后端功能"
+            self.write_trajectory(root / "claude", prompt, useful=True)
+            source = root / "claude" / "projects" / "-workspace" / "session-1.jsonl"
+            duplicate = source.parent / "session-2.jsonl"
+            duplicate.write_text(
+                source.read_text(encoding="utf-8").replace("session-1", "session-2"),
+                encoding="utf-8",
+            )
+            (repo / "app.py").write_text("print('ok')\n", encoding="utf-8")
+            with self.assertRaisesRegex(TrajectoryGateError, "多份主轨迹"):
+                validate_effective_trajectory(root / "claude", prompt, repo, sha)
+
 
 if __name__ == "__main__":
     unittest.main()

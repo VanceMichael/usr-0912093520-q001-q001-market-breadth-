@@ -27,7 +27,12 @@ CREATE TABLE IF NOT EXISTS scheduler_state (
     last_error TEXT NOT NULL DEFAULT '',
     cycle_count INTEGER NOT NULL DEFAULT 0,
     restart_count INTEGER NOT NULL DEFAULT 0,
-    consecutive_failures INTEGER NOT NULL DEFAULT 0
+    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+    failure_kind TEXT NOT NULL DEFAULT '',
+    circuit_reason TEXT NOT NULL DEFAULT '',
+    circuit_opened_at TEXT NOT NULL DEFAULT '',
+    last_success_at TEXT NOT NULL DEFAULT '',
+    database_status TEXT NOT NULL DEFAULT 'ok'
 );
 
 CREATE TABLE IF NOT EXISTS scheduler_cycles (
@@ -108,6 +113,18 @@ class SchedulerStore:
                 connection.execute(
                     "ALTER TABLE scheduler_state ADD COLUMN run_mode TEXT NOT NULL DEFAULT 'full'"
                 )
+            migrations = {
+                "failure_kind": "TEXT NOT NULL DEFAULT ''",
+                "circuit_reason": "TEXT NOT NULL DEFAULT ''",
+                "circuit_opened_at": "TEXT NOT NULL DEFAULT ''",
+                "last_success_at": "TEXT NOT NULL DEFAULT ''",
+                "database_status": "TEXT NOT NULL DEFAULT 'ok'",
+            }
+            for column, definition in migrations.items():
+                if column not in columns:
+                    connection.execute(
+                        f"ALTER TABLE scheduler_state ADD COLUMN {column} {definition}"
+                    )
             timestamp = now()
             connection.execute(
                 "INSERT OR IGNORE INTO scheduler_state(id,updated_at) VALUES(1,?)",
@@ -120,11 +137,28 @@ class SchedulerStore:
             row = connection.execute("SELECT * FROM scheduler_state WHERE id=1").fetchone()
         return dict(row) if row else {}
 
+    def database_healthcheck(self) -> tuple[bool, str]:
+        """Verify that SQLite is readable and writable before starting more work."""
+        try:
+            with closing(self.connect()) as connection:
+                result = connection.execute("PRAGMA quick_check(1)").fetchone()
+                if result is None or str(result[0]).casefold() != "ok":
+                    return False, f"SQLite quick_check 返回异常：{result[0] if result else '无结果'}"
+                connection.execute("BEGIN IMMEDIATE")
+                connection.execute(
+                    "UPDATE scheduler_state SET database_status='ok' WHERE id=1"
+                )
+                connection.commit()
+        except (OSError, sqlite3.Error) as exc:
+            return False, f"{type(exc).__name__}: {exc}"
+        return True, "ok"
+
     def update(self, **values: object) -> dict:
         allowed = {
             "desired_state", "actual_state", "run_mode", "phase", "batch_name", "detail", "pid",
             "heartbeat_at", "started_at", "last_error", "cycle_count", "restart_count",
-            "consecutive_failures",
+            "consecutive_failures", "failure_kind", "circuit_reason", "circuit_opened_at",
+            "last_success_at", "database_status",
         }
         fields = [(key, value) for key, value in values.items() if key in allowed]
         fields.append(("updated_at", now()))
@@ -217,8 +251,15 @@ class SchedulerStore:
                 "UPDATE scheduler_state SET desired_state=?,"
                 "run_mode=CASE WHEN ?<>'' THEN ? ELSE run_mode END,updated_at=?,"
                 "last_error=CASE WHEN ? IN ('retry','start','author_only','resume') THEN '' ELSE last_error END,"
-                "consecutive_failures=CASE WHEN ?='retry' THEN 0 ELSE consecutive_failures END WHERE id=1",
-                (desired, requested_mode, requested_mode, timestamp, action, action),
+                "consecutive_failures=CASE WHEN ? IN ('retry','start','author_only','resume') THEN 0 ELSE consecutive_failures END,"
+                "failure_kind=CASE WHEN ? IN ('retry','start','author_only','resume') THEN '' ELSE failure_kind END,"
+                "circuit_reason=CASE WHEN ? IN ('retry','start','author_only','resume') THEN '' ELSE circuit_reason END,"
+                "circuit_opened_at=CASE WHEN ? IN ('retry','start','author_only','resume') THEN '' ELSE circuit_opened_at END "
+                "WHERE id=1",
+                (
+                    desired, requested_mode, requested_mode, timestamp, action, action,
+                    action, action, action,
+                ),
             )
             connection.commit()
             control_id = int(cursor.lastrowid)
@@ -270,7 +311,10 @@ class SchedulerStore:
         self.event("cycle_started", f"生产周期 #{cycle_id} 已开始", phase="news")
         return cycle_id
 
-    def finish_cycle(self, cycle_id: int, *, status: str, batch: str = "", error: str = "") -> None:
+    def finish_cycle(
+        self, cycle_id: int, *, status: str, batch: str = "", error: str = "",
+        failure_kind: str = "",
+    ) -> None:
         timestamp = now()
         with closing(self.connect()) as connection:
             connection.execute(
@@ -280,14 +324,26 @@ class SchedulerStore:
             if status == "completed":
                 connection.execute(
                     "UPDATE scheduler_state SET cycle_count=cycle_count+1,consecutive_failures=0,"
-                    "last_error='',phase='idle',batch_name='',detail='等待下一轮',heartbeat_at=?,updated_at=? WHERE id=1",
-                    (timestamp, timestamp),
+                    "last_error='',failure_kind='',circuit_reason='',circuit_opened_at='',"
+                    "last_success_at=?,database_status='ok',phase='idle',batch_name='',"
+                    "detail='等待下一轮',heartbeat_at=?,updated_at=? WHERE id=1",
+                    (timestamp, timestamp, timestamp),
                 )
             elif status == "failed":
                 connection.execute(
-                    "UPDATE scheduler_state SET consecutive_failures=consecutive_failures+1,last_error=?,"
-                    "actual_state='error',phase='error',detail='本轮执行失败',heartbeat_at=?,updated_at=? WHERE id=1",
-                    (error, timestamp, timestamp),
+                    "UPDATE scheduler_state SET consecutive_failures=CASE WHEN failure_kind=? "
+                    "THEN consecutive_failures+1 ELSE 1 END,last_error=?,"
+                    "failure_kind=?,database_status=CASE WHEN ?='database_unavailable' THEN 'unavailable' "
+                    "ELSE database_status END,actual_state='error',phase='error',"
+                    "detail='本轮执行失败',heartbeat_at=?,updated_at=? WHERE id=1",
+                    (failure_kind, error, failure_kind, failure_kind, timestamp, timestamp),
+                )
+            elif status == "degraded":
+                connection.execute(
+                    "UPDATE scheduler_state SET last_error=?,failure_kind=?,actual_state='running',"
+                    "phase='idle',batch_name='',detail='可恢复故障，已有任务继续运行',"
+                    "heartbeat_at=?,updated_at=? WHERE id=1",
+                    (error, failure_kind, timestamp, timestamp),
                 )
             else:
                 connection.execute(
@@ -295,8 +351,11 @@ class SchedulerStore:
                     ("本轮已中断", timestamp, timestamp),
                 )
             connection.commit()
-        level = "error" if status == "failed" else "info"
-        self.event(f"cycle_{status}", f"生产周期 #{cycle_id} {status}", level=level, batch=batch, details={"error": error})
+        level = "error" if status == "failed" else "warning" if status == "degraded" else "info"
+        self.event(
+            f"cycle_{status}", f"生产周期 #{cycle_id} {status}", level=level,
+            batch=batch, details={"error": error, "failure_kind": failure_kind},
+        )
 
     def events(self, *, after_id: int = 0, limit: int = 200) -> list[dict]:
         limit = max(1, min(int(limit), 1000))

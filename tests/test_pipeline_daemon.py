@@ -8,6 +8,7 @@ from unittest import mock
 import pytest
 
 from tools.pipeline_daemon import (
+    AUTHOR_FAILURE_EXIT,
     active_batches,
     author_prompt,
     authored_batch_result,
@@ -16,6 +17,7 @@ from tools.pipeline_daemon import (
     child_process_kwargs,
     cycle,
     create_batch,
+    create_next_batch,
     difficulty_distribution,
     difficulty_plan,
     load_runtime_env,
@@ -269,3 +271,32 @@ def test_authored_batch_must_have_every_question_ready() -> None:
         assert authored_batch_result(database, "batch", 2) == (True, 2, 2)
         with connect(database) as connection:
             assert connection.execute("SELECT status FROM batches").fetchone()[0] == "ready"
+
+
+def test_author_failure_is_retryable_and_releases_claimed_topics() -> None:
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        database = root / "production.sqlite3"
+        with connect(database) as connection:
+            for index in range(1, 3):
+                connection.execute(
+                    "INSERT INTO news_topics(source_url,article_url,title,topic_hash,status,created_at,updated_at) "
+                    "VALUES(?,?,?,?, 'new','now','now')",
+                    ("https://news.example", f"https://news.example/{index}", f"topic {index}", f"hash-{index}"),
+                )
+            connection.commit()
+        args = Namespace(
+            db=database, codex="codex", log_dir=root / "runs" / "daemon",
+            agent_timeout=60,
+        )
+        with mock.patch.dict(os.environ, {"CC_AUTHOR_BATCH_SIZE": "2"}), mock.patch(
+            "tools.pipeline_daemon.create_batch", side_effect=TimeoutError("author timeout")
+        ):
+            code, batch = create_next_batch(database, args)
+        assert code == AUTHOR_FAILURE_EXIT
+        assert batch.isdigit()
+        with connect(database) as connection:
+            statuses = connection.execute(
+                "SELECT status FROM news_topics ORDER BY id"
+            ).fetchall()
+        assert [row["status"] for row in statuses] == ["new", "new"]

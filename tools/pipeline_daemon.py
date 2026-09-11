@@ -16,6 +16,7 @@ import os
 import re
 import signal
 import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -36,6 +37,12 @@ from tools.news_topics import DEFAULT_FEEDS, configured_feeds, ingest  # noqa: E
 from tools.orchestrator import clear_question_leases  # noqa: E402
 from tools.scheduler_state import SchedulerStore  # noqa: E402
 from tools.text_encoding import read_portable_text  # noqa: E402
+
+
+AUTHOR_FAILURE_EXIT = 75
+SYSTEMIC_FAILURE_KINDS = {
+    "database_unavailable", "permanent_auth", "model_config", "environment",
+}
 
 
 def now() -> str:
@@ -399,6 +406,18 @@ def has_new_topics(database: Path) -> bool:
         return connection.execute("SELECT 1 FROM news_topics WHERE status='new' LIMIT 1").fetchone() is not None
 
 
+def latest_systemic_failure(database: Path, since: str = "") -> str:
+    """Return a recent non-retryable worker failure, if one caused pool shutdown."""
+    with connect(database.resolve()) as connection:
+        row = connection.execute(
+            "SELECT failure_kind FROM runs WHERE status IN ('failed','timeout') "
+            "AND retryable=0 AND failure_kind IN ('permanent_auth','model_config','environment') "
+            "AND (?='' OR started_at>=?) ORDER BY id DESC LIMIT 1",
+            (since, since),
+        ).fetchone()
+    return str(row["failure_kind"] or "") if row else ""
+
+
 def author_prompt(topics: list[dict], batch: str, batch_size: int, distribution: str) -> str:
     source_urls = list(dict.fromkeys(
         str(topic.get("source_url", "")).strip()
@@ -419,7 +438,7 @@ def author_prompt(topics: list[dict], batch: str, batch_size: int, distribution:
 难度分配：{distribution}
 出题要求：业务关键词：从 {sources} 读取主题来进行出题，本轮必须按下方新闻主题清单的 question_no 将主题与题目一一绑定，每条新闻必须且只能生成一道题，不得遗漏、复用、合并主题或从同一主题派生多道题；技术关键词：需要 Docker，每道题的初始工程必须提供 Dockerfile，有外部依赖时同时提供 Docker Compose，并支持通过命令完成构建和验收；补充要求：在整批中合理覆盖 Node.js（JavaScript 或 TypeScript）、Python、Go、Java，每道题只选择其中一种主要后端技术栈。{backend_only_requirement()}每道题的 difficulty 字段必须严格按上述题数分配，不得擅自改变题数或难度。新闻只作为业务背景种子，不要复制新闻标题，不要把新闻事实当成实现要求，也不要使用新闻网站代码或受版权保护的正文。先检查 production.sqlite3 中已有题目，发现重复或模板化表达必须重写。
 新闻主题清单：{context}
-严格遵守 项目规范.md。完成真实初始工程、GitHub 可访问快照和登记后，运行出题机械质检，并使用 $cc-usr-question-qc 完成重复、自然度和反模板质检；不要亲自调用或启动 Claude 目标模型，出题会话正常结束后将由调度器自动接管后续模型流水线。不得读取、调用或修改 SchedulerStore、scheduler_state、scheduler_controls、调度器控制接口、守护进程状态或服务启停状态，也不得为了阻止目标模型而暂停、停止或重启调度器。全过程只修改本项目和题目工作区，完成后直接输出批次名、每题状态和任何阻塞原因。"""
+严格遵守 项目规范.md。完成真实初始工程、GitHub 可访问快照和登记后，运行出题机械质检，并使用 $cc-usr-question-qc 完成重复、自然度和反模板质检；不要启动目标模型，也不要亲自调用 Claude 目标模型，出题会话正常结束后将由调度器自动接管后续模型流水线。不得读取、调用或修改 SchedulerStore、scheduler_state、scheduler_controls、调度器控制接口、守护进程状态或服务启停状态，也不得为了阻止目标模型而暂停、停止或重启调度器。全过程只修改本项目和题目工作区，完成后直接输出批次名、每题状态和任何阻塞原因。"""
 
 
 def create_batch(database: Path, codex: str, topics: list[dict], batch: str, log: Path, timeout: int, store: SchedulerStore | None = None) -> int:
@@ -497,10 +516,16 @@ def create_next_batch(
     log = args.log_dir.resolve() / f"author-{batch}.log"
     try:
         code = create_batch(database, args.codex, topics, batch, log, args.agent_timeout, store)
-    except Exception:
+    except Exception as exc:
         fail_authored_batch(database, batch)
         release_topics(database, topic_ids, "new")
-        raise
+        if store:
+            store.event(
+                "author_failed", f"出题任务失败，将保留新闻并退避重试：{exc}",
+                level="warning", phase="author", batch=batch,
+                details={"failure_kind": "authoring", "retryable": True},
+            )
+        return AUTHOR_FAILURE_EXIT, batch
     if code == 0:
         complete, total, ready = authored_batch_result(database, batch, batch_size)
         release_topics(database, topic_ids, "used", batch)
@@ -512,11 +537,11 @@ def create_next_batch(
                     level="error", phase="author", batch=batch,
                     details={"total": total, "ready": ready, "expected": batch_size},
                 )
-            return 1, batch
+            return AUTHOR_FAILURE_EXIT, batch
     else:
         fail_authored_batch(database, batch)
         release_topics(database, topic_ids, "new")
-    return code, batch
+    return (AUTHOR_FAILURE_EXIT if code else 0), batch
 
 
 def pipeline_batch_timeout(
@@ -631,6 +656,7 @@ def maintain_ready_buffer(
 ) -> None:
     """Keep authoring in parallel until control state asks the global pool to drain."""
     try:
+        author_failures = 0
         while not stop_event.is_set():
             desired = str(store.state().get("desired_state") or "running")
             if desired != "running":
@@ -649,9 +675,28 @@ def maintain_ready_buffer(
                     continue
             code, batch = create_next_batch(database, args, store)
             if code:
+                if code == AUTHOR_FAILURE_EXIT:
+                    author_failures += 1
+                    delay = min(900, 30 * (2 ** min(author_failures - 1, 5)))
+                    outcome.update(
+                        code=0, batch=batch, author_failure_count=author_failures,
+                        last_author_error=f"批次 {batch or '-'} 出题失败",
+                    )
+                    store.heartbeat(
+                        phase="author", batch=batch,
+                        detail=f"出题失败，{delay} 秒后重试；已有题目继续处理",
+                    )
+                    store.event(
+                        "author_backoff", f"出题失败，{delay} 秒后重试",
+                        level="warning", phase="author", batch=batch,
+                        details={"delay_seconds": delay, "failure_count": author_failures},
+                    )
+                    stop_event.wait(delay)
+                    continue
                 outcome.update(code=code, batch=batch)
                 break
             if batch:
+                author_failures = 0
                 store.event(
                     "buffer_batch_created",
                     f"题目缓冲池新增批次 {batch}",
@@ -889,6 +934,43 @@ def main() -> int:
             else:
                 store.apply_controls("running", "控制指令已生效")
 
+            database_ok, database_detail = store.database_healthcheck()
+            if not database_ok:
+                try:
+                    current = store.state()
+                    previous_kind = str(current.get("failure_kind") or "")
+                    failure_count = (
+                        int(current.get("consecutive_failures") or 0) + 1
+                        if previous_kind == "database_unavailable" else 1
+                    )
+                    circuit_open = failure_count >= max(1, args.failure_threshold)
+                    opened_at = now() if circuit_open else ""
+                    reason = (
+                        f"database_unavailable 连续失败达到 {args.failure_threshold} 次"
+                        if circuit_open else ""
+                    )
+                    store.update(
+                        desired_state="paused" if circuit_open else "running",
+                        actual_state="error", phase="error", database_status="unavailable",
+                        failure_kind="database_unavailable", last_error=database_detail,
+                        consecutive_failures=failure_count,
+                        circuit_reason=reason, circuit_opened_at=opened_at,
+                        detail="SQLite 数据库不可用，暂停领取新任务", heartbeat_at=now(),
+                    )
+                    store.event(
+                        "database_unavailable", database_detail, level="error",
+                        details={
+                            "failure_kind": "database_unavailable",
+                            "failure_count": failure_count, "circuit_open": circuit_open,
+                        },
+                    )
+                except sqlite3.Error:
+                    print(f"database unavailable: {database_detail}", file=sys.stderr, flush=True)
+                if not args.loop:
+                    return 1
+                time.sleep(min(max(1, args.poll_seconds), 10))
+                continue
+
             free_gb = shutil.disk_usage(PROJECT_ROOT).free / (1024 ** 3)
             if free_gb < max(0, args.min_free_gb):
                 detail = f"可用磁盘仅 {free_gb:.1f} GB，低于 {args.min_free_gb:.1f} GB 安全阈值"
@@ -900,6 +982,7 @@ def main() -> int:
                 continue
 
             cycle_id = store.begin_cycle()
+            cycle_started_at = now()
             batch = ""
             try:
                 code, batch = cycle(args, store)
@@ -929,25 +1012,63 @@ def main() -> int:
             except subprocess.TimeoutExpired as exc:
                 code = 1
                 error = f"命令执行超时：{exc.timeout} 秒"
-                store.finish_cycle(cycle_id, status="failed", batch=batch, error=error)
+                store.finish_cycle(
+                    cycle_id, status="degraded", batch=batch, error=error,
+                    failure_kind="command_timeout",
+                )
+            except sqlite3.Error as exc:
+                code = 1
+                error = f"{type(exc).__name__}: {exc}"
+                store.finish_cycle(
+                    cycle_id, status="failed", batch=batch, error=error,
+                    failure_kind="database_unavailable",
+                )
             except Exception as exc:  # keep the resident scheduler observable after one bad cycle
                 code = 1
                 error = f"{type(exc).__name__}: {exc}"
-                store.finish_cycle(cycle_id, status="failed", batch=batch, error=error)
+                store.finish_cycle(
+                    cycle_id, status="degraded", batch=batch, error=error,
+                    failure_kind="operational",
+                )
             else:
-                if code:
-                    store.finish_cycle(cycle_id, status="failed", batch=batch, error=f"流水线退出码 {code}")
+                if code == AUTHOR_FAILURE_EXIT:
+                    store.finish_cycle(
+                        cycle_id, status="degraded", batch=batch,
+                        error="出题任务失败，已保留新闻主题等待退避重试",
+                        failure_kind="authoring",
+                    )
+                elif code:
+                    failure_kind = (
+                        latest_systemic_failure(args.db.resolve(), cycle_started_at)
+                        or "pipeline_failure"
+                    )
+                    cycle_status = "failed" if failure_kind in SYSTEMIC_FAILURE_KINDS else "degraded"
+                    store.finish_cycle(
+                        cycle_id, status=cycle_status, batch=batch,
+                        error=f"流水线退出码 {code}", failure_kind=failure_kind,
+                    )
                 else:
                     store.finish_cycle(cycle_id, status="completed", batch=batch)
 
             state = store.state()
-            if code and int(state.get("consecutive_failures") or 0) >= max(1, args.failure_threshold):
+            failure_kind = str(state.get("failure_kind") or "")
+            if (
+                code and failure_kind in SYSTEMIC_FAILURE_KINDS
+                and int(state.get("consecutive_failures") or 0) >= max(1, args.failure_threshold)
+            ):
+                opened_at = now()
+                reason = f"{failure_kind} 连续失败达到 {args.failure_threshold} 次"
                 store.update(
-                    desired_state="paused", actual_state="error", detail="连续失败达到阈值，已暂停新周期",
+                    desired_state="paused", actual_state="error",
+                    detail="系统性故障达到阈值，已暂停领取新任务",
+                    circuit_reason=reason, circuit_opened_at=opened_at,
                 )
                 store.event(
-                    "circuit_opened", "连续失败达到阈值，调度器已暂停",
-                    level="error", details={"failure_threshold": args.failure_threshold},
+                    "circuit_opened", f"系统性故障触发自动熔断：{reason}",
+                    level="error", details={
+                        "failure_threshold": args.failure_threshold,
+                        "failure_kind": failure_kind, "opened_at": opened_at,
+                    },
                 )
             elif str(state.get("desired_state")) == "draining":
                 store.apply_controls("paused", "当前周期已完成，已排空")

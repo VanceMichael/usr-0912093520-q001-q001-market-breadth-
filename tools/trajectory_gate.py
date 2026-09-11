@@ -37,20 +37,34 @@ class TrajectoryEvidence:
     changed_files: int
 
 
+def _is_internal_task_notification(text: str) -> bool:
+    stripped = text.strip()
+    return (
+        stripped.startswith("<task-notification>")
+        and stripped.endswith("</task-notification>")
+        and "<task-id>" in stripped
+        and "<tool-use-id>" in stripped
+        and "<status>" in stripped
+    )
+
+
 def _message_text(event: dict[str, Any]) -> str:
+    if event.get("isMeta") is True or event.get("isCompactSummary") is True:
+        return ""
     message = event.get("message")
     if not isinstance(message, dict):
         return str(event.get("prompt") or "")
     content = message.get("content")
     if isinstance(content, str):
-        return content
+        return "" if _is_internal_task_notification(content) else content
     if not isinstance(content, list):
         return str(event.get("prompt") or "")
     parts = []
     for block in content:
         if isinstance(block, dict) and block.get("type") == "text":
             parts.append(str(block.get("text") or ""))
-    return "".join(parts)
+    text = "".join(parts)
+    return "" if _is_internal_task_notification(text) else text
 
 
 def _event_strings(value: Any):
@@ -130,8 +144,18 @@ def _trajectory_metrics(
     session_id = str(matched_event.get("sessionId") or matched_event.get("session_id") or "")
     prompt_id = str(
         matched_event.get("promptId") or matched_event.get("prompt_id")
-        or matched_event.get("uuid") or ""
+        or ""
     )
+    foreign_sessions = sorted({
+        str(event.get("sessionId") or event.get("session_id") or "")
+        for event in events
+        if str(event.get("sessionId") or event.get("session_id") or "")
+        not in {"", session_id}
+    })
+    if foreign_sessions:
+        raise TrajectoryGateError(
+            f"{path.name} 混入其他 SessionID：" + "、".join(foreign_sessions[:10])
+        )
     for event_index, event in enumerate(events):
         event_session = str(event.get("sessionId") or event.get("session_id") or "")
         if event_session not in {"", session_id}:
@@ -190,6 +214,10 @@ def _trajectory_metrics(
         raise TrajectoryGateError(f"{path.name} 的原始 Prompt 缺少 SessionID")
     if not prompt_id:
         raise TrajectoryGateError(f"{path.name} 的原始 Prompt 缺少 PromptID")
+    if path.stem != session_id:
+        raise TrajectoryGateError(
+            f"轨迹文件名 {path.name} 与 SessionID {session_id} 不一致"
+        )
     duplicate_calls = sorted(identifier for identifier, count in calls.items() if count > 1)
     duplicate_results = sorted(identifier for identifier, count in results.items() if count > 1)
     if duplicate_calls or duplicate_results:
@@ -278,9 +306,12 @@ def validate_effective_trajectory(
     if not candidates:
         raise TrajectoryGateError("没有找到与本题原始 Prompt 精确匹配的 Claude 轨迹")
 
-    path, session_id, prompt_id, assistant_messages, tool_uses, has_final_text = max(
-        candidates, key=lambda item: (item[5], item[4], item[3])
-    )
+    if len(candidates) != 1:
+        raise TrajectoryGateError(
+            "同一原始 Prompt 匹配到多份主轨迹："
+            + "、".join(path.name for path, *_rest in candidates)
+        )
+    path, session_id, prompt_id, assistant_messages, tool_uses, has_final_text = candidates[0]
     if assistant_messages == 0:
         raise TrajectoryGateError("轨迹中没有真实的 assistant 响应")
     if tool_uses == 0:

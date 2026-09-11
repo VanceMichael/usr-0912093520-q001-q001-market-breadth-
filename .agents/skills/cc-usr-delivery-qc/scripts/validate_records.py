@@ -35,6 +35,23 @@ CONFIG_PATH_RE = re.compile(
     r"(?i)(?:CLAUDE\.md|AGENTS\.md|\.claude[/\\]+settings(?:\.local)?\.json|"
     r"\.codex[/\\]+config\.toml)"
 )
+MEMORY_CONTAMINATION_RE = re.compile(
+    r"(?i)(?:(?:remember|recall)(?:ed)?\s+(?:this|the)\s+(?:project|repo|task)\s+from\s+"
+    r"(?:a|the)?\s*previous\s+(?:session|conversation|run)|"
+    r"(?:上一次|上一轮|此前)(?:会话|对话|运行)(?:里|中)?(?:已经|曾经)?(?:写过|知道|记得)|"
+    r"(?:早就|已经)记得(?:这个|该)(?:项目|仓库|任务))"
+)
+
+
+def _is_internal_task_notification(text: str) -> bool:
+    stripped = text.strip()
+    return (
+        stripped.startswith("<task-notification>")
+        and stripped.endswith("</task-notification>")
+        and "<task-id>" in stripped
+        and "<tool-use-id>" in stripped
+        and "<status>" in stripped
+    )
 
 
 def _event_strings(value: object):
@@ -53,25 +70,47 @@ def _event_session_id(event: dict) -> str:
 
 
 def _event_user_prompt(event: dict) -> str:
-    if event.get("type") != "user" or event.get("isMeta") is True:
+    if (
+        event.get("type") != "user" or event.get("isMeta") is True
+        or event.get("isCompactSummary") is True
+    ):
         return ""
     message = event.get("message")
     if not isinstance(message, dict) or message.get("role") != "user":
         return ""
     content = message.get("content")
     if isinstance(content, str):
-        return content
+        return "" if _is_internal_task_notification(content) else content
     if isinstance(content, list):
-        return "\n".join(
+        text = "\n".join(
             str(block.get("text", ""))
             for block in content
             if isinstance(block, dict) and block.get("type") == "text"
         )
+        return "" if _is_internal_task_notification(text) else text
     return ""
 
 
 def _event_prompt_id(event: dict) -> str:
-    return str(event.get("promptId") or event.get("prompt_id") or event.get("uuid") or "")
+    return str(event.get("promptId") or event.get("prompt_id") or "")
+
+
+def _assistant_text(event: dict) -> str:
+    if event.get("type") != "assistant":
+        return ""
+    message = event.get("message")
+    if not isinstance(message, dict) or message.get("role") != "assistant":
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    return "\n".join(
+        str(block.get("text") or block.get("thinking") or "")
+        for block in content
+        if isinstance(block, dict) and block.get("type") in {"text", "thinking"}
+    )
 
 
 def _assistant_has_text(event: dict) -> bool:
@@ -193,6 +232,14 @@ def trajectory_integrity_issues(record: dict, source_row: sqlite3.Row) -> list[s
             f"{record_id}: trajectory contains events from other SessionIDs: "
             + ", ".join(foreign_sessions)
         )
+    for event in session_events:
+        match = MEMORY_CONTAMINATION_RE.search(_assistant_text(event))
+        if match:
+            excerpt = re.sub(r"\s+", " ", match.group(0)).strip()
+            issues.append(
+                f"{record_id}: trajectory contains prior-session memory instead of verified workspace evidence ({excerpt})"
+            )
+            break
     real_turns = [
         (index, event) for index, event in enumerate(events)
         if _event_session_id(event) in {"", session_id}
