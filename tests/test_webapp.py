@@ -128,8 +128,7 @@ class WebConsoleTests(unittest.TestCase):
                     event = connection.execute(
                         "SELECT action,details FROM record_review_events ORDER BY id DESC LIMIT 1"
                     ).fetchone()
-                self.assertIsNotNone(event)
-                self.assertEqual(event[0], "codex_review_completed")
+                self.assertIsNone(event)
             finally:
                 data.author_executor.shutdown(wait=True)
                 data.pipeline_executor.shutdown(wait=True)
@@ -181,11 +180,40 @@ class WebConsoleTests(unittest.TestCase):
                 self.assertTrue(result["ok"])
                 submit.assert_called_once()
                 with sqlite3.connect(database) as connection:
-                    event = connection.execute(
-                        "SELECT action FROM record_review_events WHERE record_id=?",
+                    events = connection.execute(
+                        "SELECT action FROM record_review_events WHERE record_id=? ORDER BY id",
                         ("0911-001-T01",),
-                    ).fetchone()
-                self.assertEqual(event[0], "codex_review_started")
+                    ).fetchall()
+                self.assertEqual([row[0] for row in events], ["codex_review_started"])
+
+                review = {
+                    "decision": "rejected",
+                    "summary": "当前资料仍有一项事实无法直接确认。",
+                    "dimensions": {
+                        name: {"approved": False, "reason": "当前证据不足以直接支持这项描述中的判断。"}
+                        for name in ("delivery", "instruction", "planning", "reasoning", "execution")
+                    },
+                    "issues": ["缺少能够直接支持描述的当前轮次证据"],
+                }
+
+                def run(command, **kwargs):
+                    output = Path(command[command.index("--output-last-message") + 1])
+                    output.write_text(json.dumps(review, ensure_ascii=False), encoding="utf-8")
+                    return mock.Mock(returncode=0, stdout="")
+
+                with mock.patch("webapp.server.subprocess.run", side_effect=run):
+                    data._run_codex_delivery_review(
+                        "0911-001-T01", {"record_id": "0911-001-T01"}
+                    )
+                with sqlite3.connect(database) as connection:
+                    events = connection.execute(
+                        "SELECT action FROM record_review_events WHERE record_id=? ORDER BY id",
+                        ("0911-001-T01",),
+                    ).fetchall()
+                self.assertEqual(
+                    [row[0] for row in events],
+                    ["codex_review_started", "codex_review_completed"],
+                )
             finally:
                 data.author_executor.shutdown(wait=True)
                 data.pipeline_executor.shutdown(wait=True)

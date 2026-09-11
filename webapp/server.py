@@ -2337,6 +2337,8 @@ class ConsoleData:
             raise FileNotFoundError(f"数据库不存在：{self.database}")
         connection = sqlite3.connect(self.database, timeout=30)
         connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout=30000")
+        connection.execute("PRAGMA foreign_keys=ON")
         return connection
 
     def batches(self, connection: sqlite3.Connection) -> list[dict]:
