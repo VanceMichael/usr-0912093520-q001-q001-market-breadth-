@@ -1557,7 +1557,6 @@ $(".nav-list").addEventListener("click", (event) => {
   }
   if (state.view === "reviews") {
     loadReviews();
-    if (!reviewTimer) reviewTimer = setInterval(() => loadReviews({ quiet: true }), 5000);
   } else if (reviewTimer) {
     clearInterval(reviewTimer);
     reviewTimer = null;
