@@ -137,6 +137,13 @@ class OrchestratorTest(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertEqual(orchestrator.stream_result_state(log), "success")
+            log.write_text(
+                json.dumps({"type": "result", "is_error": False, "result": "接口失败时返回 403，但本次任务已完成"}) + "\n",
+                encoding="utf-8",
+            )
+            state, diagnostics = orchestrator.stream_result_details(log)
+            self.assertEqual(state, "success")
+            self.assertEqual(diagnostics, "")
 
             task = root / "claude" / "tasks" / "session" / "1.json"
             task.parent.mkdir(parents=True)

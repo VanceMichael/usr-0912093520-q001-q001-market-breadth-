@@ -255,8 +255,14 @@ def stream_result_details(log_path: Path) -> tuple[str, str]:
                 if not isinstance(event, dict):
                     continue
                 if event.get("type") == "result":
-                    found = "failure" if event.get("is_error") else "success"
-                    for key in ("error", "result", "subtype"):
+                    is_error = bool(event.get("is_error"))
+                    found = "failure" if is_error else "success"
+                    # A successful assistant answer may legitimately mention HTTP
+                    # status codes (for example, documenting a 403 response). Only
+                    # scan result text for provider diagnostics when the CLI marks
+                    # the result as an error; otherwise it can trip auth detection.
+                    keys = ("error", "result", "subtype") if is_error else ("error",)
+                    for key in keys:
                         value = event.get(key)
                         if isinstance(value, str) and value.strip():
                             diagnostics.append(value[-2000:])
