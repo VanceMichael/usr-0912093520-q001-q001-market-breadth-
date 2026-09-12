@@ -38,7 +38,6 @@ let schedulerEventSource = null;
 let schedulerRunTimer = null;
 let schedulerRunLoading = null;
 let schedulerRunRequest = 0;
-let reviewTimer = null;
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
@@ -1554,12 +1553,6 @@ $(".nav-list").addEventListener("click", (event) => {
     schedulerEventSource = null;
     if (schedulerRunTimer) clearInterval(schedulerRunTimer);
     schedulerRunTimer = null;
-  }
-  if (state.view === "reviews") {
-    loadReviews();
-  } else if (reviewTimer) {
-    clearInterval(reviewTimer);
-    reviewTimer = null;
   }
   renderView();
 });
