@@ -265,6 +265,8 @@ CREATE TABLE IF NOT EXISTS records (
     delivery_qc_note TEXT NOT NULL DEFAULT '',
     delivery_qc_checked_at TEXT NOT NULL DEFAULT '',
     delivery_qc_changes TEXT NOT NULL DEFAULT '[]',
+    evidence_ledger_sha256 TEXT NOT NULL DEFAULT '',
+    evidence_qc_report TEXT NOT NULL DEFAULT '{}',
     raw_user_prompt TEXT NOT NULL DEFAULT '',
     raw_turn_id TEXT NOT NULL DEFAULT '',
     is_continuation INTEGER NOT NULL DEFAULT 0 CHECK (is_continuation IN (0, 1)),
@@ -417,6 +419,32 @@ CREATE TABLE IF NOT EXISTS solo2_submissions (
     lease_owner TEXT NOT NULL DEFAULT '',
     lease_expires_at TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS solo2_repairs (
+    id INTEGER PRIMARY KEY,
+    remote_id INTEGER NOT NULL UNIQUE,
+    local_record_id TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'PENDING_FIX',
+    qc_summary TEXT NOT NULL DEFAULT '',
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    versions_json TEXT NOT NULL DEFAULT '[]',
+    draft_json TEXT NOT NULL DEFAULT '{}',
+    schema_fingerprint TEXT NOT NULL DEFAULT '',
+    last_error TEXT NOT NULL DEFAULT '',
+    synced_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    submitted_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_solo2_repairs_status ON solo2_repairs(status, updated_at DESC);
+CREATE TABLE IF NOT EXISTS solo2_repair_events (
+    id INTEGER PRIMARY KEY,
+    remote_id INTEGER NOT NULL,
+    local_record_id TEXT NOT NULL DEFAULT '',
+    action TEXT NOT NULL,
+    note TEXT NOT NULL DEFAULT '',
+    details TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_solo2_repair_events_remote ON solo2_repair_events(remote_id, created_at DESC);
 CREATE TABLE IF NOT EXISTS question_reset_audit (
     id INTEGER PRIMARY KEY,
     question_id INTEGER NOT NULL REFERENCES questions(id) ON DELETE RESTRICT,
@@ -446,6 +474,7 @@ RECORD_COLUMNS = (
     "evidence_ledger", "requirement_coverage", "evidence_gate_passed",
     "evidence_checked_at", "history_gate_passed", "history_checked_at", "delivery_qc_passed",
     "delivery_qc_note", "delivery_qc_checked_at", "delivery_qc_changes",
+    "evidence_ledger_sha256", "evidence_qc_report",
     "raw_user_prompt", "raw_turn_id", "is_continuation", "continuation_count",
     "created_at",
 )
@@ -516,6 +545,8 @@ def migrate_records_continuation_identity(connection: sqlite3.Connection) -> Non
                 delivery_qc_note TEXT NOT NULL DEFAULT '',
                 delivery_qc_checked_at TEXT NOT NULL DEFAULT '',
                 delivery_qc_changes TEXT NOT NULL DEFAULT '[]',
+                evidence_ledger_sha256 TEXT NOT NULL DEFAULT '',
+                evidence_qc_report TEXT NOT NULL DEFAULT '{}',
                 raw_user_prompt TEXT NOT NULL DEFAULT '',
                 raw_turn_id TEXT NOT NULL DEFAULT '',
                 is_continuation INTEGER NOT NULL DEFAULT 0 CHECK (is_continuation IN (0, 1)),
@@ -714,6 +745,14 @@ def connect(database: Path) -> sqlite3.Connection:
     if "delivery_qc_changes" not in record_columns:
         connection.execute(
             "ALTER TABLE records ADD COLUMN delivery_qc_changes TEXT NOT NULL DEFAULT '[]'"
+        )
+    if "evidence_ledger_sha256" not in record_columns:
+        connection.execute(
+            "ALTER TABLE records ADD COLUMN evidence_ledger_sha256 TEXT NOT NULL DEFAULT ''"
+        )
+    if "evidence_qc_report" not in record_columns:
+        connection.execute(
+            "ALTER TABLE records ADD COLUMN evidence_qc_report TEXT NOT NULL DEFAULT '{}'"
         )
     migrate_records_continuation_identity(connection)
     record_columns = {

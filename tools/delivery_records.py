@@ -11,7 +11,9 @@ from datetime import datetime, time, timedelta, timezone
 from difflib import SequenceMatcher
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from tools.delivery_quality import prose_english_issues, validate_evidence_structure
+from tools.delivery_quality import (
+    evidence_ledger_sha256, prose_english_issues, validate_evidence_structure,
+)
 
 
 try:
@@ -285,6 +287,9 @@ def validate_one(
 
     evidence_errors, _evidence, _coverage = validate_evidence_structure(record)
     errors.extend(evidence_errors)
+    ledger_hash = str(record.get("evidence_ledger_sha256") or "").strip()
+    if ledger_hash and ledger_hash != evidence_ledger_sha256(record.get("evidence_ledger")):
+        errors.append(f"{record_id}: evidence_ledger_sha256 与当前证据账本不一致")
     for field, label in (
         ("evidence_gate_passed", "事实证据门禁"),
         ("history_gate_passed", "历史反模板门禁"),

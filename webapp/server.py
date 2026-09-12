@@ -79,6 +79,7 @@ from tools.capacity import concurrency_recommendation as scheduler_capacity  # n
 from tools.batch_pipeline import SCHEMA_VERSION, connect as initialize_database  # noqa: E402
 from tools.authoring_policy import backend_only_requirement  # noqa: E402
 from tools.scheduler_state import SchedulerStore  # noqa: E402
+from tools.run_supervisor import read_supervisor_state  # noqa: E402
 from tools.text_encoding import read_portable_text  # noqa: E402
 from tools.solo2_client import Solo2Client, Solo2Error  # noqa: E402
 from tools.solo2_service import submission_overview, submit_records  # noqa: E402
@@ -1456,6 +1457,17 @@ class ConsoleData:
                     )
                 except OSError:
                     pass
+                # Docker attempts keep supervisor.json beside the mounted
+                # Claude state directory; local runs keep it in the state
+                # directory itself.  Expose only bounded status metadata.
+                supervisor_root = trajectory.parent if trajectory.name == "claude" else trajectory
+                supervisor = read_supervisor_state(supervisor_root)
+                if supervisor:
+                    item["supervisor_state"] = str(supervisor.get("state") or "")
+                    item["supervisor_heartbeat_at"] = str(supervisor.get("heartbeat_at") or "")
+                    item["supervisor_checked_at"] = supervisor.get("checked_at")
+                    item["supervisor_error"] = self._redact_log(str(supervisor.get("error") or ""))[-500:]
+                    item["supervisor_activity"] = supervisor.get("activity") or {}
             item["activity_at"] = (
                 datetime.fromtimestamp(activity).astimezone().isoformat(timespec="seconds")
                 if activity else str(row["heartbeat_at"] or row["started_at"] or "")
@@ -2754,11 +2766,17 @@ class ConsoleData:
             "records": [dict(row) for row in records],
         }
 
-    def delivery_reviews(self, batch: object | None = None) -> dict:
+    def delivery_reviews(
+        self, batch: object | None = None, *, view: str = "batch", status: str = "all",
+        search: str = "", page: int = 1, page_size: int = 20,
+    ) -> dict:
         batch_name = str(batch or "").strip() or None
         if batch_name and not BATCH_RE.fullmatch(batch_name):
             raise ValueError("批次名无效")
-        return review_queue(self.database, batch_name)
+        return review_queue(
+            self.database, batch_name, view=view, status=status, search=search,
+            page=page, page_size=page_size,
+        )
 
     def approve_delivery_review(self, body: dict) -> dict:
         return approve_delivery_record(
@@ -3081,7 +3099,8 @@ class ConsoleData:
                            "human_qc_approved=0", "human_qc_reviewer=''", "human_qc_approved_at=''", "human_qc_note=''",
                            "review_method=''", "delivery_qc_passed=0", "delivery_qc_note=''", "delivery_qc_checked_at=''",
                            "delivery_qc_changes='[]'", "evidence_gate_passed=0", "evidence_checked_at=''",
-                           "history_gate_passed=0", "history_checked_at=''"])
+                           "history_gate_passed=0", "history_checked_at=''",
+                           "evidence_ledger_sha256=''", "evidence_qc_report='{}'"])
             values = [candidate[f"{name}_score"] for name in dimensions] + [candidate[f"{name}_description"] for name in dimensions]
             values.extend([candidate["other_issues"], candidate["evidence_ledger"], candidate["requirement_coverage"], record_id])
             before = {
@@ -3378,6 +3397,112 @@ class ConsoleData:
             attempts = 3
         return origin, attempts
 
+    def _solo2_client(self) -> Solo2Client:
+        origin, _attempts = self._solo2_settings()
+        return Solo2Client(self.project_root / ".local-auth" / "solo2.cookies", origin=origin)
+
+    def solo2_repairs(self) -> dict[str, object]:
+        """Synchronize and return SOLO2 records currently waiting for repair."""
+        client = self._solo2_client()
+        first = client.list_submissions(stage="PENDING_FIX", page=1, page_size=100)
+        items = list(first.get("items") or [])
+        meta = first.get("meta") or {}
+        total_pages = max(1, int(meta.get("total_pages") or 1))
+        if total_pages > 100:
+            raise ValueError("SOLO2 待返修分页数量超过安全上限，请缩小平台筛选范围")
+        for page in range(2, total_pages + 1):
+            items.extend(client.list_submissions(stage="PENDING_FIX", page=page, page_size=100).get("items") or [])
+        timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        with closing(self.connect_rw()) as connection:
+            local_rows = connection.execute("SELECT record_id,session_id,turn_id FROM records").fetchall()
+            local_by_identity = {(str(row["session_id"]), str(row["turn_id"])): str(row["record_id"]) for row in local_rows}
+            # Read the previous cache before replacing it.  A cached item that
+            # disappeared from PENDING_FIX has been resolved (or otherwise left
+            # that queue) on SOLO2 and must not remain visible locally.
+            previous = connection.execute(
+                "SELECT remote_id,local_record_id FROM solo2_repairs WHERE status='PENDING_FIX'"
+            ).fetchall()
+            remote_ids = {int(item.get("id")) for item in items if item.get("id") is not None}
+            stale = [row for row in previous if int(row["remote_id"]) not in remote_ids]
+            for item in items:
+                remote_id = int(item.get("id"))
+                local_id = local_by_identity.get((str(item.get("session_id") or ""), str(item.get("turn_id") or "")), "")
+                detail = json.dumps(item, ensure_ascii=False)
+                connection.execute(
+                    "INSERT INTO solo2_repairs(remote_id,local_record_id,status,qc_summary,detail_json,schema_fingerprint,synced_at,updated_at) "
+                    "VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(remote_id) DO UPDATE SET local_record_id=excluded.local_record_id,status=excluded.status,"
+                    "qc_summary=excluded.qc_summary,detail_json=excluded.detail_json,synced_at=excluded.synced_at,updated_at=excluded.updated_at",
+                    (remote_id, local_id, str(item.get("status") or "PENDING_FIX"), str(item.get("qc_summary") or ""), detail, "", timestamp, timestamp),
+                )
+                if local_id:
+                    connection.execute(
+                        "UPDATE solo2_submissions SET status='remote_pending_fix',remote_status='PENDING_FIX',last_error=?,updated_at=? WHERE record_id=? AND status='succeeded'",
+                        (str(item.get("qc_summary") or "平台待返修"), timestamp, local_id),
+                    )
+            # Do not use ``NOT IN (NULL)`` for an empty response: in SQLite it
+            # matches nothing, leaving every old repair row behind.  Explicitly
+            # delete all cached PENDING_FIX rows when SOLO2 reports none.
+            if remote_ids:
+                marks = ",".join("?" for _ in remote_ids)
+                connection.execute(
+                    f"DELETE FROM solo2_repairs WHERE status='PENDING_FIX' AND remote_id NOT IN ({marks})",
+                    sorted(remote_ids),
+                )
+            else:
+                connection.execute("DELETE FROM solo2_repairs WHERE status='PENDING_FIX'")
+            # A resolved repair should no longer block a previously successful
+            # local submission.  SOLO2's queue endpoint is authoritative for
+            # the PENDING_FIX state; clear the local marker for linked records.
+            for row in stale:
+                local_id = str(row["local_record_id"] or "")
+                if local_id:
+                    connection.execute(
+                        "UPDATE solo2_submissions SET status='succeeded',remote_status='RESOLVED',last_error='',updated_at=? "
+                        "WHERE record_id=? AND status='remote_pending_fix'",
+                        (timestamp, local_id),
+                    )
+            connection.commit()
+            rows = connection.execute("SELECT * FROM solo2_repairs WHERE status='PENDING_FIX' ORDER BY updated_at DESC,remote_id DESC").fetchall()
+        return {"ok": True, "items": [dict(row) for row in rows], "meta": {"total": len(rows), "remote_total": int(meta.get("total") or len(items))}}
+
+    def solo2_repair_detail(self, remote_id: int) -> dict[str, object]:
+        client = self._solo2_client()
+        detail = client.submission_detail(remote_id)
+        versions = client.submission_versions(remote_id)
+        schema = client.form_schema()
+        timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        with closing(self.connect_rw()) as connection:
+            local = connection.execute("SELECT record_id FROM records WHERE session_id=? AND turn_id=? LIMIT 1", (str(detail.get("session_id") or ""), str(detail.get("turn_id") or ""))).fetchone()
+            local_id = str(local[0]) if local else ""
+            connection.execute(
+                "INSERT INTO solo2_repairs(remote_id,local_record_id,status,qc_summary,detail_json,versions_json,schema_fingerprint,synced_at,updated_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(remote_id) DO UPDATE SET local_record_id=excluded.local_record_id,status=excluded.status,qc_summary=excluded.qc_summary,detail_json=excluded.detail_json,versions_json=excluded.versions_json,schema_fingerprint=excluded.schema_fingerprint,synced_at=excluded.synced_at,updated_at=excluded.updated_at",
+                (remote_id, local_id, str(detail.get("status") or ""), str(detail.get("qc_summary") or ""), json.dumps(detail, ensure_ascii=False), json.dumps(versions, ensure_ascii=False), str(schema.get("fingerprint") or ""), timestamp, timestamp),
+            )
+            connection.commit()
+        return {"ok": True, "detail": detail, "versions": versions, "schema": schema, "local_record_id": local_id}
+
+    def solo2_repair_submit(self, remote_id: int, body: dict[str, object]) -> dict[str, object]:
+        data = body.get("data")
+        fingerprint = str(body.get("schema_fingerprint") or "").strip()
+        comment = str(body.get("comment") or "").strip()
+        if not isinstance(data, dict) or not data:
+            raise ValueError("返修数据不能为空")
+        if not fingerprint:
+            raise ValueError("缺少平台表单版本标识")
+        client = self._solo2_client()
+        result = client.update_submission(remote_id, data, fingerprint, comment)
+        timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
+        with closing(self.connect_rw()) as connection:
+            row = connection.execute("SELECT local_record_id FROM solo2_repairs WHERE remote_id=?", (remote_id,)).fetchone()
+            local_id = str(row[0]) if row else ""
+            connection.execute("UPDATE solo2_repairs SET status='QC_RUNNING',draft_json=?,last_error='',updated_at=?,submitted_at=? WHERE remote_id=?", (json.dumps(data, ensure_ascii=False), timestamp, timestamp, remote_id))
+            if local_id:
+                connection.execute("UPDATE solo2_submissions SET status='remote_pending_fix',remote_status='QC_RUNNING',last_error='',updated_at=? WHERE record_id=?", (timestamp, local_id))
+            connection.execute("INSERT INTO solo2_repair_events(remote_id,local_record_id,action,note,details,created_at) VALUES(?,?,?,?,?,?)", (remote_id, local_id, "repair_submitted", comment, json.dumps(result, ensure_ascii=False), timestamp))
+            connection.commit()
+        return {"ok": True, "remote_id": remote_id, "result": result}
+
     def solo2_login(self, username: object, password: object) -> dict[str, object]:
         if not isinstance(username, str) or not isinstance(password, str):
             raise ValueError("请输入 SOLO2 账号和密码")
@@ -3584,9 +3709,21 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 batch = parse_qs(parsed.query).get("batch", [None])[0]
                 self.send_json(self.data.solo2_status(batch))
                 return
+            if parsed.path == "/api/solo2/repairs":
+                self.send_json(self.data.solo2_repairs())
+                return
+            match = re.fullmatch(r"/api/solo2/repairs/(\d+)", parsed.path)
+            if match:
+                self.send_json(self.data.solo2_repair_detail(int(match.group(1))))
+                return
             if parsed.path == "/api/reviews":
-                batch = parse_qs(parsed.query).get("batch", [None])[0]
-                self.send_json(self.data.delivery_reviews(batch))
+                query = parse_qs(parsed.query)
+                batch = query.get("batch", [None])[0]
+                self.send_json(self.data.delivery_reviews(
+                    batch, view=query.get("view", ["batch"])[0],
+                    status=query.get("status", ["all"])[0], search=query.get("search", [""])[0],
+                    page=int(query.get("page", ["1"])[0]), page_size=int(query.get("page_size", ["20"])[0]),
+                ))
                 return
             if parsed.path == "/api/reviews/history":
                 self.send_json(approved_history(self.data.database))
@@ -3716,6 +3853,8 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 result = self.data.export(body.get("batch"), body.get("numbers"))
             elif self.path == "/api/solo2/login":
                 result = self.data.solo2_login(body.get("username"), body.get("password"))
+            elif re.fullmatch(r"/api/solo2/repairs/\d+", self.path):
+                result = self.data.solo2_repair_submit(int(self.path.rsplit("/", 1)[-1]), body)
             elif self.path == "/api/actions/solo2-submit":
                 result = self.data.solo2_submit(
                     body.get("batch"), body.get("numbers"), body.get("record_ids")
@@ -3724,10 +3863,6 @@ class ConsoleHandler(BaseHTTPRequestHandler):
                 result = self.data.approve_delivery_review(body)
             elif self.path == "/api/reviews/reject":
                 result = self.data.reject_delivery_review(body)
-            elif self.path == "/api/reviews/codex":
-                result = self.data.create_codex_delivery_review(body)
-            elif self.path == "/api/reviews/regenerate":
-                result = self.data.regenerate_codex_delivery(body)
             elif self.path == "/api/reviews/history/import":
                 result = import_history(
                     self.data.database,

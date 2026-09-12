@@ -35,6 +35,7 @@ from tools.batch_pipeline import connect  # noqa: E402
 from tools.authoring_policy import backend_only_requirement  # noqa: E402
 from tools.news_topics import DEFAULT_FEEDS, configured_feeds, ingest, ingest_report  # noqa: E402
 from tools.orchestrator import clear_question_leases  # noqa: E402
+from tools.run_supervisor import write_supervisor_state  # noqa: E402
 from tools.scheduler_state import SchedulerStore  # noqa: E402
 from tools.text_encoding import read_portable_text  # noqa: E402
 
@@ -135,7 +136,8 @@ def recover_interrupted_runs(database: Path) -> int:
     """Stop orphaned workers and make their questions eligible for a clean retry."""
     with closing(connect(database.resolve())) as connection:
         rows = connection.execute(
-            "SELECT r.id,r.question_id,r.container_id FROM runs r WHERE r.status='running'"
+            "SELECT r.id,r.question_id,r.container_id,r.trajectory_root "
+            "FROM runs r WHERE r.status='running'"
         ).fetchall()
         for row in rows:
             container = str(row["container_id"] or "").strip()
@@ -146,6 +148,20 @@ def recover_interrupted_runs(database: Path) -> int:
                         stderr=subprocess.DEVNULL, timeout=20, check=False,
                     )
                 except (OSError, subprocess.TimeoutExpired):
+                    pass
+            trajectory_root = str(row["trajectory_root"] or "").strip()
+            if trajectory_root:
+                try:
+                    # Docker runs store supervisor.json beside the Claude
+                    # config; local runs store it in that config directory.
+                    state_root = Path(trajectory_root)
+                    state_root = state_root.parent if state_root.name == "claude" else state_root
+                    write_supervisor_state(
+                        state_root, state="interrupted",
+                        container_id=container,
+                        error="调度器重启或立即停止，任务已回收到待运行队列",
+                    )
+                except OSError:
                     pass
             connection.execute(
                 "UPDATE runs SET status='interrupted',finished_at=?,error_message=?,heartbeat_at=? WHERE id=?",
@@ -1012,7 +1028,7 @@ def main() -> int:
     parser.add_argument("--loop", action="store_true")
     parser.add_argument("--poll-seconds", type=int, default=60)
     parser.add_argument("--failure-threshold", type=int, default=3)
-    parser.add_argument("--min-free-gb", type=float, default=15.0)
+    parser.add_argument("--min-free-gb", type=float, default=5.0)
     parser.add_argument("--log-retention-days", type=int, default=30)
     parser.add_argument("--max-log-gb", type=float, default=2.0)
     args = parser.parse_args()

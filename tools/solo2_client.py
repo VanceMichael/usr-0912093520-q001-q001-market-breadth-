@@ -12,7 +12,7 @@ from http.cookiejar import MozillaCookieJar
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import HTTPCookieProcessor, Request, build_opener
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from tools.delivery_records import EXPORT_HEADERS, EXPORT_KEYS, SCORE_KEYS
 
@@ -253,6 +253,35 @@ class Solo2Client:
         value = self._request("GET", "/submissions/form-schema")
         if not isinstance(value, dict):
             raise Solo2Error("平台返回的表单配置无效")
+        return value
+
+    def list_submissions(self, **params: object) -> dict:
+        """List submissions using SOLO2's paginated query API."""
+        query = "&".join(
+            f"{key}={quote(str(value))}"
+            for key, value in params.items() if value not in (None, "")
+        )
+        value = self._request("GET", "/submissions" + (f"?{query}" if query else ""))
+        if not isinstance(value, dict) or not isinstance(value.get("items"), list):
+            raise Solo2Error("平台返回的提交列表格式无效")
+        return value
+
+    def submission_detail(self, submission_id: int | str) -> dict:
+        value = self._request("GET", f"/submissions/{int(submission_id)}")
+        if not isinstance(value, dict):
+            raise Solo2Error("平台返回的提交详情格式无效")
+        return value
+
+    def submission_versions(self, submission_id: int | str) -> object:
+        return self._request("GET", f"/submissions/{int(submission_id)}/versions")
+
+    def update_submission(self, submission_id: int | str, data: dict, schema_fingerprint: str, comment: str = "") -> dict:
+        value = self._request(
+            "PUT", f"/submissions/{int(submission_id)}",
+            payload={"data": data, "schema_fingerprint": schema_fingerprint, "comment": comment},
+        )
+        if not isinstance(value, dict):
+            raise Solo2Error("平台返回的返修结果格式无效")
         return value
 
     def upload(self, path: Path) -> dict:

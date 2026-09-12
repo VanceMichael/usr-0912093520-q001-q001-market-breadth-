@@ -31,6 +31,7 @@ from tools.batch_pipeline import SNAPSHOT_RE, connect, prompt_hash, question_row
 from tools.capacity import adaptive_model_limit, detect_capacity
 from tools.text_encoding import read_portable_text
 from tools.trajectory_gate import TrajectoryGateError, validate_effective_trajectory
+from tools.run_supervisor import RunMetadataError, register_run_metadata, write_supervisor_state
 from tools.solo2_service import submit_records
 
 
@@ -292,6 +293,8 @@ def classify_failure(status: str, error: str, diagnostics: str = "") -> FailureC
         return FailureClassification("model_timeout", True)
     if "effective trajectory gate rejected run" in error:
         return FailureClassification("trajectory_gate", True)
+    if "blocked_metadata" in error or "完成元数据" in error or "SessionID" in error:
+        return FailureClassification("blocked_metadata", False)
     if PERMANENT_AUTH_RE.search(without_catalog_warning):
         return FailureClassification("permanent_auth", False)
     if MODEL_CONFIG_RE.search(without_catalog_warning):
@@ -348,12 +351,27 @@ def monitor_worker(
     start_timeout: int,
     stalled_timeout: int,
     initial_activity: tuple[int, int, int],
+    run_directory: Path | None = None,
 ) -> tuple[int, str, str]:
     """Supervise one Docker worker without depending on terminal screen state."""
     started = time.monotonic()
     last_activity_at = started
     last_activity = initial_activity
     activity_seen = False
+    def publish(state: str, error: str = "") -> None:
+        if run_directory is None:
+            return
+        try:
+            write_supervisor_state(
+                run_directory, state=state, container_id=container_name,
+                activity=last_activity, error=error,
+            )
+        except OSError:
+            # The database heartbeat remains authoritative if the optional
+            # diagnostic file cannot be written.
+            pass
+
+    publish("running")
     while True:
         try:
             code = process.wait(timeout=max(1, heartbeat_seconds))
@@ -366,19 +384,24 @@ def monitor_worker(
             last_activity = signature
             last_activity_at = current
         update_run_heartbeat(db, question_id, run_id)
+        publish("running")
         if code is not None:
+            publish("exited" if code else "idle")
             return int(code), "", ""
         if current - started >= timeout:
             stop_worker_container(container_name)
             process.wait(timeout=30)
+            publish("timeout", f"worker exceeded hard timeout of {timeout}s")
             return -9, "timeout", f"worker exceeded hard timeout of {timeout}s"
         if not activity_seen and current - started >= start_timeout:
             stop_worker_container(container_name)
             process.wait(timeout=30)
+            publish("timeout", f"worker produced no output within {start_timeout}s")
             return -9, "timeout", f"worker produced no output within {start_timeout}s"
         if activity_seen and current - last_activity_at >= stalled_timeout:
             stop_worker_container(container_name)
             process.wait(timeout=30)
+            publish("stalled", f"worker output stalled for {stalled_timeout}s")
             return -9, "timeout", f"worker output stalled for {stalled_timeout}s"
 
 
@@ -511,7 +534,7 @@ def run_one(
             code, status, error = monitor_worker(
                 process, db, int(row["id"]), run_id, container_name,
                 log_path, trajectory_root, timeout, heartbeat_seconds,
-                start_timeout, stalled_timeout, initial_activity,
+                start_timeout, stalled_timeout, initial_activity, attempt_root,
             )
         if not status:
             result_state, stream_diagnostics = stream_result_details(log_path)
@@ -536,13 +559,33 @@ def run_one(
                     code, status = 1, "failed"
                     error = f"effective trajectory gate rejected run: {exc}"
                 else:
-                    status, error = "succeeded", ""
-                    with closing(connect(db)) as connection:
-                        connection.execute(
-                            "UPDATE runs SET session_id=? WHERE batch_run_id=? AND question_id=?",
-                            (evidence.session_id, run_id, row["id"]),
+                    try:
+                        evidence_path = getattr(evidence, "path", None)
+                        register_run_metadata(
+                            db, int(row["id"]), run_id, trajectory_root,
+                            session_file=evidence_path if isinstance(evidence_path, Path) else evidence_path,
+                            expected_session_id=str(evidence.session_id or ""),
                         )
-                        connection.commit()
+                    except (OSError, RunMetadataError) as exc:
+                        code, status = 1, "failed"
+                        error = f"blocked_metadata: {exc}"
+                        try:
+                            write_supervisor_state(
+                                attempt_root, state="blocked_metadata",
+                                container_id=container_name, error=error,
+                            )
+                        except OSError:
+                            pass
+                    else:
+                        status, error = "succeeded", ""
+                        try:
+                            write_supervisor_state(
+                                attempt_root, state="completed",
+                                container_id=container_name,
+                                activity=activity_signature(log_path, trajectory_root),
+                            )
+                        except OSError:
+                            pass
     except subprocess.TimeoutExpired:
         code, status, error = -9, "timeout", "worker did not stop after container termination"
     except OSError as exc:
@@ -556,6 +599,11 @@ def run_one(
         else classify_failure(status, error, locals().get("stream_diagnostics", ""))
     )
     with closing(connect(db)) as connection:
+        question_status = (
+            "completed" if status == "succeeded"
+            else "blocked" if classification.kind == "blocked_metadata"
+            else "approved"
+        )
         connection.execute(
             "UPDATE runs SET status=?,finished_at=?,exit_code=?,error_message=?,heartbeat_at=?,"
             "failure_kind=?,retryable=? "
@@ -567,7 +615,7 @@ def run_one(
         )
         connection.execute(
             "UPDATE questions SET status=?,updated_at=? WHERE id=? AND maintenance_mode=0",
-            ("completed" if status == "succeeded" else "approved", finished, row["id"]),
+            (question_status, finished, row["id"]),
         )
         connection.commit()
     return task_id, code, f"{status} in {time.monotonic()-started:.1f}s ({log_path})"
@@ -697,6 +745,9 @@ def run_with_retries(
                 record_retry_delay(db, question_id, delay)
                 time.sleep(delay)
         else:
+            if classification.kind == "blocked_metadata":
+                block_question(db, question_id)
+                return task_id, 1, f"blocked_metadata: {last_message}"
             model_attempts = max(model_attempts + 1, failed_attempts(db, question_id))
             if circuit_breaker is not None:
                 circuit_breaker.record_recovery()
@@ -865,7 +916,9 @@ def solo2_pending_available(db: Path, max_attempts: int) -> bool:
             "WHERE r.delivery_qc_passed=1 AND r.delivery_qc_note='质检通过' "
             "AND r.evidence_gate_passed=1 AND r.history_gate_passed=1 "
             "AND r.human_qc_approved=1 "
+            "AND r.review_method='human' "
             "AND COALESCE(s.status,'') NOT IN ('succeeded','auth_blocked','schema_blocked') "
+            "AND COALESCE(s.status,'')!='remote_pending_fix' "
             "AND (COALESCE(s.status,'')!='submitting' OR "
             "julianday(COALESCE(s.lease_expires_at,''))<julianday('now')) "
             "AND COALESCE(s.attempt_count,0)<? "

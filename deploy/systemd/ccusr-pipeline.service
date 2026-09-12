@@ -12,7 +12,7 @@ WorkingDirectory=/home/ubuntu/UserSatisfactionRating-codex
 Environment=HOME=/home/ubuntu
 Environment=PATH=/home/ubuntu/.local/bin:/home/ubuntu/.npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/usr/bin/python3 /home/ubuntu/UserSatisfactionRating-codex/tools/pipeline_daemon.py --loop --concurrency 2 --worker-image ccusr-claude-worker:local --worker-timeout 3600 --agent-timeout 3600 --poll-seconds 60 --failure-threshold 3 --min-free-gb 15 --log-retention-days 30 --max-log-gb 2
+ExecStart=/usr/bin/python3 /home/ubuntu/UserSatisfactionRating-codex/tools/pipeline_daemon.py --loop --concurrency 2 --worker-image ccusr-claude-worker:local --worker-timeout 3600 --agent-timeout 3600 --poll-seconds 60 --failure-threshold 3 --min-free-gb 5 --log-retention-days 30 --max-log-gb 2
 Restart=on-failure
 RestartSec=30
 TimeoutStopSec=45

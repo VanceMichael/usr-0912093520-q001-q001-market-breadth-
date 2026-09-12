@@ -15,7 +15,7 @@
     <string>--agent-timeout</string><string>3600</string>
     <string>--poll-seconds</string><string>60</string>
     <string>--failure-threshold</string><string>3</string>
-    <string>--min-free-gb</string><string>15</string>
+    <string>--min-free-gb</string><string>5</string>
     <string>--log-retention-days</string><string>30</string>
     <string>--max-log-gb</string><string>2</string>
   </array>

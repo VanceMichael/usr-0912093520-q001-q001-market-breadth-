@@ -28,6 +28,12 @@ const state = {
   schedulerFollowOutput: true,
   solo2: null,
   reviews: null,
+  reviewView: "batch_pending",
+  reviewStatus: "all",
+  reviewSearch: "",
+  reviewPage: 1,
+  repairs: null,
+  repairDetail: null,
 };
 let drawerCloseTimer = null;
 let authorJobsTimer = null;
@@ -236,10 +242,11 @@ function reviewDeliveryState(record) {
     retry_wait: ["提交失败，可重试", "amber", "平台或网络暂时未完成接收"],
     auth_blocked: ["登录失效，可重试", "amber", "请在导出中心重新登录"],
     schema_blocked: ["平台字段阻断", "red", "请检查平台字段后重试"],
+    remote_pending_fix: ["SOLO2 待返修", "amber", "平台已打回，请在 SOLO2 返修中心处理"],
   };
   if (states[record.solo2_status]) return states[record.solo2_status];
   if (record.human_qc_approved) return ["可提交", "green", "最终复核已通过，可以提交这条记录"];
-  if (record.ready_for_review) return ["待最终复核", "amber", "请选择人工确认或 Codex 严格复核"];
+  if (record.ready_for_review) return ["待最终复核", "amber", "请人工逐项确认五维描述和证据"];
   return ["前置门禁阻断", "red", "请先补齐交付质检、事实证据和历史去重结果"];
 }
 
@@ -261,6 +268,9 @@ function renderReviews() {
   const list = $("#review-list");
   if (!state.reviews.records.length) {
     list.innerHTML = `<div class="empty-state"><strong>当前批次没有交付记录</strong><span>完成模型跑题和交付生产后会出现在这里。</span></div>`;
+    $("#review-page-label").textContent = `共 ${state.reviews.meta?.total || 0} 条`;
+    $("#review-prev").disabled = true;
+    $("#review-next").disabled = true;
     return;
   }
   list.innerHTML = state.reviews.records.map((record) => {
@@ -273,7 +283,6 @@ function renderReviews() {
       [
         record.human_qc_approved || historicallyDelivered,
         historicallyDelivered ? "历史 SOLO2 交付" :
-          record.review_method === "codex" ? "Codex 复核" :
           record.review_method === "human" ? "人工确认" : "最终复核",
       ],
     ];
@@ -290,38 +299,67 @@ function renderReviews() {
       </section>`;
     }).join("");
     const history = record.history_matches.length ? `<div class="history-warning"><strong>发现历史相似描述</strong>${record.history_matches.slice(0, 5).map((item) => `<p>${escapeHtml(item.record_id)} · ${escapeHtml(item.dimension)} · 相似度 ${Math.round(item.similarity * 100)}%</p>`).join("")}</div>` : "";
-    const codex = record.codex_review ? `<div class="codex-review-report ${escapeHtml(record.codex_review.status)} ${escapeHtml(record.codex_review.decision)}"><div><strong>Codex 自动逐维复核${record.codex_review.decision === "approved" ? " · 已通过" : record.codex_review.decision === "rejected" ? " · 未通过" : ""}</strong><span>${escapeHtml(formatDate(record.codex_review.updated_at))}</span></div><pre>${escapeHtml(record.codex_review.report || (record.codex_review.status === "started" ? "正在读取全部复核资料…" : "暂无报告"))}</pre></div>` : "";
-    const regenerationLabels = {
-      started: "正在根据已有证据生成新交付产物",
-      quality_checking: "新交付产物已生成，正在执行交付质检",
-      completed: "新交付产物和交付质检均已完成",
-      failed: "重新生成或交付质检失败",
-    };
-    const regeneration = record.delivery_regeneration ? `<div class="codex-review-report ${escapeHtml(record.delivery_regeneration.status)}"><div><strong>${escapeHtml(regenerationLabels[record.delivery_regeneration.status] || "交付产物重新生成")}</strong><span>${escapeHtml(formatDate(record.delivery_regeneration.updated_at))}</span></div>${record.delivery_regeneration.report ? `<pre>${escapeHtml(record.delivery_regeneration.report)}</pre>` : ""}</div>` : "";
-    const regenerationRunning = ["started", "quality_checking"].includes(record.delivery_regeneration?.status);
-    const codexReviewRunning = record.codex_review?.status === "started";
+    let qcChanges = "";
+    try {
+      const changes = JSON.parse(record.delivery_qc_changes || "[]");
+      if (Array.isArray(changes) && changes.length) qcChanges = `<details class="qc-changes"><summary>自动质检修改记录（${changes.length}）</summary><pre>${escapeHtml(JSON.stringify(changes, null, 2))}</pre></details>`;
+    } catch {}
+    const solo2Eligible = Boolean(record.can_solo2_submit || (
+      record.delivery_qc_passed && record.delivery_qc_note === "质检通过" &&
+      record.evidence_gate_passed && record.history_gate_passed &&
+      !record.history_matches.length && record.human_qc_approved &&
+      record.review_method === "human" &&
+      !["succeeded", "submitting", "remote_pending_fix"].includes(record.solo2_status)
+    ));
+    const solo2Preparable = record.ready_for_review &&
+      !["succeeded", "submitting", "remote_pending_fix"].includes(record.solo2_status);
     const submitLabel = record.solo2_status === "succeeded" ? "已提交此条" :
       record.solo2_status === "submitting" ? "正在提交" :
       record.solo2_status ? "重试提交此条" : "提交此条到 SOLO2";
-    return `<article class="review-record" data-review-record="${escapeHtml(record.record_id)}">
+    return `<article class="review-record" data-review-record="${escapeHtml(record.record_id)}" data-solo2-preparable="${solo2Preparable ? "1" : "0"}">
       <header class="review-record-head"><div><span>${escapeHtml(record.batch_name)} · 第 ${record.question_no} 题 · 第 ${record.turn_no} 轮</span><h3>${escapeHtml(record.title)}</h3><p>${escapeHtml(record.record_id)}</p></div><div class="gate-strip">${gateStatus.map(([passed, label]) => `<span class="tag ${passed ? "green" : "amber"}">${escapeHtml(label)}${passed ? "通过" : "待处理"}</span>`).join("")}</div></header>
       <details class="review-prompt"><summary>查看原始要求和需求覆盖</summary><p>${escapeHtml(record.user_prompt)}</p><ul>${coverage}</ul></details>
-      ${history}${dimensions}${regeneration}${codex}
+      ${history}${dimensions}${qcChanges}
       <div class="review-delivery-state"><div><span>单条交付状态${record.solo2_attempt_count ? ` · 已尝试 ${record.solo2_attempt_count} 次` : ""}</span><strong>${escapeHtml(deliveryDetail)}</strong>${record.solo2_last_error ? `<small>${escapeHtml(record.solo2_last_error)}</small>` : ""}</div><span class="tag ${escapeHtml(deliveryTone)}">${escapeHtml(deliveryLabel)}</span></div>
-      <footer class="review-actions"><textarea data-review-note rows="2" maxlength="500" placeholder="退回时填写具体问题；人工通过时可填写补充说明"></textarea><div><button class="button secondary" type="button" data-review-action="regenerate" ${["submitting", "succeeded"].includes(record.solo2_status) || record.human_qc_approved || regenerationRunning || codexReviewRunning ? "disabled" : ""}><i data-lucide="refresh-cw"></i>${regenerationRunning ? "正在重新生成" : "根据已有证据重新生成"}</button><button class="button secondary" type="button" data-review-action="codex" ${record.ready_for_review && !record.human_qc_approved && !codexReviewRunning && !regenerationRunning ? "" : "disabled"}><i data-lucide="scan-search"></i>${codexReviewRunning ? "Codex 复核中" : "Codex 代替人工复核"}</button><button class="button secondary" type="button" data-review-action="reject" ${["submitting", "succeeded"].includes(record.solo2_status) || regenerationRunning ? "disabled" : ""}><i data-lucide="undo-2"></i>退回重写</button><button class="button primary" type="button" data-review-action="approve" ${record.ready_for_review && !record.human_qc_approved && !regenerationRunning ? "" : "disabled"}><i data-lucide="badge-check"></i>${record.human_qc_approved ? (record.review_method === "codex" ? "已由 Codex 通过" : "已人工确认") : "人工确认五维并通过"}</button><button class="button delivery-submit" type="button" data-review-action="solo2" ${record.can_solo2_submit && !regenerationRunning ? "" : "disabled"}><i data-lucide="send"></i>${escapeHtml(submitLabel)}</button></div></footer>
+      <footer class="review-actions"><textarea data-review-note rows="2" maxlength="500" placeholder="退回时填写具体问题；人工通过时可填写补充说明"></textarea><div><button class="button secondary" type="button" data-review-action="reject" ${["submitting", "succeeded"].includes(record.solo2_status) ? "disabled" : ""}><i data-lucide="undo-2"></i>标记复核不通过</button><button class="button primary" type="button" data-review-action="approve" ${record.ready_for_review && !record.human_qc_approved ? "" : "disabled"}><i data-lucide="badge-check"></i>${record.human_qc_approved ? "已人工确认" : "人工确认五维并通过"}</button><button class="button secondary" type="button" data-review-action="approve-all" ${record.ready_for_review && !record.human_qc_approved ? "" : "disabled"} title="通过前置门禁后，一键写入五个维度的人工确认"><i data-lucide="list-checks"></i>一键确认五维通过</button><button class="button delivery-submit" type="button" data-review-action="solo2" ${solo2Eligible ? "" : "disabled"} title="${solo2Eligible ? "提交此条到 SOLO2" : solo2Preparable ? "勾选五个维度后可直接提交，系统会先保存人工确认" : "前置门禁未通过，暂不可提交"}"><i data-lucide="send"></i>${escapeHtml(submitLabel)}</button></div></footer>
     </article>`;
   }).join("");
+  $("#review-page-label").textContent = `第 ${state.reviews.meta?.page || 1} / ${state.reviews.meta?.total_pages || 1} 页（共 ${state.reviews.meta?.total || 0} 条）`;
+  $("#review-prev").disabled = (state.reviews.meta?.page || 1) <= 1;
+  $("#review-next").disabled = (state.reviews.meta?.page || 1) >= (state.reviews.meta?.total_pages || 1);
   refreshIcons();
 }
 
 async function loadReviews({ quiet = false } = {}) {
   try {
-    const query = state.batch ? `?batch=${encodeURIComponent(state.batch)}` : "";
+    const params = new URLSearchParams({view: state.reviewView, status: state.reviewStatus, search: state.reviewSearch, page: String(state.reviewPage), page_size: "20"});
+    if (state.batch && state.reviewView !== "all_pending") params.set("batch", state.batch);
+    const query = `?${params}`;
     state.reviews = await api(`/api/reviews${query}`);
     renderReviews();
   } catch (error) {
     if (!quiet) toast(error.message, true);
   }
+}
+
+async function loadRepairs({quiet = false} = {}) {
+  try { state.repairs = await api("/api/solo2/repairs"); renderRepairs(); }
+  catch (error) { if (!quiet) toast(error.message, true); }
+}
+
+function renderRepairs() {
+  const items = state.repairs?.items || [];
+  $("#repair-summary").innerHTML = `<span class="summary-chip warning">待返修<strong>${items.length}</strong></span><span class="summary-chip">需人工处理<strong>${items.filter(x => !x.local_record_id).length}</strong></span>`;
+  $("#repair-list").innerHTML = items.length ? items.map(item => `<button class="repair-item ${state.repairDetail?.detail?.id === item.remote_id ? "active" : ""}" data-repair-id="${item.remote_id}"><strong>#${item.remote_id} · ${escapeHtml(item.status)}</strong><span>${escapeHtml(item.qc_summary || "平台未提供摘要")}</span><small>${escapeHtml(item.local_record_id || "未匹配本地记录")}</small></button>`).join("") : `<div class="empty-state"><strong>没有待返修数据</strong><span>点击同步重新读取 SOLO2。</span></div>`;
+  if (!state.repairDetail) return;
+  const d = state.repairDetail.detail || {};
+  const schema = state.repairDetail.schema || {};
+  const locked = new Set(d.locked_fields || []);
+  const values = {...d};
+  const fields = (schema.fields || []).filter(f => f.is_enabled !== false && f.field_type !== "attachment");
+  const checks = Array.isArray(d.qc_checks) ? d.qc_checks.map(x => `<li><span class="tag ${x.passed ? "green" : "amber"}">${escapeHtml(x.check_name || x.check_key || "质检")}</span>${escapeHtml(x.summary || "")}</li>`).join("") : "";
+  const versions = Array.isArray(state.repairDetail.versions) ? `<details class="repair-versions"><summary>历史版本（${state.repairDetail.versions.length}）</summary><pre>${escapeHtml(JSON.stringify(state.repairDetail.versions, null, 2))}</pre></details>` : "";
+  $("#repair-detail").innerHTML = `<div class="repair-detail-head"><h3>#${d.id} · ${escapeHtml(d.status_label || d.status || "待返修")}</h3><p>${escapeHtml(d.qc_summary || "")}</p><span>本地记录：${escapeHtml(state.repairDetail.local_record_id || "未匹配")}</span></div>${checks ? `<ul class="repair-checks">${checks}</ul>` : ""}${versions}<div class="repair-form">${fields.map(f => { const key=f.field_key; const value=values[key] ?? ""; const disabled=locked.has(key); return `<label><span>${escapeHtml(f.label || key)}${disabled ? "（锁定）" : ""}</span><textarea data-repair-field="${escapeHtml(key)}" ${disabled ? "disabled" : ""}>${escapeHtml(value)}</textarea></label>`; }).join("")}<label><span>返修说明</span><textarea id="repair-comment" placeholder="请说明本次修改内容和依据"></textarea></label><button class="button primary" id="repair-submit" type="button">提交返修并重新质检</button></div>`;
 }
 
 function renderView() {
@@ -331,7 +369,8 @@ function renderView() {
   const vpsView = state.view === "vps";
   const schedulerView = state.view === "scheduler";
   const reviewView = state.view === "reviews";
-  const nonProductionView = exportsView || settingsView || authorView || vpsView || schedulerView || reviewView;
+  const repairView = state.view === "repairs";
+  const nonProductionView = exportsView || settingsView || authorView || vpsView || schedulerView || reviewView || repairView;
   $(".batch-toolbar").hidden = settingsView || authorView || vpsView || schedulerView;
   $(".pipeline-band").hidden = nonProductionView;
   $(".list-controls").hidden = nonProductionView;
@@ -342,12 +381,14 @@ function renderView() {
   $("#vps-view").hidden = !vpsView;
   $("#scheduler-view").hidden = !schedulerView;
   $("#review-view").hidden = !reviewView;
+  $("#repair-view").hidden = !repairView;
   $("#pipeline-jobs-panel").hidden = nonProductionView;
   const titles = {
     author: ["生成题目", "填写批次信息和关键词，生成可复制的标准出题命令。"],
     production: ["生产批次", "从题目质检到 Excel 交付，状态直接来自本地生产库。"],
     records: ["交付记录", "查看已经生成评分记录的题目及交付质检状态。"],
-    reviews: ["交付复核", "人工确认或 Codex 严格逐维复核通过后，开放最终交付。"],
+    reviews: ["交付复核", "人工逐维确认通过后，开放最终交付。"],
+    repairs: ["SOLO2 返修", "同步平台待返修数据，逐条修改并重新进入平台质检。"],
     exports: ["导出中心", "集中查看当前批次的工作簿和原始 JSONL 轨迹。"],
     settings: ["运行配置", "修改下一次 Claude Code 启动使用的中转地址、模型和提交人。"],
     vps: ["VPS 管理", "统一查看远程 VPS 节点状态、批次进度和交付物。"],
@@ -358,6 +399,7 @@ function renderView() {
   $$(".nav-item").forEach((button) => button.classList.toggle("active", button.dataset.view === state.view));
   if (exportsView) { renderFiles(); loadSolo2(); }
   else if (reviewView) { renderReviews(); loadReviews({ quiet: true }); }
+  else if (repairView) { renderRepairs(); loadRepairs({ quiet: true }); }
   else if (settingsView) renderSettings();
   else if (vpsView) renderVps();
   else if (schedulerView) renderScheduler();
@@ -556,7 +598,11 @@ function renderSchedulerLive() {
     state.schedulerRunCursor = 0;
     state.schedulerRunSource = "";
   }
-  $("#scheduler-live-runs").innerHTML = runs.length ? runs.map((run) => `<button class="scheduler-live-run ${Number(run.id) === Number(state.selectedSchedulerRun) ? "active" : ""}" type="button" data-live-run="${run.id}"><strong>${escapeHtml(run.task_id)}</strong><span>${escapeHtml(run.languages || "未知技术栈")} · ${escapeHtml(run.difficulty || "未标难度")}</span><em>运行中 · ${escapeHtml(formatDate(run.activity_at))}</em></button>`).join("") : `<div class="empty-state compact-empty"><strong>当前没有运行中的题目</strong></div>`;
+  $("#scheduler-live-runs").innerHTML = runs.length ? runs.map((run) => {
+    const supervisor = run.supervisor_state ? `监管：${run.supervisor_state}` : "监管：暂无状态";
+    const detail = run.supervisor_error ? ` · ${run.supervisor_error}` : "";
+    return `<button class="scheduler-live-run ${Number(run.id) === Number(state.selectedSchedulerRun) ? "active" : ""}" type="button" data-live-run="${run.id}"><strong>${escapeHtml(run.task_id)}</strong><span>${escapeHtml(run.languages || "未知技术栈")} · ${escapeHtml(run.difficulty || "未标难度")}</span><em>运行中 · ${escapeHtml(formatDate(run.activity_at))} · ${escapeHtml(supervisor)}${escapeHtml(detail)}</em></button>`;
+  }).join("") : `<div class="empty-state compact-empty"><strong>当前没有运行中的题目</strong></div>`;
   const current = runs.find((run) => Number(run.id) === Number(state.selectedSchedulerRun));
   $("#scheduler-live-status").textContent = current ? `${current.task_id} · ${formatBytes(current.output_bytes || 0)}` : "等待运行任务";
   $("#scheduler-live-follow").classList.toggle("active", state.schedulerFollowOutput);
@@ -1424,12 +1470,14 @@ function closeDrawer() {
 $("#refresh-button").addEventListener("click", () => {
   if (state.view === "scheduler") return loadSchedulers();
   if (state.view === "reviews") return loadReviews();
+  if (state.view === "repairs") return loadRepairs();
   return loadDashboard();
 });
 $("#batch-select").addEventListener("change", async (event) => {
   state.stage = null;
   await loadDashboard(event.target.value);
   if (state.view === "reviews") loadReviews();
+  if (state.view === "repairs") loadRepairs();
 });
 $("#search-input").addEventListener("input", (event) => { state.search = event.target.value; renderRows(); });
 $("#select-all").addEventListener("change", (event) => {
@@ -1557,6 +1605,15 @@ $(".nav-list").addEventListener("click", (event) => {
   renderView();
 });
 $("#review-refresh").addEventListener("click", () => loadReviews());
+$("#review-filter-apply").addEventListener("click", () => {
+  state.reviewView = $("#review-view-mode").value;
+  state.reviewStatus = $("#review-status-filter").value;
+  state.reviewSearch = $("#review-search-input").value.trim();
+  state.reviewPage = 1;
+  loadReviews();
+});
+$("#review-prev").addEventListener("click", () => { if (state.reviewPage > 1) { state.reviewPage -= 1; loadReviews(); } });
+$("#review-next").addEventListener("click", () => { if (state.reviews && state.reviewPage < (state.reviews.meta?.total_pages || 1)) { state.reviewPage += 1; loadReviews(); } });
 $("#review-history-sync").addEventListener("click", async () => {
   const button = $("#review-history-sync");
   const original = button.innerHTML;
@@ -1574,6 +1631,63 @@ $("#review-history-sync").addEventListener("click", async () => {
     refreshIcons();
   }
 });
+$("#repair-refresh").addEventListener("click", () => loadRepairs());
+$("#repair-list").addEventListener("click", async (event) => {
+  const button = event.target.closest("[data-repair-id]");
+  if (!button) return;
+  try { state.repairDetail = await api(`/api/solo2/repairs/${button.dataset.repairId}`); renderRepairs(); }
+  catch (error) { toast(error.message, true); }
+});
+$("#repair-detail").addEventListener("click", async (event) => {
+  if (!event.target.closest("#repair-submit") || !state.repairDetail) return;
+  const data = {};
+  $$("[data-repair-field]").forEach((field) => { data[field.dataset.repairField] = field.value; });
+  const button = event.target.closest("#repair-submit");
+  button.disabled = true;
+  try {
+    await api(`/api/solo2/repairs/${state.repairDetail.detail.id}`, {method: "POST", body: JSON.stringify({data, schema_fingerprint: state.repairDetail.schema.fingerprint, comment: $("#repair-comment").value.trim()})});
+    toast("返修已提交，平台正在重新质检");
+    state.repairDetail = null;
+    await loadRepairs();
+  } catch (error) { toast(error.message, true); button.disabled = false; }
+});
+function markReviewCardApproved(card, recordId, reviewer) {
+  const record = state.reviews?.records?.find((item) => item.record_id === recordId);
+  if (record) {
+    record.human_qc_approved = true;
+    record.review_method = "human";
+    record.human_qc_reviewer = reviewer;
+    record.can_solo2_submit = true;
+  }
+  card.querySelectorAll("[data-review-confirm]").forEach((input) => {
+    input.checked = true;
+    input.disabled = true;
+  });
+  card.querySelectorAll('[data-review-action="approve"], [data-review-action="approve-all"]').forEach((button) => {
+    button.disabled = true;
+  });
+  const submit = card.querySelector('[data-review-action="solo2"]');
+  if (submit) {
+    submit.disabled = false;
+    submit.title = "提交此条到 SOLO2";
+  }
+}
+$("#review-list").addEventListener("change", (event) => {
+  const input = event.target.closest("[data-review-confirm]");
+  if (!input) return;
+  const card = input.closest("[data-review-record]");
+  if (!card || card.dataset.solo2Preparable !== "1") return;
+  const allConfirmed = reviewDimensions.every(([key]) => (
+    card.querySelector(`[data-review-confirm="${key}"]`)?.checked === true
+  ));
+  const submit = card.querySelector('[data-review-action="solo2"]');
+  if (submit && !card.querySelector('[data-review-action="approve"]')?.disabled) {
+    submit.disabled = !allConfirmed;
+    submit.title = allConfirmed
+      ? "五个维度已勾选，提交时会先保存人工确认"
+      : "请先逐项勾选五个维度，再提交到 SOLO2";
+  }
+});
 $("#review-list").addEventListener("click", async (event) => {
   const button = event.target.closest("[data-review-action]");
   if (!button) return;
@@ -1586,45 +1700,7 @@ $("#review-list").addEventListener("click", async (event) => {
   button.disabled = true;
   button.textContent = "处理中…";
   try {
-    if (action === "regenerate") {
-      openModal(
-        "根据已有证据重新生成交付",
-        "不会重新运行 Claude，也不会修改题目代码或原始轨迹。Codex 将单独读取已有要求、证据账本、需求覆盖和复核历史，重新生成五维内容，完成后自动进入单题交付质检。",
-        "开始重新生成",
-        async () => {
-          closeModal();
-          try {
-            await api("/api/reviews/regenerate", {
-              method: "POST", body: JSON.stringify({ record_id: recordId }),
-            });
-            toast("新的交付产物生成已启动");
-            await loadReviews({ quiet: true });
-          } catch (error) {
-            toast(error.message, true);
-          }
-        },
-      );
-      return;
-    } else if (action === "codex") {
-      openModal(
-        "由 Codex 代替人工复核",
-        "Codex 将读取这条记录的原始要求、五维描述、证据账本、需求覆盖和历史相似结果。五项全部通过后会直接开放 Excel 与 SOLO2 交付；任一项无法确认则继续阻断。",
-        "开始严格复核",
-        async () => {
-          closeModal();
-          try {
-            await api("/api/reviews/codex", {
-              method: "POST", body: JSON.stringify({ record_id: recordId }),
-            });
-            toast("Codex 自动逐维复核已启动");
-            await loadReviews({ quiet: true });
-          } catch (error) {
-            toast(error.message, true);
-          }
-        },
-      );
-      return;
-    } else if (action === "solo2") {
+    if (action === "solo2") {
       openModal(
         "确认提交这一条记录",
         `${recordId} 的字段和原始轨迹将提交到 SOLO2。提交成功后不能完整重置对应题目。`,
@@ -1632,9 +1708,27 @@ $("#review-list").addEventListener("click", async (event) => {
         async () => {
           closeModal();
           try {
+            const record = state.reviews?.records?.find((item) => item.record_id === recordId);
+            const confirmations = Object.fromEntries(reviewDimensions.map(([key]) => [
+              key, Boolean(card.querySelector(`[data-review-confirm="${key}"]`)?.checked),
+            ]));
+            if (!record?.can_solo2_submit) {
+              if (!record?.ready_for_review || Object.values(confirmations).some((value) => !value)) {
+                throw new Error("请先通过前置门禁并逐项勾选五个维度");
+              }
+              await api("/api/reviews/approve", {
+                method: "POST",
+                body: JSON.stringify({
+                  record_id: recordId,
+                  reviewer,
+                  note,
+                  confirmations,
+                }),
+              });
+            }
             await api("/api/actions/solo2-submit", {
               method: "POST",
-              body: JSON.stringify({ batch: state.batch, record_ids: [recordId] }),
+              body: JSON.stringify({ batch: record?.batch_name || state.batch, record_ids: [recordId] }),
             });
             toast("这一条记录已提交到 SOLO2");
             await loadDashboard(state.batch);
@@ -1658,7 +1752,15 @@ $("#review-list").addEventListener("click", async (event) => {
       await api("/api/reviews/approve", {
         method: "POST", body: JSON.stringify({ record_id: recordId, reviewer, note, confirmations }),
       });
+      markReviewCardApproved(card, recordId, reviewer);
       toast("五个维度已由人工确认");
+    } else if (action === "approve-all") {
+      const confirmations = Object.fromEntries(reviewDimensions.map(([key]) => [key, true]));
+      await api("/api/reviews/approve", {
+        method: "POST", body: JSON.stringify({ record_id: recordId, reviewer, note, confirmations }),
+      });
+      markReviewCardApproved(card, recordId, reviewer);
+      toast("五个维度已一键确认通过");
     }
     await loadDashboard(state.batch);
     await loadReviews({ quiet: true });

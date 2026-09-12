@@ -64,7 +64,8 @@ def _records(
     clauses = [
         "r.delivery_qc_passed=1", "r.delivery_qc_note='质检通过'",
         "r.evidence_gate_passed=1", "r.history_gate_passed=1",
-        "r.human_qc_approved=1", "r.review_method IN ('human','codex')",
+        "r.human_qc_approved=1", "r.review_method='human'",
+        "COALESCE(s.status,'')!='remote_pending_fix'",
     ]
     parameters: list[object] = []
     if batch:

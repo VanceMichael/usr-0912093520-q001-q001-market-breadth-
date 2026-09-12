@@ -24,7 +24,13 @@ from tools.delivery_records import (  # noqa: E402
     load_records,
     validate_records,
 )
-from tools.delivery_quality import history_matches, verify_evidence_sources  # noqa: E402
+from tools.delivery_quality import (  # noqa: E402
+    build_evidence_qc_receipt,
+    evidence_ledger_sha256,
+    find_authoritative_trajectory,
+    history_matches,
+    verify_evidence_sources,
+)
 
 
 FIXABLE_FIELDS = (
@@ -640,6 +646,8 @@ def apply_fixes(
             "evidence_checked_at=''",
             "history_gate_passed=0",
             "history_checked_at=''",
+            "evidence_ledger_sha256=''",
+            "evidence_qc_report='{}'",
             "human_qc_approved=0",
             "human_qc_reviewer=''",
             "human_qc_approved_at=''",
@@ -689,12 +697,43 @@ def finalize(
     if not report["passed"]:
         return 0, report
     timestamp = now()
+    # Bind the successful QC result to the exact evidence ledger and the
+    # authoritative JSONL bytes used by this record.  Any later edit changes
+    # the ledger hash and therefore invalidates the receipt.
+    receipts: list[tuple[str, str, str]] = []
+    for record in records:
+        source = connection.execute(
+            "SELECT x.trajectory_root FROM runs x "
+            "JOIN questions q ON q.id=x.question_id "
+            "WHERE q.question_no=? AND q.batch_id=(SELECT id FROM batches WHERE name=?) "
+            "AND x.status='succeeded' AND x.session_id=? "
+            "ORDER BY x.launched_at DESC,x.id DESC LIMIT 1",
+            (int(record["question_no"]), batch, str(record["session_id"])),
+        ).fetchone()
+        if source is None or not str(source["trajectory_root"] or "").strip():
+            raise ValueError(f"{record['record_id']}: 找不到已登记的权威轨迹目录，不能生成质检回执")
+        try:
+            trajectory = find_authoritative_trajectory(
+                Path(str(source["trajectory_root"])), str(record["trajectory_file"])
+            )
+            receipt = build_evidence_qc_receipt(record, trajectory)
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"{record['record_id']}: 无法生成证据质检回执：{exc}") from exc
+        receipts.append((
+            str(record["record_id"]),
+            evidence_ledger_sha256(record.get("evidence_ledger")),
+            json.dumps(receipt, ensure_ascii=False, separators=(",", ":")),
+        ))
     question_marks = ", ".join("?" for _ in records)
     connection.execute(
         f"UPDATE records SET delivery_qc_passed=1, delivery_qc_note='质检通过', "
         f"delivery_qc_checked_at=?,evidence_gate_passed=1,evidence_checked_at=?,"
         f"history_gate_passed=1,history_checked_at=? WHERE record_id IN ({question_marks})",
         [timestamp, timestamp, timestamp, *(record["record_id"] for record in records)],
+    )
+    connection.executemany(
+        "UPDATE records SET evidence_ledger_sha256=?,evidence_qc_report=? WHERE record_id=?",
+        [(ledger_hash, receipt, record_id) for record_id, ledger_hash, receipt in receipts],
     )
     connection.commit()
     return len(records), report

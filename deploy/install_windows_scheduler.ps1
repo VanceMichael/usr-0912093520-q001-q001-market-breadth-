@@ -25,7 +25,7 @@ $Trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
 
 $Definitions = @(
     @{ Name = "CCUSR Console"; Arguments = "`"$ProjectRoot\webapp\server.py`" --host 127.0.0.1 --port 4173 --db `"$ProjectRoot\production.sqlite3`" --no-open" },
-    @{ Name = "CCUSR Scheduler"; Arguments = "`"$ProjectRoot\tools\pipeline_daemon.py`" --loop --concurrency 2 --codex-concurrency 1 --worker-image ccusr-claude-worker:local --worker-timeout 3600 --agent-timeout 3600 --poll-seconds 60 --failure-threshold 3 --min-free-gb 15 --log-retention-days 30 --max-log-gb 2" }
+    @{ Name = "CCUSR Scheduler"; Arguments = "`"$ProjectRoot\tools\pipeline_daemon.py`" --loop --concurrency 2 --codex-concurrency 1 --worker-image ccusr-claude-worker:local --worker-timeout 3600 --agent-timeout 3600 --poll-seconds 60 --failure-threshold 3 --min-free-gb 5 --log-retention-days 30 --max-log-gb 2" }
 )
 
 foreach ($Definition in $Definitions) {

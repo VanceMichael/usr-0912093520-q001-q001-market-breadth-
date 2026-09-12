@@ -455,6 +455,34 @@ th:nth-child(6) { width: 12%; }
 .summary-chip.warning { color: var(--amber); border-color: #ead19b; background: var(--amber-soft); }
 .summary-chip.warning strong { color: var(--amber); }
 .review-list { display: grid; gap: 14px; }
+.review-filters { display: flex; align-items: end; gap: 10px; flex-wrap: wrap; margin: 14px 0; }
+.review-filters label { display: grid; gap: 4px; color: var(--muted); font-size: 10px; font-weight: 700; }
+.review-filters select, .review-filters input { height: 36px; min-width: 150px; padding: 0 9px; border: 1px solid var(--line); border-radius: 5px; background: #fff; color: var(--ink); }
+.review-filters .review-search { flex: 1; min-width: 220px; }
+.review-filters .review-search input { width: 100%; }
+.review-pagination { display: flex; justify-content: center; align-items: center; gap: 14px; margin: 18px 0; color: var(--muted); font-size: 11px; }
+.qc-changes { margin: 12px 18px 0; padding: 10px; border: 1px solid #cbd8ea; border-radius: 5px; background: #f5f8fc; font-size: 11px; }
+.qc-changes pre { max-height: 180px; overflow: auto; margin: 8px 0 0; white-space: pre-wrap; font: 10px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.repair-view { margin-top: 18px; }
+.repair-layout { display: grid; grid-template-columns: minmax(270px, .8fr) minmax(0, 2fr); gap: 14px; }
+.repair-list, .repair-detail { border: 1px solid var(--line); border-radius: 7px; background: #fff; overflow: hidden; }
+.repair-list { display: grid; align-content: start; max-height: 760px; overflow-y: auto; }
+.repair-item { display: grid; gap: 5px; padding: 13px; border: 0; border-bottom: 1px solid var(--line); background: #fff; color: var(--ink); text-align: left; cursor: pointer; }
+.repair-item:hover, .repair-item.active { background: #fff8ed; }
+.repair-item span, .repair-item small { color: var(--muted); font-size: 10px; line-height: 1.45; }
+.repair-detail { padding: 18px; }
+.repair-detail-head { padding-bottom: 13px; border-bottom: 1px solid var(--line); }
+.repair-detail-head h3 { margin: 0 0 7px; font-size: 16px; }
+.repair-detail-head p, .repair-detail-head span { display: block; margin: 4px 0 0; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.repair-checks { display: grid; gap: 6px; margin: 13px 0 0; padding: 0; list-style: none; }
+.repair-checks li { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 11px; }
+.repair-versions { margin-top: 13px; padding: 9px; background: #f7f6f8; border-radius: 5px; font-size: 11px; }
+.repair-versions pre { max-height: 180px; overflow: auto; margin: 8px 0 0; white-space: pre-wrap; font: 10px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.repair-form { display: grid; gap: 10px; margin-top: 14px; }
+.repair-form label { display: grid; gap: 5px; }
+.repair-form label span { color: var(--muted); font-size: 10px; font-weight: 700; }
+.repair-form textarea { min-height: 52px; padding: 8px; border: 1px solid var(--line); border-radius: 5px; resize: vertical; font: 12px/1.5 inherit; }
+.repair-form textarea:disabled { background: #f2f1f4; color: var(--muted); }
 .review-record { border: 1px solid var(--line); border-radius: 7px; background: #fff; box-shadow: 0 4px 16px rgba(37, 31, 33, .04); overflow: hidden; }
 .review-record-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding: 17px 18px; border-bottom: 1px solid var(--line); background: #faf9fa; }
 .review-record-head span, .review-record-head p { color: var(--muted); font-size: 10px; }
@@ -594,6 +622,7 @@ th:nth-child(6) { width: 12%; }
   .detail-grid { grid-template-columns: 1fr; }
   .score-grid { grid-template-columns: repeat(5, minmax(48px, 1fr)); overflow-x: auto; }
   .review-heading, .review-record-head, .review-dimension-head, .review-delivery-state { align-items: stretch; flex-direction: column; }
+  .repair-layout { grid-template-columns: 1fr; }
   .review-heading-actions { align-items: stretch; }
   .review-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .gate-strip { justify-content: flex-start; }

@@ -33,6 +33,7 @@ from tools.batch_pipeline import SNAPSHOT_RE, connect, prompt_hash, question_row
 from tools.runtime_environment import docker_info, repair_docker_engine  # noqa: E402
 from tools.text_encoding import read_portable_text  # noqa: E402
 from tools.trajectory_gate import TrajectoryGateError, validate_effective_trajectory  # noqa: E402
+from tools.run_supervisor import RunMetadataError, register_run_metadata, write_supervisor_state  # noqa: E402
 
 
 class PipelineInterrupted(RuntimeError):
@@ -434,7 +435,10 @@ class Pipeline:
         assert self.pipeline_root is not None
         question_id = int(row["id"])
         folder = Path(row["folder_path"]).resolve(strict=True)
-        trajectory_root = self.pipeline_root / "claude-home"
+        # Keep Claude state and the primary JSONL isolated per question.  A
+        # shared config directory lets concurrent sessions contaminate each
+        # other's session lookup and makes evidence attribution ambiguous.
+        trajectory_root = self.pipeline_root / "claude-home" / str(row["task_id"])
         trajectory_root.mkdir(parents=True, exist_ok=True)
         batch_run_id = self.pipeline_root.name
         launch_time = timestamp()
@@ -455,6 +459,13 @@ class Pipeline:
             heartbeat_at=launch_time, activity_at=launch_time,
             health_status="starting", health_detail="正在启动本地 Claude CLI" if model_mode == "local" else "正在启动 Claude 容器",
         )
+        try:
+            write_supervisor_state(
+                trajectory_root, state="starting", attempt=1,
+                container_id=(f"ccusr-{self.job_id}-{row['question_no']}" if model_mode == "docker" else ""),
+            )
+        except OSError:
+            pass
         if model_mode == "local":
             return self.run_local_model(row, command, trajectory_root, launch_time, config)
         docker = shutil.which("docker") or "docker"
@@ -499,6 +510,14 @@ class Pipeline:
                     question_id, heartbeat_at=timestamp(), activity_at=activity_at,
                     health_status=health_status, health_detail=health_detail,
                 )
+                try:
+                    write_supervisor_state(
+                        trajectory_root,
+                        state=health_status,
+                        container_id=container_name,
+                    )
+                except OSError:
+                    pass
                 if health_status == "stalled":
                     stalled = True
                     stalled_detail = health_detail
@@ -520,6 +539,12 @@ class Pipeline:
                     activity_at=now, health_status="healthy",
                     health_detail="Claude 容器运行正常，刚刚产生新输出",
                 )
+                try:
+                    write_supervisor_state(
+                        trajectory_root, state="running", container_id=container_name,
+                    )
+                except OSError:
+                    pass
                 self.log(f"[{row['task_id']}] {line}")
         returncode = process.wait(timeout=86400)
         finished = timestamp()
@@ -534,6 +559,10 @@ class Pipeline:
                 health_detail=error if stalled else f"Claude 容器已异常退出，退出码 {returncode}",
                 finished_at=finished,
             )
+            try:
+                write_supervisor_state(trajectory_root, state="failed", error=error)
+            except OSError:
+                pass
             raise RuntimeError(f"{row['task_id']} 模型运行失败：{error}")
         try:
             evidence = validate_effective_trajectory(
@@ -549,6 +578,28 @@ class Pipeline:
                 question_id, status="failed", error=error, heartbeat_at=finished,
                 health_status="failed", health_detail=error, finished_at=finished,
             )
+            try:
+                write_supervisor_state(trajectory_root, state="blocked_trajectory", error=error)
+            except OSError:
+                pass
+            raise RuntimeError(f"{row['task_id']} {error}") from exc
+        try:
+            register_run_metadata(
+                self.database, question_id, batch_run_id, trajectory_root,
+                session_file=evidence.path,
+                expected_session_id=evidence.session_id,
+            )
+        except (OSError, RunMetadataError) as exc:
+            error = f"blocked_metadata: {exc}"
+            self.finish_model_run(question_id, batch_run_id, "failed", 1, error, finished)
+            self.item(
+                question_id, status="failed", error=error, heartbeat_at=finished,
+                health_status="blocked", health_detail=error, finished_at=finished,
+            )
+            try:
+                write_supervisor_state(trajectory_root, state="blocked_metadata", error=error)
+            except OSError:
+                pass
             raise RuntimeError(f"{row['task_id']} {error}") from exc
         self.finish_model_run(
             question_id, batch_run_id, "succeeded", 0, "", finished,
@@ -564,6 +615,10 @@ class Pipeline:
             activity_at=finished, health_status="completed",
             health_detail="Claude 容器已正常完成", finished_at=finished,
         )
+        try:
+            write_supervisor_state(trajectory_root, state="completed")
+        except OSError:
+            pass
 
     def run_local_model(
         self, row: sqlite3.Row, command: str, trajectory_root: Path,
@@ -599,6 +654,10 @@ class Pipeline:
                 activity_at=now, health_status="healthy",
                 health_detail="本地 Claude CLI 运行正常，刚刚产生新输出",
             )
+            try:
+                write_supervisor_state(trajectory_root, state="running")
+            except OSError:
+                pass
             self.log(f"[{row['task_id']}] {line}")
         returncode = process.wait(timeout=86400)
         finished = timestamp()
@@ -608,6 +667,10 @@ class Pipeline:
                 question_id, self.pipeline_root.name, "failed", returncode, error, finished,
             )
             self.item(question_id, status="failed", error=error, finished_at=finished, health_status="failed", health_detail=error)
+            try:
+                write_supervisor_state(trajectory_root, state="failed", error=error)
+            except OSError:
+                pass
             raise RuntimeError(f"{row['task_id']} 模型运行失败：{error}")
         try:
             evidence = validate_effective_trajectory(
@@ -625,6 +688,25 @@ class Pipeline:
                 question_id, status="failed", error=error, finished_at=finished,
                 health_status="failed", health_detail=error,
             )
+            try:
+                write_supervisor_state(trajectory_root, state="blocked_trajectory", error=error)
+            except OSError:
+                pass
+            raise RuntimeError(f"{row['task_id']} {error}") from exc
+        try:
+            register_run_metadata(
+                self.database, question_id, self.pipeline_root.name, trajectory_root,
+                session_file=evidence.path,
+                expected_session_id=evidence.session_id,
+            )
+        except (OSError, RunMetadataError) as exc:
+            error = f"blocked_metadata: {exc}"
+            self.finish_model_run(question_id, self.pipeline_root.name, "failed", 1, error, finished)
+            self.item(question_id, status="failed", error=error, finished_at=finished, health_status="blocked", health_detail=error)
+            try:
+                write_supervisor_state(trajectory_root, state="blocked_metadata", error=error)
+            except OSError:
+                pass
             raise RuntimeError(f"{row['task_id']} {error}") from exc
         self.finish_model_run(
             question_id, self.pipeline_root.name, "succeeded", 0, "", finished,
@@ -636,6 +718,10 @@ class Pipeline:
             f"代码变化 {evidence.changed_files} 个文件）"
         )
         self.item(question_id, status="model_completed", heartbeat_at=finished, activity_at=finished, health_status="completed", health_detail="本地 Claude CLI 已正常完成", finished_at=finished)
+        try:
+            write_supervisor_state(trajectory_root, state="completed")
+        except OSError:
+            pass
 
     def finish_model_run(
         self,
@@ -808,7 +894,7 @@ class Pipeline:
 
     def qc_export_stage(self) -> None:
         assert self.trajectory_search_root is not None
-        self.log("阶段 4/4：Codex CLI 执行交付质检，完成后进入人工或 Codex 逐维复核")
+        self.log("阶段 4/4：Codex CLI 执行交付质检，完成后进入人工逐维复核")
         with closing(self.db()) as connection:
             question_ids = [
                 int(row["question_id"]) for row in connection.execute(
@@ -841,7 +927,7 @@ class Pipeline:
             "并拒绝评价者自述、评分质检、模型表现、生成过程、固定标签、套话开头和机械重复句式。"
             "无法从证据恢复的字段必须保持未通过，不得猜测或修改目标模型产物。"
             f"validate_records.py 必须显式使用 --select {selection}。"
-            "质检通过后停止，记录必须先由人工或 Codex 严格逐维复核，不得直接导出 Excel 或提交 SOLO2。"
+                "质检通过后停止，记录必须先由人工逐维复核，不得直接导出 Excel 或提交 SOLO2。"
         )
         if self.codex(prompt) != 0:
             for question_id in question_ids:
@@ -869,7 +955,7 @@ class Pipeline:
         finished = timestamp()
         for question_id in question_ids:
             self.item(question_id, status="awaiting_review", finished_at=finished)
-        self.log(f"交付质检通过 {passed_records}/{total_records} 条，等待人工或 Codex 逐维复核")
+        self.log(f"交付质检通过 {passed_records}/{total_records} 条，等待人工逐维复核")
 
     @staticmethod
     def question_qc_passed(row: sqlite3.Row) -> bool:
@@ -1060,7 +1146,7 @@ class Pipeline:
             progress[int(row["id"])]["delivery_passed"] for row in rows
         )
         if retry_of_job_id is not None and delivery_complete:
-            self.log("阶段 4/4：交付质检已有有效通过记录，等待人工或 Codex 逐维复核")
+            self.log("阶段 4/4：交付质检已有有效通过记录，等待人工逐维复核")
             finished = timestamp()
             for row in rows:
                 self.item(int(row["id"]), status="awaiting_review", error="", finished_at=finished)

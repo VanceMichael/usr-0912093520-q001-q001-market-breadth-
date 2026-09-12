@@ -19,6 +19,7 @@
         <button class="nav-item active" data-view="production"><i data-lucide="list-checks"></i><span>生产批次</span></button>
         <button class="nav-item" data-view="records"><i data-lucide="database"></i><span>交付记录</span></button>
         <button class="nav-item" data-view="reviews"><i data-lucide="scan-eye"></i><span>交付复核</span></button>
+        <button class="nav-item" data-view="repairs"><i data-lucide="wrench"></i><span>SOLO2 返修</span></button>
         <button class="nav-item" data-view="exports"><i data-lucide="file-spreadsheet"></i><span>导出中心</span></button>
         <button class="nav-item" data-view="scheduler"><i data-lucide="activity"></i><span>调度器</span></button>
         <button class="nav-item" data-view="vps"><i data-lucide="server"></i><span>VPS 管理</span></button>
@@ -175,8 +176,16 @@
             <button class="icon-button" type="button" id="review-refresh" title="刷新复核队列" aria-label="刷新复核队列"><i data-lucide="refresh-cw"></i></button>
           </div>
         </div>
+        <div class="review-filters"><label><span>展示范围</span><select id="review-view-mode"><option value="batch_pending">当前批次未交付</option><option value="batch">当前批次全部</option><option value="all_pending">所有批次未交付</option></select></label><label><span>状态</span><select id="review-status-filter"><option value="all">全部</option><option value="ready">待人工确认</option><option value="blocked">门禁阻断</option><option value="approved">人工已确认</option><option value="submitted">已提交</option></select></label><label class="review-search"><span>搜索</span><input id="review-search-input" type="search" placeholder="记录编号、批次、题目"></label><button class="button secondary" type="button" id="review-filter-apply">应用筛选</button></div>
         <div class="review-summary" id="review-summary"></div>
         <div class="review-list" id="review-list"><div class="empty-state"><strong>正在读取待复核记录</strong></div></div>
+        <div class="review-pagination"><button class="button secondary" id="review-prev" type="button">上一页</button><span id="review-page-label"></span><button class="button secondary" id="review-next" type="button">下一页</button></div>
+      </section>
+
+      <section class="repair-view" id="repair-view" hidden>
+        <div class="section-heading"><div><h2>SOLO2 返修中心</h2><p>同步平台“待返修”数据，逐条查看打回原因、历史版本和需修改字段。</p></div><button class="button secondary" id="repair-refresh" type="button"><i data-lucide="refresh-cw"></i>同步待返修</button></div>
+        <div class="review-summary" id="repair-summary"></div>
+        <div class="repair-layout"><div class="repair-list" id="repair-list"><div class="empty-state"><strong>正在读取 SOLO2 待返修数据</strong></div></div><div class="repair-detail" id="repair-detail"><div class="empty-state"><strong>选择一条待返修数据</strong></div></div></div>
       </section>
 
       <section class="vps-view" id="vps-view" hidden>
@@ -344,6 +353,6 @@
 
   <div class="toast-region" id="toast-region" aria-live="polite"></div>
   <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=20260913-2"></script>
 </body>
 </html>

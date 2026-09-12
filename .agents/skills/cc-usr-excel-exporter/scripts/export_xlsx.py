@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import sqlite3
@@ -30,6 +31,7 @@ from tools.delivery_records import (  # noqa: E402
     load_records as load_database_records,
     validate_records,
 )
+from tools.delivery_quality import evidence_ledger_sha256, trajectory_sha256  # noqa: E402
 
 
 NS_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
@@ -330,6 +332,27 @@ def main() -> int:
                 / f"CC_Codex 用户满意度标注（{args.batch}-{question_label(numbers)}）.xlsx"
             )
         sources = trajectory_sources(roots_by_question, records)
+        source_by_question = {question_no: path for question_no, path in sources}
+        for record in records:
+            ledger_hash = str(record.get("evidence_ledger_sha256") or "").strip()
+            if ledger_hash and ledger_hash != evidence_ledger_sha256(record.get("evidence_ledger")):
+                raise ValueError(f"evidence ledger hash is stale for {record['record_id']}")
+            # With the registered roots, also verify that the JSONL copied to
+            # the package is byte-for-byte the one checked by delivery QC.
+            # An explicit --claude-root remains an operator migration escape
+            # hatch for legacy exports and therefore skips only this byte check.
+            if args.claude_root is None:
+                try:
+                    receipt = json.loads(str(record.get("evidence_qc_report") or ""))
+                except (TypeError, ValueError):
+                    receipt = None
+                source = source_by_question.get(int(record["question_no"]))
+                if not isinstance(receipt, dict) or receipt.get("version") != 2:
+                    raise ValueError(f"evidence QC receipt is missing for {record['record_id']}")
+                if receipt.get("evidence_ledger_sha256") != ledger_hash:
+                    raise ValueError(f"evidence QC receipt ledger hash mismatch for {record['record_id']}")
+                if source is None or receipt.get("trajectory_sha256") != trajectory_sha256(source):
+                    raise ValueError(f"authoritative trajectory changed after QC for {record['record_id']}")
         export(template, output, records)
         trajectories = copy_trajectories(sources, args.batch, batch_directory)
     except (OSError, ValueError, sqlite3.Error) as exc:

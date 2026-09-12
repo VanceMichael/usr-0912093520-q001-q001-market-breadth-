@@ -37,11 +37,18 @@ def _record_context(connection, record_id: str):
     ).fetchone()
 
 
-def review_queue(database: Path, batch: str | None = None) -> dict:
+def review_queue(
+    database: Path, batch: str | None = None, *, view: str = "batch",
+    status: str = "all", search: str = "", page: int = 1, page_size: int = 20,
+) -> dict:
+    if view not in {"batch", "batch_pending", "all_pending"}:
+        raise ValueError("复核视图无效")
+    page = max(1, min(int(page), 10000))
+    page_size = max(1, min(int(page_size), 100))
     with closing(connect(database)) as connection:
         parameters: list[object] = []
         where = ""
-        if batch:
+        if batch and view != "all_pending":
             where = "WHERE b.name=?"
             parameters.append(batch)
         rows = connection.execute(
@@ -63,22 +70,6 @@ def review_queue(database: Path, batch: str | None = None) -> dict:
             (str(row["record_id"]), str(row["dimension"])): dict(row)
             for row in reviews
         }
-        codex_events = {}
-        for event in connection.execute(
-            "SELECT record_id,action,details,created_at FROM record_review_events "
-            "WHERE action IN ('codex_review_started','codex_review_completed','codex_review_failed') "
-            "ORDER BY id DESC"
-        ).fetchall():
-            codex_events.setdefault(str(event["record_id"]), dict(event))
-        regeneration_events = {}
-        for event in connection.execute(
-            "SELECT record_id,action,details,created_at FROM record_review_events "
-            "WHERE action IN ("
-            "'delivery_regeneration_started','delivery_regeneration_completed',"
-            "'delivery_regeneration_qc_completed','delivery_regeneration_failed') "
-            "ORDER BY id DESC"
-        ).fetchall():
-            regeneration_events.setdefault(str(event["record_id"]), dict(event))
         items: list[dict] = []
         for row in rows:
             record = as_record(row)
@@ -90,44 +81,8 @@ def review_queue(database: Path, batch: str | None = None) -> dict:
                 dimension: reviewed.get((record["record_id"], dimension))
                 for dimension in DIMENSIONS
             }
-            codex_event = codex_events.get(record["record_id"])
-            if codex_event:
-                details = json.loads(str(codex_event.get("details") or "{}"))
-                record["codex_review"] = {
-                    "status": str(codex_event["action"]).removeprefix("codex_review_"),
-                    "report": str(details.get("report") or ""),
-                    "decision": str(details.get("decision") or ""),
-                    "dimensions": details.get("dimensions") or {},
-                    "updated_at": str(codex_event["created_at"]),
-                }
-            else:
-                record["codex_review"] = None
-            regeneration_event = regeneration_events.get(record["record_id"])
-            if regeneration_event:
-                try:
-                    regeneration_details = json.loads(
-                        str(regeneration_event.get("details") or "{}")
-                    )
-                except json.JSONDecodeError:
-                    regeneration_details = {}
-                regeneration_action = str(regeneration_event["action"])
-                regeneration_status = {
-                    "delivery_regeneration_started": "started",
-                    "delivery_regeneration_completed": "quality_checking",
-                    "delivery_regeneration_qc_completed": "completed",
-                    "delivery_regeneration_failed": "failed",
-                }[regeneration_action]
-                record["delivery_regeneration"] = {
-                    "status": regeneration_status,
-                    "report": str(
-                        regeneration_details.get("error")
-                        or regeneration_details.get("message")
-                        or ""
-                    ),
-                    "updated_at": str(regeneration_event["created_at"]),
-                }
-            else:
-                record["delivery_regeneration"] = None
+            record["codex_review"] = None
+            record["delivery_regeneration"] = None
             record["history_matches"] = history_matches(
                 connection, record, exclude_record_id=record["record_id"]
             )
@@ -149,27 +104,48 @@ def review_queue(database: Path, batch: str | None = None) -> dict:
                 and record["history_gate_passed"]
                 and not record["history_matches"]
                 and record["human_qc_approved"]
-                and record.get("review_method") in {"human", "codex"}
-                and record["solo2_status"] not in {"succeeded", "submitting"}
+                and record.get("review_method") == "human"
+                and record["solo2_status"] not in {"succeeded", "submitting", "remote_pending_fix"}
             )
             items.append(record)
+        if view in {"batch_pending", "all_pending"}:
+            items = [item for item in items if item["solo2_status"] != "succeeded"]
+        if status and status != "all":
+            status_map = {
+                "ready": lambda item: item["ready_for_review"] and not item["human_qc_approved"],
+                "approved": lambda item: item["human_qc_approved"],
+                "blocked": lambda item: not item["ready_for_review"] and not item["human_qc_approved"],
+                "submitted": lambda item: item["solo2_status"] == "succeeded",
+            }
+            predicate = status_map.get(status)
+            if predicate is None:
+                raise ValueError("复核状态筛选无效")
+            items = [item for item in items if predicate(item)]
+        needle = search.strip().lower()
+        if needle:
+            items = [item for item in items if needle in " ".join(
+                str(item.get(key) or "") for key in ("record_id", "batch_name", "task_id", "title", "user_prompt")
+            ).lower()]
+        items.sort(key=lambda item: (item["human_qc_approved"], item["batch_name"], item["question_no"], item["turn_no"]))
+        total = len(items)
+        start = (page - 1) * page_size
+        page_items = items[start:start + page_size]
     return {
         "reviewers": list(REVIEWERS),
-        "records": items,
+        "records": page_items,
+        "meta": {"page": page, "page_size": page_size, "total": total, "total_pages": (total + page_size - 1) // page_size},
+        "view": view,
+        "status": status or "all",
+        "search": search,
         "summary": {
-            "total": len(items),
+            "total": total,
             "waiting": sum(
-                not item["human_qc_approved"] and item["solo2_status"] != "succeeded"
-                for item in items
+                not item["human_qc_approved"] and item["solo2_status"] != "succeeded" for item in (items)
             ),
             "approved": sum(item["human_qc_approved"] for item in items),
             "delivered": sum(item["solo2_status"] == "succeeded" for item in items),
             "human_approved": sum(
                 item["human_qc_approved"] and item.get("review_method") == "human"
-                for item in items
-            ),
-            "codex_approved": sum(
-                item["human_qc_approved"] and item.get("review_method") == "codex"
                 for item in items
             ),
             "blocked": sum(

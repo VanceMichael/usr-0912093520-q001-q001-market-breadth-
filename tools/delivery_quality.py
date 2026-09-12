@@ -32,6 +32,50 @@ SENTENCE_RE = re.compile(r"[^。！？!?]+[。！？!?]?")
 CHINESE_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 
 
+def evidence_ledger_sha256(value: object) -> str:
+    """Hash the canonical evidence ledger representation.
+
+    The function accepts either the SQLite JSON text or its decoded array so
+    callers can use the same binding before and after serialization.
+    """
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return ""
+    try:
+        rendered = json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+    except (TypeError, ValueError):
+        return ""
+    return hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+
+
+def trajectory_sha256(path: Path) -> str:
+    """Return a stable hash of the authoritative JSONL bytes."""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def build_evidence_qc_receipt(
+    record: dict, trajectory_path: Path, *, errors: list[str] | None = None,
+    warnings: list[str] | None = None,
+) -> dict:
+    """Build a compact, verifiable receipt for a successful evidence QC pass."""
+    return {
+        "version": 2,
+        "record_id": str(record.get("record_id") or ""),
+        "evidence_ledger_sha256": evidence_ledger_sha256(record.get("evidence_ledger")),
+        "trajectory_sha256": trajectory_sha256(trajectory_path),
+        "zero_errors": not errors,
+        "zero_warnings": not warnings,
+    }
+
+
 def json_array(value: object, field: str) -> tuple[list[dict], list[str]]:
     if isinstance(value, str):
         try:
@@ -179,6 +223,11 @@ def _find_trajectory(root: Path, name: str) -> Path:
     if len(matches) != 1:
         raise ValueError("找不到唯一的权威轨迹文件")
     return matches[0]
+
+
+def find_authoritative_trajectory(root: Path, name: str) -> Path:
+    """Public wrapper used when a QC pass records the trajectory receipt."""
+    return _find_trajectory(root, name)
 
 
 def _event_prompt_id(event: dict) -> str:
