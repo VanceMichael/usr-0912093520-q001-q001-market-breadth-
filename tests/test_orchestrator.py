@@ -272,6 +272,20 @@ class OrchestratorTest(unittest.TestCase):
             reclaimed = orchestrator._claim_rows(db, "owner-c", "model", 1, 3600)
             self.assertEqual([row["task_id"] for row in reclaimed], ["b1-001"])
 
+    def test_global_model_does_not_claim_before_batch_validation(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            db = root / "production.sqlite3"
+            row = self.make_question(root, db)[0]
+
+            self.assertEqual(orchestrator._claim_rows(db, "model", "model", 1, 3600), [])
+            with connect(db) as connection:
+                connection.execute("UPDATE batches SET status='ready'")
+                connection.commit()
+
+            claimed = orchestrator._claim_rows(db, "model", "model", 1, 3600)
+            self.assertEqual([item["task_id"] for item in claimed], [row["task_id"]])
+
     def test_global_delivery_claim_requires_successful_model_run(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -287,6 +301,29 @@ class OrchestratorTest(unittest.TestCase):
                 connection.commit()
             claimed = orchestrator._claim_rows(db, "delivery", "delivery", 1, 3600)
             self.assertEqual([item["task_id"] for item in claimed], [row["task_id"]])
+
+    def test_global_delivery_recovers_success_from_failed_batch(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            db = root / "production.sqlite3"
+            row = self.make_question(root, db)[0]
+            with connect(db) as connection:
+                connection.execute("UPDATE batches SET status='failed'")
+                connection.execute("UPDATE questions SET status='draft' WHERE id=?", (row["id"],))
+                connection.execute(
+                    "INSERT INTO runs(question_id,batch_run_id,launched_at,status) "
+                    "VALUES(?,'success','now','succeeded')",
+                    (row["id"],),
+                )
+                connection.commit()
+
+            claimed = orchestrator._claim_rows(db, "delivery", "delivery", 1, 3600)
+            self.assertEqual([item["task_id"] for item in claimed], [row["task_id"]])
+            with connect(db) as connection:
+                status = connection.execute(
+                    "SELECT status FROM questions WHERE id=?", (row["id"],)
+                ).fetchone()[0]
+            self.assertEqual(status, "completed")
 
     def test_monitor_reclaims_worker_that_never_produces_output(self):
         with tempfile.TemporaryDirectory() as raw:

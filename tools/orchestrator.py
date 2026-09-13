@@ -851,7 +851,7 @@ def _claim_rows(
         if kind == "model":
             rows = connection.execute(
                 "SELECT q.* FROM questions q JOIN batches b ON b.id=q.batch_id "
-                "WHERE b.status NOT IN ('completed','partial','failed') AND q.maintenance_mode=0 "
+                "WHERE b.status IN ('ready','approved') AND q.maintenance_mode=0 "
                 "AND q.status='approved' AND q.mechanical_qc='pass' AND q.qc_decision='pass' "
                 "AND q.qc_prompt_sha256=q.prompt_sha256 "
                 "AND (q.model_lease_owner='' OR julianday(q.model_lease_expires_at)<julianday(?)) "
@@ -867,8 +867,7 @@ def _claim_rows(
         else:
             candidates = connection.execute(
                 "SELECT q.* FROM questions q JOIN batches b ON b.id=q.batch_id "
-                "WHERE b.status NOT IN ('completed','partial','failed') AND q.maintenance_mode=0 "
-                "AND q.status='completed' "
+                "WHERE q.maintenance_mode=0 AND q.status!='blocked' "
                 "AND (q.delivery_lease_owner='' OR julianday(q.delivery_lease_expires_at)<julianday(?)) "
                 "AND EXISTS(SELECT 1 FROM runs s WHERE s.question_id=q.id AND s.status='succeeded') "
                 "AND ((SELECT COUNT(*) FROM records r WHERE r.question_id=q.id)=0 "
@@ -881,11 +880,17 @@ def _claim_rows(
             rows = list(candidates[:limit])
         claimed: list[int] = []
         for row in rows:
+            status_update = ",status='completed',updated_at=?" if kind == "delivery" else ""
+            values: tuple[object, ...] = (
+                (owner, expires, current, row["id"], current)
+                if kind == "delivery"
+                else (owner, expires, row["id"], current)
+            )
             cursor = connection.execute(
-                f"UPDATE questions SET {kind}_lease_owner=?,{kind}_lease_expires_at=? "
+                f"UPDATE questions SET {kind}_lease_owner=?,{kind}_lease_expires_at=?{status_update} "
                 f"WHERE id=? AND ({kind}_lease_owner='' "
                 f"OR julianday({kind}_lease_expires_at)<julianday(?))",
-                (owner, expires, row["id"], current),
+                values,
             )
             if cursor.rowcount:
                 claimed.append(int(row["id"]))
