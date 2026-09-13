@@ -249,6 +249,7 @@ def run_headless_stream(command: list[str], environment: dict[str, str]) -> int:
     process = subprocess.Popen(
         process_command,
         env=environment,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,

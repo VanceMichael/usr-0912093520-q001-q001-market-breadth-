@@ -13,6 +13,13 @@ from pathlib import Path
 
 DIMENSIONS = ("delivery", "instruction", "planning", "reasoning", "execution")
 EVIDENCE_SOURCES = {"trajectory", "workspace", "prompt"}
+EVIDENCE_KINDS = {"requirement", "process", "product", "runtime"}
+EVIDENCE_KIND_SOURCES = {
+    "requirement": {"prompt"},
+    "process": {"trajectory"},
+    "product": {"workspace"},
+    "runtime": {"trajectory"},
+}
 COVERAGE_STATUSES = {"met", "unmet", "uncertain"}
 TECHNICAL_SPAN_RE = re.compile(
     r"`[^`]*`|https?://\S+|(?:[A-Za-z]:)?(?:[/\\][^\s，。；！？]+)+|"
@@ -30,6 +37,30 @@ TECHNICAL_WORDS = {
 LATIN_RE = re.compile(r"[A-Za-z]")
 SENTENCE_RE = re.compile(r"[^。！？!?]+[。！？!?]?")
 CHINESE_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
+NON_MODEL_ENVIRONMENT_RE = re.compile(
+    r"(?i)(?:"
+    r"(?:当前|本地|宿主机|运行|执行|测试|目标|容器)?环境[^，。；]{0,36}"
+    r"(?:没有|缺少|缺失|未安装|不可用|不具备|无法提供)|"
+    r"(?:docker|docker\s+compose|compose|pytest|maven|java|git)[^，。；]{0,30}"
+    r"(?:command\s+not\s+found|not\s+found|no\s+docker|unavailable|不存在|不可用|未安装|缺少)|"
+    r"(?:没有安装|未安装|缺少|找不到)[^，。；]{0,18}"
+    r"(?:docker|docker\s+compose|compose|pytest|maven|java|git)(?:\s*命令)?|"
+    r"(?:command\s+not\s+found|no[_ -]?docker|docker[_ -]?unavailable|daemon[_ -]?unavailable|"
+    r"守护进程不可用|没有可用的?\s*docker\s*守护进程|找不到\s*docker\s*命令)|"
+    r"(?:网络|网关|镜像仓库|软件源|依赖下载)[^，。；]{0,36}(?:波动|超时|失败|不可达|中断)|"
+    r"(?:dubious\s+ownership|unsafe\s+repository|trustanchors|证书链|目录属主|权限限制)"
+    r")"
+)
+
+
+def non_model_environment_issues(text: str) -> list[str]:
+    """Reject exported evaluation prose that treats infrastructure as capability."""
+    if NON_MODEL_ENVIRONMENT_RE.search(str(text or "")):
+        return [
+            "不得把环境、网络、预装工具或权限故障写入评价描述；"
+            "只评价模型自身可控且有证据的行为"
+        ]
+    return []
 
 
 def evidence_ledger_sha256(value: object) -> str:
@@ -128,6 +159,7 @@ def validate_evidence_structure(record: dict) -> tuple[list[str], list[dict], li
         record.get("requirement_coverage"), "requirement_coverage"
     )
     errors.extend(coverage_errors)
+    uses_evidence_kinds = any("kind" in item for item in evidence)
     ids: set[str] = set()
     by_dimension = {dimension: [] for dimension in DIMENSIONS}
     for index, item in enumerate(evidence, 1):
@@ -135,6 +167,7 @@ def validate_evidence_structure(record: dict) -> tuple[list[str], list[dict], li
         evidence_id = str(item.get("id") or "").strip()
         dimension = str(item.get("dimension") or "").strip()
         source_type = str(item.get("source_type") or "").strip()
+        kind = str(item.get("kind") or "").strip()
         claim = str(item.get("claim") or "").strip()
         fact = str(item.get("fact") or "").strip()
         excerpt = str(item.get("excerpt") or "").strip()
@@ -148,6 +181,19 @@ def validate_evidence_structure(record: dict) -> tuple[list[str], list[dict], li
             by_dimension[dimension].append(item)
         if source_type not in EVIDENCE_SOURCES:
             errors.append(f"{prefix}的来源类型无效")
+        if uses_evidence_kinds:
+            if kind not in EVIDENCE_KINDS:
+                errors.append(f"{prefix}必须提供有效的 kind")
+            elif source_type in EVIDENCE_SOURCES and source_type not in EVIDENCE_KIND_SOURCES[kind]:
+                errors.append(f"{prefix}的 {source_type} 来源不能证明 {kind} 类型事实")
+            if kind == "runtime":
+                related_line = item.get("related_line")
+                if (
+                    not isinstance(related_line, int)
+                    or isinstance(related_line, bool)
+                    or related_line < 1
+                ):
+                    errors.append(f"{prefix}的运行结果必须提供 related_line 关联工具调用")
         if not claim or not fact or not excerpt:
             errors.append(f"{prefix}必须包含 claim、fact 和 excerpt")
         if len(CHINESE_RE.findall(fact)) < 6:
@@ -346,6 +392,60 @@ def verify_evidence_sources(
             errors.append(f"{record_id}: 证据 {evidence_id} 的轨迹校验值不一致")
         if excerpt not in raw.decode("utf-8", errors="replace"):
             errors.append(f"{record_id}: 证据 {evidence_id} 的轨迹摘录不存在")
+        kind = str(item.get("kind") or "")
+        if kind not in {"process", "runtime"}:
+            continue
+        try:
+            event = json.loads(raw)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            errors.append(f"{record_id}: 证据 {evidence_id} 的轨迹行不是有效事件")
+            continue
+        message = event.get("message") if isinstance(event, dict) else None
+        content = message.get("content") if isinstance(message, dict) else None
+        blocks = content if isinstance(content, list) else []
+        if kind == "process":
+            if not any(
+                isinstance(block, dict) and block.get("type") in {"tool_use", "thinking"}
+                for block in blocks
+            ):
+                errors.append(f"{record_id}: 过程证据 {evidence_id} 必须引用工具调用或思考事件")
+            continue
+        result_ids = {
+            str(block.get("tool_use_id") or "")
+            for block in blocks
+            if isinstance(block, dict) and block.get("type") == "tool_result"
+            and str(block.get("tool_use_id") or "")
+        }
+        if not result_ids:
+            errors.append(f"{record_id}: 运行证据 {evidence_id} 必须引用工具结果事件")
+            continue
+        related_line = item.get("related_line")
+        if not isinstance(related_line, int) or isinstance(related_line, bool):
+            continue
+        if (
+            related_line >= line_no
+            or related_line > len(trajectory_lines)
+            or turn_range is None
+            or not turn_range[0] <= related_line <= turn_range[1]
+        ):
+            errors.append(f"{record_id}: 运行证据 {evidence_id} 关联的工具调用不在当前结果之前")
+            continue
+        try:
+            related_event = json.loads(trajectory_lines[related_line - 1])
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            errors.append(f"{record_id}: 运行证据 {evidence_id} 关联行不是有效事件")
+            continue
+        related_message = related_event.get("message") if isinstance(related_event, dict) else None
+        related_content = related_message.get("content") if isinstance(related_message, dict) else None
+        related_blocks = related_content if isinstance(related_content, list) else []
+        call_ids = {
+            str(block.get("id") or "")
+            for block in related_blocks
+            if isinstance(block, dict) and block.get("type") == "tool_use"
+            and str(block.get("id") or "")
+        }
+        if not call_ids or not (call_ids & result_ids):
+            errors.append(f"{record_id}: 运行证据 {evidence_id} 的工具结果与关联调用不匹配")
     return errors
 
 

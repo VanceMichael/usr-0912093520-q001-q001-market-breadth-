@@ -15,7 +15,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from tools.batch_pipeline import connect, create_batch, set_repository  # noqa: E402
-from tools.delivery_records import EXPORT_HEADERS  # noqa: E402
+from tools.delivery_records import EXPORT_HEADERS, validate_one  # noqa: E402
+from tools.delivery_quality import (  # noqa: E402
+    validate_evidence_structure,
+    verify_evidence_sources,
+)
 from tools.solo2_client import Solo2Error  # noqa: E402
 from tools.solo2_service import submit_records  # noqa: E402
 from tools.human_review import (  # noqa: E402
@@ -277,6 +281,107 @@ class DeliveryPipelineTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0, result.stdout)
             self.assertIn("delivery_description must not exceed 420 characters", result.stdout)
 
+    def test_description_style_gate_requires_arabic_ordinals(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            record = automated_record()
+            record["delivery_description"] = (
+                "第八十行的返回值已经由接口测试核对，状态落库和事件推送也能连续完成。"
+                "该位置使用中文数字标记会影响交付人员按统一格式定位原始证据。"
+            )
+            input_path = root / "score.json"
+            input_path.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+
+            result = self.run_command([
+                sys.executable, str(STYLE_GATE), "--input", str(input_path),
+            ])
+
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("must use Arabic digits for ordinals", result.stdout)
+
+    def test_environment_failure_cannot_be_used_as_model_deduction(self):
+        record = automated_record()
+        record["delivery_score"] = 4
+        record["delivery_description"] = (
+            "主要接口和测试已经补齐，但运行环境中缺少 docker 命令，镜像级启动验收没有完成。"
+            "这一限制来自执行环境，不能据此判断交付代码存在缺口。"
+        )
+
+        errors, _warnings = validate_one(record)
+
+        self.assertTrue(any("不得把环境" in error for error in errors), errors)
+
+    def test_model_authored_dockerfile_defect_is_a_valid_deduction(self):
+        record = automated_record()
+        record["delivery_score"] = 4
+        record["delivery_description"] = (
+            "服务主体已经实现，但 Dockerfile 把应用监听端口写成 8081，"
+            "与程序实际使用的 8080 不一致。这个配置错误会使镜像启动后的探活请求失败。"
+        )
+
+        errors, _warnings = validate_one(record)
+
+        self.assertFalse(any("非模型环境因素" in error for error in errors), errors)
+
+    def test_environment_failure_is_blocked_in_other_issues(self):
+        record = automated_record()
+        record["other_issues"] = (
+            "系统没有安装 Docker，无法执行容器启动验收。"
+            "该情况来自运行环境限制，不应作为扣分依据。"
+        )
+
+        errors, _warnings = validate_one(record)
+
+        self.assertTrue(
+            any("other_issues" in error and "不得把环境" in error for error in errors),
+            errors,
+        )
+
+    def test_semantic_runtime_evidence_requires_matching_tool_call(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = self.prepare(root)
+            with connect(database) as connection:
+                question = connection.execute("SELECT folder_path FROM questions").fetchone()
+            trajectory = root / "0911" / "session-001.jsonl"
+            result_raw = trajectory.read_bytes().splitlines()[2]
+            record = automated_record()
+            record["user_prompt"] = (
+                "从零构建一套事件协作服务，覆盖事件接入、顺序处理、持久化、"
+                "状态推送、断线重连和完整验证场景。"
+            )
+            for item in record["evidence_ledger"]:
+                item.update({
+                    "kind": "runtime",
+                    "line": 3,
+                    "related_line": 2,
+                    "source_sha256": hashlib.sha256(result_raw).hexdigest(),
+                    "excerpt": "ok",
+                })
+
+            errors = verify_evidence_sources(
+                record,
+                question_folder=Path(question["folder_path"]),
+                trajectory_root=root / "0911",
+            )
+            self.assertEqual(errors, [])
+
+            record["evidence_ledger"][0]["related_line"] = 4
+            errors = verify_evidence_sources(
+                record,
+                question_folder=Path(question["folder_path"]),
+                trajectory_root=root / "0911",
+            )
+            self.assertTrue(any("关联的工具调用不在当前结果之前" in error for error in errors))
+
+    def test_semantic_evidence_ledger_cannot_mix_versioned_and_legacy_items(self):
+        record = automated_record()
+        record["evidence_ledger"][0].update({"kind": "runtime", "related_line": 2})
+
+        errors, _evidence, _coverage = validate_evidence_structure(record)
+
+        self.assertTrue(any("必须提供有效的 kind" in error for error in errors))
+
     def test_delivery_descriptions_reject_stock_and_model_wording(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -396,6 +501,15 @@ class DeliveryPipelineTests(unittest.TestCase):
                 len(list((root / "0911").glob("轨迹_0911_第1题_session-001*.jsonl"))),
                 2,
             )
+
+            with (claude_root / "session-001.jsonl").open("a", encoding="utf-8") as handle:
+                handle.write('{"sessionId":"foreign-session"}\n')
+            result = self.run_command([
+                sys.executable, str(EXPORTER), "--db", str(database), "--batch", "0911",
+                "--template", str(TEMPLATE), "--claude-root", str(claude_root),
+            ])
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("foreign SessionIDs", result.stdout)
 
     def test_codex_five_dimension_review_can_release_final_gate(self):
         with tempfile.TemporaryDirectory() as directory:

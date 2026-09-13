@@ -250,7 +250,7 @@ function reviewDeliveryState(record) {
   return ["前置门禁阻断", "red", "请先补齐交付质检、事实证据和历史去重结果"];
 }
 
-function renderReviews() {
+function renderReviewSummary() {
   if (!state.reviews) return;
   const summary = state.reviews.summary;
   $("#review-summary").innerHTML = `
@@ -259,6 +259,11 @@ function renderReviews() {
     <span class="summary-chip success">复核通过<strong>${summary.approved}</strong></span>
     <span class="summary-chip success">历史已交付<strong>${summary.delivered || 0}</strong></span>
     <span class="summary-chip warning">门禁阻断<strong>${summary.blocked}</strong></span>`;
+}
+
+function renderReviews() {
+  if (!state.reviews) return;
+  renderReviewSummary();
   const reviewer = $("#review-reviewer");
   const selectedReviewer = reviewer.value;
   reviewer.innerHTML = state.reviews.reviewers.map((name) => (
@@ -785,6 +790,7 @@ function renderSettings() {
   $("#config-worker-cpus").value = state.config.worker_cpus || 1;
   $("#config-worker-memory").value = state.config.worker_memory || "2g";
   $("#config-worker-timeout").value = state.config.worker_timeout || 3600;
+  $("#config-max-attempts").value = state.config.max_attempts || 2;
   $("#config-gateway-max-attempts").value = state.config.gateway_max_attempts || 3;
   $("#config-gateway-backoff-base").value = state.config.gateway_backoff_base || 30;
   $("#config-gateway-backoff-max").value = state.config.gateway_backoff_max || 300;
@@ -1622,7 +1628,6 @@ $("#review-history-sync").addEventListener("click", async () => {
   try {
     const result = await api("/api/reviews/history/sync", { method: "POST", body: "{}" });
     toast(`已同步 ${result.nodes} 个节点，共 ${result.imported} 条描述`);
-    await loadReviews({ quiet: true });
   } catch (error) {
     toast(error.message, true);
   } finally {
@@ -1653,11 +1658,18 @@ $("#repair-detail").addEventListener("click", async (event) => {
 });
 function markReviewCardApproved(card, recordId, reviewer) {
   const record = state.reviews?.records?.find((item) => item.record_id === recordId);
+  const wasApproved = Boolean(record?.human_qc_approved);
   if (record) {
     record.human_qc_approved = true;
     record.review_method = "human";
     record.human_qc_reviewer = reviewer;
     record.can_solo2_submit = true;
+    if (!wasApproved) {
+      state.reviews.summary.waiting = Math.max(0, state.reviews.summary.waiting - 1);
+      state.reviews.summary.approved += 1;
+      state.reviews.summary.human_approved = (state.reviews.summary.human_approved || 0) + 1;
+      renderReviewSummary();
+    }
   }
   card.querySelectorAll("[data-review-confirm]").forEach((input) => {
     input.checked = true;
@@ -1671,6 +1683,92 @@ function markReviewCardApproved(card, recordId, reviewer) {
     submit.disabled = false;
     submit.title = "提交此条到 SOLO2";
   }
+  const finalGate = card.querySelector(".gate-strip .tag:last-child");
+  if (finalGate) {
+    finalGate.className = "tag green";
+    finalGate.textContent = "人工确认通过";
+  }
+  updateReviewDeliveryDisplay(card, "可提交", "green", "最终复核已通过，可以提交这条记录");
+}
+
+function updateReviewDeliveryDisplay(card, label, tone, detail, error = "") {
+  const status = card.querySelector(".review-delivery-state");
+  if (!status) return;
+  const detailNode = status.querySelector("strong");
+  const tag = status.querySelector(".tag");
+  if (detailNode) detailNode.textContent = detail;
+  if (tag) {
+    tag.className = `tag ${tone}`;
+    tag.textContent = label;
+  }
+  const oldError = status.querySelector("small");
+  if (oldError) oldError.remove();
+  if (error && detailNode) detailNode.insertAdjacentHTML("afterend", `<small>${escapeHtml(error)}</small>`);
+}
+
+function markReviewCardRejected(card, recordId, reviewer) {
+  const record = state.reviews?.records?.find((item) => item.record_id === recordId);
+  const wasApproved = Boolean(record?.human_qc_approved);
+  if (record) {
+    record.human_qc_approved = false;
+    record.review_method = "";
+    record.human_qc_reviewer = reviewer;
+    record.can_solo2_submit = false;
+    if (wasApproved) {
+      state.reviews.summary.waiting += 1;
+      state.reviews.summary.approved = Math.max(0, state.reviews.summary.approved - 1);
+      state.reviews.summary.human_approved = Math.max(0, (state.reviews.summary.human_approved || 0) - 1);
+      renderReviewSummary();
+    }
+  }
+  card.querySelectorAll("[data-review-confirm]").forEach((input) => {
+    input.checked = false;
+    input.disabled = !record?.ready_for_review;
+  });
+  card.querySelectorAll('[data-review-action="approve"], [data-review-action="approve-all"]').forEach((actionButton) => {
+    actionButton.disabled = !record?.ready_for_review;
+  });
+  const submit = card.querySelector('[data-review-action="solo2"]');
+  if (submit) {
+    submit.disabled = true;
+    submit.title = record?.ready_for_review
+      ? "请先逐项确认五个维度"
+      : "前置门禁未通过，暂不可提交";
+  }
+  const finalGate = card.querySelector(".gate-strip .tag:last-child");
+  if (finalGate) {
+    finalGate.className = "tag amber";
+    finalGate.textContent = "最终复核待处理";
+  }
+  const [label, tone, detail] = reviewDeliveryState(record || {});
+  updateReviewDeliveryDisplay(card, label, tone, detail);
+}
+
+function markReviewCardSubmitted(card, recordId, result) {
+  const record = state.reviews?.records?.find((item) => item.record_id === recordId);
+  const item = result?.results?.find((entry) => entry.record_id === recordId) || {};
+  if (record) {
+    if (record.solo2_status !== "succeeded") {
+      state.reviews.summary.delivered = (state.reviews.summary.delivered || 0) + 1;
+      renderReviewSummary();
+    }
+    record.solo2_status = "succeeded";
+    record.solo2_remote_id = String(item.remote_id || "");
+    record.solo2_last_error = "";
+    record.can_solo2_submit = false;
+  }
+  card.querySelectorAll('[data-review-action="reject"], [data-review-action="solo2"]').forEach((actionButton) => {
+    actionButton.disabled = true;
+  });
+  const submit = card.querySelector('[data-review-action="solo2"]');
+  if (submit) {
+    submit.innerHTML = '<i data-lucide="send"></i>已提交此条';
+    submit.title = "这一条记录已经提交到 SOLO2";
+  }
+  updateReviewDeliveryDisplay(
+    card, "已提交", "green",
+    item.remote_id ? `平台编号 ${item.remote_id}` : "平台已接收",
+  );
 }
 $("#review-list").addEventListener("change", (event) => {
   const input = event.target.closest("[data-review-confirm]");
@@ -1697,6 +1795,7 @@ $("#review-list").addEventListener("click", async (event) => {
   const note = card.querySelector("[data-review-note]").value.trim();
   const action = button.dataset.reviewAction;
   const original = button.innerHTML;
+  let keepDisabled = false;
   button.disabled = true;
   button.textContent = "处理中…";
   try {
@@ -1707,6 +1806,10 @@ $("#review-list").addEventListener("click", async (event) => {
         "确认提交",
         async () => {
           closeModal();
+          const submitOriginal = button.innerHTML;
+          let submitted = false;
+          button.disabled = true;
+          button.textContent = "提交中…";
           try {
             const record = state.reviews?.records?.find((item) => item.record_id === recordId);
             const confirmations = Object.fromEntries(reviewDimensions.map(([key]) => [
@@ -1725,17 +1828,23 @@ $("#review-list").addEventListener("click", async (event) => {
                   confirmations,
                 }),
               });
+              markReviewCardApproved(card, recordId, reviewer);
             }
-            await api("/api/actions/solo2-submit", {
+            const result = await api("/api/actions/solo2-submit", {
               method: "POST",
               body: JSON.stringify({ batch: record?.batch_name || state.batch, record_ids: [recordId] }),
             });
+            markReviewCardSubmitted(card, recordId, result);
+            submitted = true;
             toast("这一条记录已提交到 SOLO2");
-            await loadDashboard(state.batch);
           } catch (error) {
             toast(error.message, true);
           } finally {
-            await loadReviews({ quiet: true });
+            if (!submitted) {
+              button.innerHTML = submitOriginal;
+              button.disabled = false;
+            }
+            refreshIcons();
           }
         },
       );
@@ -1744,6 +1853,7 @@ $("#review-list").addEventListener("click", async (event) => {
       await api("/api/reviews/reject", {
         method: "POST", body: JSON.stringify({ record_id: recordId, reviewer, note }),
       });
+      markReviewCardRejected(card, recordId, reviewer);
       toast("记录已退回重写");
     } else if (action === "approve") {
       const confirmations = Object.fromEntries(reviewDimensions.map(([key]) => [
@@ -1753,6 +1863,7 @@ $("#review-list").addEventListener("click", async (event) => {
         method: "POST", body: JSON.stringify({ record_id: recordId, reviewer, note, confirmations }),
       });
       markReviewCardApproved(card, recordId, reviewer);
+      keepDisabled = true;
       toast("五个维度已由人工确认");
     } else if (action === "approve-all") {
       const confirmations = Object.fromEntries(reviewDimensions.map(([key]) => [key, true]));
@@ -1760,15 +1871,14 @@ $("#review-list").addEventListener("click", async (event) => {
         method: "POST", body: JSON.stringify({ record_id: recordId, reviewer, note, confirmations }),
       });
       markReviewCardApproved(card, recordId, reviewer);
+      keepDisabled = true;
       toast("五个维度已一键确认通过");
     }
-    await loadDashboard(state.batch);
-    await loadReviews({ quiet: true });
   } catch (error) {
     toast(error.message, true);
   } finally {
     button.innerHTML = original;
-    button.disabled = false;
+    button.disabled = keepDisabled;
     refreshIcons();
   }
 });
@@ -1799,6 +1909,7 @@ $("#settings-form").addEventListener("submit", async (event) => {
         worker_cpus: Number($("#config-worker-cpus").value),
         worker_memory: $("#config-worker-memory").value,
         worker_timeout: Number($("#config-worker-timeout").value),
+        max_attempts: Number($("#config-max-attempts").value),
         gateway_max_attempts: Number($("#config-gateway-max-attempts").value),
         gateway_backoff_base: Number($("#config-gateway-backoff-base").value),
         gateway_backoff_max: Number($("#config-gateway-backoff-max").value),

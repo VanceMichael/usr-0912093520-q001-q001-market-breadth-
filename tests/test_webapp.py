@@ -410,12 +410,15 @@ class WebConsoleTests(unittest.TestCase):
                 "api_key": "new-secret",
                 "submitter": "新提交人",
                 "worker_timeout": 7200,
+                "max_attempts": 4,
             })
             self.assertEqual(result["config"]["model"], "claude-new")
             self.assertEqual(result["config"]["model_mode"], "local")
+            self.assertEqual(result["config"]["max_attempts"], 4)
             content = env_file.read_text(encoding="utf-8")
             self.assertIn('CC_SWITCH_BASE_URL="https://relay.example.com/v1"', content)
             self.assertIn('CC_SWITCH_API_KEY="new-secret"', content)
+            self.assertIn('CC_PIPELINE_MAX_ATTEMPTS="4"', content)
             self.assertIn('CC_PIPELINE_MODEL_MODE="local"', content)
             self.assertIn('CC_AUTHOR_BATCH_SIZE="10"', content)
             self.assertIn('CC_PIPELINE_WORKER_TIMEOUT="7200"', content)
@@ -516,6 +519,11 @@ class WebConsoleTests(unittest.TestCase):
                     queue = data.scheduler_snapshot()["queue"]
                 self.assertEqual(queue["questions_ready"], 0)
                 self.assertEqual(queue["questions_exhausted"], 1)
+                (root / ".env").write_text("CC_PIPELINE_MAX_ATTEMPTS=4\n", encoding="utf-8")
+                with mock.patch.object(data, "_scheduler_containers", return_value=[]):
+                    queue = data.scheduler_snapshot()["queue"]
+                self.assertEqual(queue["questions_ready"], 1)
+                self.assertEqual(queue["questions_exhausted"], 0)
                 with connect(database) as connection:
                     connection.execute("UPDATE batches SET status='failed'")
                     connection.commit()
@@ -1098,6 +1106,17 @@ class WebConsoleTests(unittest.TestCase):
             ) as popen:
                 open_local_path(target, target)
             popen.assert_called_once_with(["open", str(target)], cwd=target)
+
+    def test_review_action_buttons_do_not_refetch_the_review_list(self):
+        source = (
+            Path(__file__).resolve().parents[1] / "webapp" / "static" / "app.js"
+        ).read_text(encoding="utf-8")
+        action_section = source.split(
+            '$("#review-history-sync")', 1
+        )[1].split('$("#settings-form")', 1)[0]
+
+        self.assertNotIn("loadReviews(", action_section)
+        self.assertNotIn("loadDashboard(", action_section)
 
     def test_windows_secure_file_restricts_acl_to_current_user(self):
         identity = mock.Mock(returncode=0, stdout="machine\\operator\n")

@@ -16,7 +16,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from tools.batch_pipeline import connect  # noqa: E402
-from tools.delivery_quality import history_matches, prose_english_issues  # noqa: E402
+from tools.delivery_quality import (  # noqa: E402
+    history_matches, non_model_environment_issues, prose_english_issues,
+)
 
 
 PREFIXES = ("delivery", "instruction", "planning", "reasoning", "execution")
@@ -56,6 +58,11 @@ PLACEHOLDER_RE = re.compile(r"\[[^\]]+\]|=>|→|->")
 ENGLISH_EVALUATOR_LABEL_RE = re.compile(
     r"(?:^|[。；;\s])(?:Rationale|Reasoning|Summary|Overall|Conclusion)\s*[:：]",
     re.IGNORECASE,
+)
+CHINESE_ORDINAL_RE = re.compile(
+    r"第[零〇一二两三四五六七八九十百千万]+"
+    r"(?=(?:至第?[零〇一二两三四五六七八九十百千万]+)?"
+    r"(?:行|步|次|轮|个|处|阶段|条|项|章|节|题|页|列|点))"
 )
 STYLE_FIELDS = tuple(f"{prefix}_description" for prefix in PREFIXES)
 MIN_DESCRIPTION_CHINESE = 45
@@ -138,7 +145,13 @@ def check_record(path: Path, record: dict, record_index: int) -> list[str]:
             errors.append(f"{path} record {record_index}: {field} contains scaffolding or an arrow")
         if ENGLISH_EVALUATOR_LABEL_RE.search(text):
             errors.append(f"{path} record {record_index}: {field} contains an English evaluator label")
+        if CHINESE_ORDINAL_RE.search(text):
+            errors.append(
+                f"{path} record {record_index}: {field} must use Arabic digits for ordinals, for example 第80行"
+            )
         for issue in prose_english_issues(text):
+            errors.append(f"{path} record {record_index}: {field} {issue}")
+        for issue in non_model_environment_issues(text):
             errors.append(f"{path} record {record_index}: {field} {issue}")
         chinese_count = len(re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff]", text))
         if chinese_count < MIN_DESCRIPTION_CHINESE:
@@ -199,6 +212,12 @@ def check_record(path: Path, record: dict, record_index: int) -> list[str]:
             errors.append(f"{path} record {record_index}: other_issues uses a turn-recap opening")
         if SELF_REFERENCE_RE.search(text):
             errors.append(f"{path} record {record_index}: other_issues exposes generation or evaluator language")
+        for issue in non_model_environment_issues(text):
+            errors.append(f"{path} record {record_index}: other_issues {issue}")
+        if CHINESE_ORDINAL_RE.search(text):
+            errors.append(
+                f"{path} record {record_index}: other_issues must use Arabic digits for ordinals, for example 第80行"
+            )
         if PLACEHOLDER_RE.search(text):
             errors.append(f"{path} record {record_index}: other_issues contains scaffolding or an arrow")
         if ENGLISH_EVALUATOR_LABEL_RE.search(text):

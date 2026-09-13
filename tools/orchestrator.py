@@ -529,7 +529,8 @@ def run_one(
         with log_path.open("w", encoding="utf-8") as log:
             initial_activity = activity_signature(log_path, trajectory_root)
             process = subprocess.Popen(
-                command, stdout=log, stderr=subprocess.STDOUT,
+                command, stdin=subprocess.DEVNULL,
+                stdout=log, stderr=subprocess.STDOUT,
             )
             code, status, error = monitor_worker(
                 process, db, int(row["id"]), run_id, container_name,
@@ -775,7 +776,8 @@ def run_codex(codex: str, prompt: str, log_path: Path, timeout: int) -> int:
         try:
             result = subprocess.run(
                 codex_command(codex, prompt), cwd=PROJECT_ROOT,
-                stdout=log, stderr=subprocess.STDOUT, timeout=timeout,
+                stdin=subprocess.DEVNULL, stdout=log,
+                stderr=subprocess.STDOUT, timeout=timeout,
                 check=False, env=os.environ.copy(),
             )
         except subprocess.TimeoutExpired:
@@ -964,8 +966,13 @@ def deliver_one(
             f"使用 $cc-usr-delivery-producer 只处理批次 {batch} 第 {number} 题。"
             f"原始 Claude JSONL 根目录为 {data_root.resolve()}。读取真实轨迹、SQLite、初始快照、Git diff 和实际产物，"
             "按项目规范为全部有效轮次生成完整交付记录并写入 SQLite。功能成功必须由目标轮次内的真实测试输出、"
-            "服务交互或其他运行证据支撑，静态阅读、文件存在和最终回复不能单独证明成功；测试失败仍要保留记录并如实降分。"
-            "五维描述必须各自为单段、至少 45 个汉字且不超过 420 个字符。不得修改题目代码、轨迹或仓库，"
+            "服务交互或其他运行证据支撑，静态阅读、文件存在和最终回复不能单独证明成功。测试失败先判断责任归属；"
+            "仅模型自身代码、决策或工具使用造成的问题可以扣分，缺少宿主命令或预装依赖、Docker 守护进程不可用、"
+            "网络、镜像仓库、权限、证书和网关等外部故障不得写入五维描述或其他问题，也不得支持扣分。"
+            "新证据账本必须为每项填写 kind：requirement/prompt、product/workspace、process/trajectory 或 runtime/trajectory；"
+            "runtime 必须引用 tool_result，并用 related_line 关联本轮先发生且 id 匹配的 tool_use。"
+            "五维描述必须各自为单段、至少 45 个汉字且不超过 420 个字符，序号使用阿拉伯数字，例如第80行。"
+            "不得修改题目代码、轨迹或仓库，"
             "不得处理其他题目；完成生产后停止，保持质检与最终复核字段未通过，不得执行交付质检或导出。"
         )
         code = run_codex(codex, prompt, log_root / "delivery-producer.log", timeout)
@@ -978,8 +985,10 @@ def deliver_one(
         prompt = (
             f"使用 $cc-usr-delivery-qc 只质检批次 {batch} 第 {number} 题的全部交付记录。"
             f"原始 Claude JSONL 根目录为 {data_root.resolve()}。以 SQLite 已有生产记录为质检对象，不得重新生产。"
-            "成功结论必须有目标轮次原始 JSONL 中的真实运行证据；测试失败要保留记录、说明影响并降低对应分数。"
-            "五维描述必须各自为单段、至少 45 个汉字且不超过 420 个字符。依据可核验证据修正不合规字段，"
+            "成功结论必须有目标轮次原始 JSONL 中的真实运行证据。测试失败必须先归因；只有模型自身可控行为造成的失败才能写入描述并扣分，"
+            "环境缺命令或预装依赖、Docker 守护进程、网络、镜像仓库、权限、证书、网关等外部问题不得作为评价内容。"
+            "对带 kind 的新证据账本检查来源语义，并确认 runtime 的 tool_result 与 related_line 指向的 tool_use 匹配。"
+            "五维描述必须各自为单段、至少 45 个汉字且不超过 420 个字符，序号使用阿拉伯数字。依据可核验证据修正不合规字段，"
             f"显式使用 --select {number} 重新验证并执行 --finalize；不得修改目标模型代码，不得处理其他题目，"
             "不要导出 Excel。完成后停止。"
         )

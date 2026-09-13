@@ -317,7 +317,8 @@ def run_command(
         handle.write(f"\n[{now()}] $ {' '.join(command)}\n")
         handle.flush()
         process = subprocess.Popen(
-            command, cwd=cwd, stdout=handle, stderr=subprocess.STDOUT,
+            command, cwd=cwd, stdin=subprocess.DEVNULL,
+            stdout=handle, stderr=subprocess.STDOUT,
             **child_process_kwargs(),
         )
         started = time.monotonic()
@@ -375,7 +376,7 @@ def load_runtime_env(path: Path) -> None:
             "CC_CLAUDE_WORKER_MEMORY",
             "CC_CLAUDE_DOCKER_IMAGE", "CC_CLAUDE_HEARTBEAT_SECONDS",
             "CC_CLAUDE_START_TIMEOUT", "CC_CLAUDE_STALLED_TIMEOUT",
-            "CC_PIPELINE_WORKER_TIMEOUT",
+            "CC_PIPELINE_WORKER_TIMEOUT", "CC_PIPELINE_MAX_ATTEMPTS",
             "CC_GATEWAY_MAX_ATTEMPTS", "CC_GATEWAY_BACKOFF_BASE",
             "CC_GATEWAY_BACKOFF_MAX", "CC_GATEWAY_CIRCUIT_THRESHOLD",
             "CC_GATEWAY_CIRCUIT_WINDOW", "CC_GATEWAY_CIRCUIT_COOLDOWN",
@@ -923,6 +924,12 @@ def cycle(args: argparse.Namespace, store: SchedulerStore | None = None) -> tupl
     try:
         args.worker_timeout = max(
             1, int(os.environ.get("CC_PIPELINE_WORKER_TIMEOUT", args.worker_timeout))
+        )
+    except ValueError:
+        pass
+    try:
+        args.max_attempts = max(
+            1, min(10, int(os.environ.get("CC_PIPELINE_MAX_ATTEMPTS", args.max_attempts)))
         )
     except ValueError:
         pass

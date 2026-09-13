@@ -61,7 +61,7 @@ PIPELINE_ENV_KEYS = (
     "CC_CLAUDE_WORKER_CPUS", "CC_CLAUDE_WORKER_MEMORY",
     "CC_CLAUDE_HEARTBEAT_SECONDS",
     "CC_CLAUDE_START_TIMEOUT", "CC_CLAUDE_STALLED_TIMEOUT",
-    "CC_PIPELINE_WORKER_TIMEOUT",
+    "CC_PIPELINE_WORKER_TIMEOUT", "CC_PIPELINE_MAX_ATTEMPTS",
     "CC_GATEWAY_MAX_ATTEMPTS", "CC_GATEWAY_BACKOFF_BASE",
     "CC_GATEWAY_BACKOFF_MAX", "CC_GATEWAY_CIRCUIT_THRESHOLD",
     "CC_GATEWAY_CIRCUIT_WINDOW", "CC_GATEWAY_CIRCUIT_COOLDOWN",
@@ -74,7 +74,7 @@ AUTHOR_JOB_OUTPUT_LIMIT = 200_000
 AUTHOR_JOB_STATUSES = {"queued", "running", "completed", "failed", "interrupted"}
 
 sys.path.insert(0, str(PROJECT_ROOT))
-from tools.runtime_environment import docker_info, repair_docker_engine  # noqa: E402
+from tools.runtime_environment import docker_info, process_alive, repair_docker_engine  # noqa: E402
 from tools.capacity import concurrency_recommendation as scheduler_capacity  # noqa: E402
 from tools.batch_pipeline import SCHEMA_VERSION, connect as initialize_database  # noqa: E402
 from tools.authoring_policy import backend_only_requirement  # noqa: E402
@@ -378,7 +378,7 @@ class ConsoleData:
         state = self.scheduler_store.state()
         heartbeat = str(state.get("heartbeat_at") or "")
         online = False
-        if heartbeat and state.get("pid"):
+        if heartbeat and process_alive(state.get("pid")):
             try:
                 age = (datetime.now().astimezone() - datetime.fromisoformat(heartbeat)).total_seconds()
                 online = 0 <= age <= 15
@@ -993,7 +993,8 @@ class ConsoleData:
                     "--model-concurrency", str(model_concurrency),
                     "--codex-concurrency", str(codex_concurrency),
                 ],
-                cwd=self.project_root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                cwd=self.project_root, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="replace", creationflags=flags,
                 start_new_session=os.name != "nt", env=pipeline_env,
             )
@@ -1621,8 +1622,12 @@ class ConsoleData:
                 heartbeat_age = max(0, int((datetime.now().astimezone() - datetime.fromisoformat(heartbeat)).total_seconds()))
             except ValueError:
                 pass
-        process_online = heartbeat_age is not None and heartbeat_age <= 15
+        process_online = (
+            heartbeat_age is not None and heartbeat_age <= 15
+            and process_alive(state.get("pid"))
+        )
         config = self.env_config()
+        max_attempts = int(config["max_attempts"])
         gateway_attempts = int(config["gateway_max_attempts"])
         with closing(self.connect()) as connection:
             queue = {
@@ -1638,10 +1643,10 @@ class ConsoleData:
                     "AND q.qc_prompt_sha256=q.prompt_sha256 "
                     "AND NOT EXISTS(SELECT 1 FROM runs s WHERE s.question_id=q.id AND s.status='succeeded') "
                     "AND (SELECT COUNT(*) FROM runs f WHERE f.question_id=q.id "
-                    "AND f.status IN ('failed','timeout') AND COALESCE(f.failure_kind,'')!='transient_gateway')<2 "
+                    "AND f.status IN ('failed','timeout') AND COALESCE(f.failure_kind,'')!='transient_gateway')<? "
                     "AND (SELECT COUNT(*) FROM runs g WHERE g.question_id=q.id "
                     "AND g.status='failed' AND g.failure_kind='transient_gateway')<?",
-                    (gateway_attempts,),
+                    (max_attempts, gateway_attempts),
                 ).fetchone()[0]),
                 "questions_running": int(connection.execute(
                     "SELECT COUNT(DISTINCT r.question_id) FROM runs r "
@@ -1653,10 +1658,10 @@ class ConsoleData:
                     "WHERE b.status NOT IN ('completed','partial','failed') "
                     "AND NOT EXISTS(SELECT 1 FROM runs s WHERE s.question_id=q.id AND s.status='succeeded') "
                     "AND ((SELECT COUNT(*) FROM runs f WHERE f.question_id=q.id "
-                    "AND f.status IN ('failed','timeout') AND COALESCE(f.failure_kind,'')!='transient_gateway')>=2 "
+                    "AND f.status IN ('failed','timeout') AND COALESCE(f.failure_kind,'')!='transient_gateway')>=? "
                     "OR (SELECT COUNT(*) FROM runs g WHERE g.question_id=q.id "
                     "AND g.status='failed' AND g.failure_kind='transient_gateway')>=?)",
-                    (gateway_attempts,),
+                    (max_attempts, gateway_attempts),
                 ).fetchone()[0]),
                 "deliveries_pending": int(connection.execute(
                     "SELECT COUNT(*) FROM questions q JOIN batches b ON b.id=q.batch_id "
@@ -1706,6 +1711,7 @@ class ConsoleData:
                 "ready_target": config["ready_target"],
                 "worker_cpus": config["worker_cpus"],
                 "worker_memory": config["worker_memory"],
+                "max_attempts": config["max_attempts"],
                 "news_feeds": config["news_feeds"],
             },
             "server_time": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -1765,7 +1771,7 @@ class ConsoleData:
         state = self.scheduler_store.state()
         heartbeat = str(state.get("heartbeat_at") or "")
         online = False
-        if heartbeat:
+        if heartbeat and process_alive(state.get("pid")):
             try:
                 online = (datetime.now().astimezone() - datetime.fromisoformat(heartbeat)).total_seconds() <= 15
             except ValueError:
@@ -1822,7 +1828,8 @@ class ConsoleData:
             } if os.name == "nt" else {"start_new_session": True}
             subprocess.Popen(
                 [sys.executable, str(self.project_root / "tools" / "pipeline_daemon.py"), "--loop"],
-                cwd=self.project_root, stdout=log, stderr=subprocess.STDOUT,
+                cwd=self.project_root, stdin=subprocess.DEVNULL,
+                stdout=log, stderr=subprocess.STDOUT,
                 **process_kwargs,
             )
         except OSError:
@@ -1961,6 +1968,7 @@ class ConsoleData:
             "worker_cpus": values.get("CC_CLAUDE_WORKER_CPUS", "1").strip() or "1",
             "worker_memory": values.get("CC_CLAUDE_WORKER_MEMORY", "2g").strip().lower() or "2g",
             "worker_timeout": env_bounded("CC_PIPELINE_WORKER_TIMEOUT", 3600, 28800),
+            "max_attempts": env_bounded("CC_PIPELINE_MAX_ATTEMPTS", 2, 10),
             "gateway_max_attempts": env_bounded("CC_GATEWAY_MAX_ATTEMPTS", 3, 10),
             "gateway_backoff_base": env_bounded("CC_GATEWAY_BACKOFF_BASE", 30),
             "gateway_backoff_max": env_bounded("CC_GATEWAY_BACKOFF_MAX", 300),
@@ -2277,6 +2285,14 @@ class ConsoleData:
             raise ValueError("单题硬超时配置无效") from exc
         if not 600 <= worker_timeout <= 28800:
             raise ValueError("单题硬超时必须是 600-28800 秒")
+        try:
+            max_attempts = int(body.get(
+                "max_attempts", current.get("CC_PIPELINE_MAX_ATTEMPTS", "2") or "2"
+            ))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("模型实现最大尝试次数配置无效") from exc
+        if not 1 <= max_attempts <= 10:
+            raise ValueError("模型实现最大尝试次数必须是 1-10")
         gateway_values = {}
         for field, env_key, default, maximum in (
             ("gateway_max_attempts", "CC_GATEWAY_MAX_ATTEMPTS", 3, 10),
@@ -2347,6 +2363,7 @@ class ConsoleData:
             "CC_CLAUDE_WORKER_CPUS": str(worker_cpus).rstrip("0").rstrip("."),
             "CC_CLAUDE_WORKER_MEMORY": worker_memory,
             "CC_PIPELINE_WORKER_TIMEOUT": str(worker_timeout),
+            "CC_PIPELINE_MAX_ATTEMPTS": str(max_attempts),
             **concurrency_values,
             **gateway_values,
             "CC_SOLO2_ORIGIN": solo2_origin,
@@ -3064,7 +3081,8 @@ class ConsoleData:
             if not isinstance(supplied_evidence, list):
                 raise ValueError("evidence_ledger 必须是数组")
             immutable_source_fields = (
-                "source_type", "line", "path", "source_sha256", "excerpt"
+                "source_type", "kind", "line", "related_line", "path",
+                "source_sha256", "excerpt",
             )
             for item in supplied_evidence:
                 if not isinstance(item, dict):

@@ -12,7 +12,8 @@ from difflib import SequenceMatcher
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from tools.delivery_quality import (
-    evidence_ledger_sha256, prose_english_issues, validate_evidence_structure,
+    evidence_ledger_sha256, non_model_environment_issues, prose_english_issues,
+    validate_evidence_structure,
 )
 
 
@@ -82,6 +83,11 @@ DESCRIPTION_TEMPLATE_PATTERNS = (
     re.compile(r"^\s*(?:经检查|通过检查|根据轨迹|从轨迹看|结合轨迹|综合来看|总体来看|本次任务中|本轮任务中|总体而言|综上所述|值得注意的是|需要指出的是)[，,:：]?"),
     re.compile(r"[→➡]"),
     re.compile(r"【(?:第几步|哪个环节|具体行为|什么后果|根因|正确做法|哪个文件|哪个功能)】"),
+)
+CHINESE_ORDINAL_RE = re.compile(
+    r"第[零〇一二两三四五六七八九十百千万]+"
+    r"(?=(?:至第?[零〇一二两三四五六七八九十百千万]+)?"
+    r"(?:行|步|次|轮|个|处|阶段|条|项|章|节|题|页|列|点))"
 )
 
 
@@ -156,10 +162,13 @@ def _description_style_errors(description: str, *, minimum: int = MIN_DESCRIPTIO
         errors.append("不得包含评价者自述、评分质检、模型表现或生成过程措辞")
     if any(pattern.search(description) for pattern in DESCRIPTION_TEMPLATE_PATTERNS):
         errors.append("不得使用固定标签、套话开头、箭头或占位模板")
+    if CHINESE_ORDINAL_RE.search(description):
+        errors.append("序号必须使用阿拉伯数字，例如第80行")
     prose = re.sub(r"```.*?```|`[^`]*`|https?://\S+", " ", description, flags=re.DOTALL)
     if UNNECESSARY_ENGLISH_RE.search(prose):
         errors.append("不得使用可由中文直接表达的英文评价或衔接词")
     errors.extend(prose_english_issues(description))
+    errors.extend(non_model_environment_issues(description))
     return errors
 
 

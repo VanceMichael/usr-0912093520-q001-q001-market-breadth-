@@ -195,6 +195,34 @@ def unique_path(path: Path) -> Path:
     raise ValueError(f"too many existing exports for {path.name}")
 
 
+def trajectory_identity(path: Path, session_id: str) -> None:
+    """Require the exported JSONL to contain only the selected Claude session."""
+    matched = False
+    foreign: set[str] = set()
+    with path.open(encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, 1):
+            if not line.strip():
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"invalid JSONL at {path}:{line_number}: {exc}") from exc
+            if not isinstance(event, dict):
+                raise ValueError(f"trajectory event is not an object at {path}:{line_number}")
+            event_session = str(event.get("sessionId") or event.get("session_id") or "")
+            if event_session == session_id:
+                matched = True
+            elif event_session:
+                foreign.add(event_session)
+    if not matched:
+        raise ValueError(f"trajectory does not contain SessionID {session_id}: {path}")
+    if foreign:
+        raise ValueError(
+            f"trajectory contains foreign SessionIDs for {session_id}: "
+            + ", ".join(sorted(foreign))
+        )
+
+
 def trajectory_sources(roots_by_question: dict[int, list[Path]], records: list[dict]) -> list[tuple[int, Path]]:
     requested: dict[tuple[int, str, str], None] = {}
     for record in records:
@@ -229,6 +257,7 @@ def trajectory_sources(roots_by_question: dict[int, list[Path]], records: list[d
             raise ValueError(
                 f"trajectory is ambiguous for question {question_no}: {filename}"
             )
+        trajectory_identity(candidates[0], session_id)
         located.append((question_no, candidates[0]))
     return located
 

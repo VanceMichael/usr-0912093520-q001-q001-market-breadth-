@@ -185,7 +185,7 @@ class Pipeline:
         self.log("$ " + " ".join(self._safe_arg(value) for value in command[:5]) + (" ..." if len(command) > 5 else ""))
         process = subprocess.Popen(
             command, cwd=cwd or self.project_root, text=True, encoding="utf-8", errors="replace",
-            stdin=subprocess.PIPE if stdin_text is not None else None,
+            stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             env=python_subprocess_env(),
         )
@@ -480,7 +480,11 @@ class Pipeline:
         env.update({"ANTHROPIC_BASE_URL": config["CC_SWITCH_BASE_URL"], "ANTHROPIC_AUTH_TOKEN": config["CC_SWITCH_API_KEY"], "ANTHROPIC_MODEL": config["CC_SWITCH_MODEL"]})
         self.log(f"题目 {row['task_id']}：启动 Docker Claude CLI（仅传 SQLite 原始 Prompt）")
         started = datetime.now().astimezone().isoformat(timespec="seconds")
-        process = subprocess.Popen(command_line, cwd=self.project_root, env=env, text=True, encoding="utf-8", errors="replace", stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        process = subprocess.Popen(
+            command_line, cwd=self.project_root, env=env, text=True,
+            encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
         assert process.stdout is not None
         lines: Queue[str | None] = Queue()
 
@@ -638,7 +642,8 @@ class Pipeline:
         self.log(f"题目 {row['task_id']}：启动本地 Claude CLI（仅传 SQLite 原始 Prompt）")
         process = subprocess.Popen(
             command_line, cwd=Path(row["folder_path"]), env=env, text=True,
-            encoding="utf-8", errors="replace", stdout=subprocess.PIPE,
+            encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
         )
         assert process.stdout is not None
@@ -833,10 +838,16 @@ class Pipeline:
                 "只依据匹配的原始 Claude JSONL、SQLite、初始快照、Git diff 和真实产物评分；"
                 "为每个有效轮次生成临时 JSON 并使用 collect_record.py --from-json 写入 SQLite。"
                 "28 个交付字段必须完整记录，其中当前对话轮次排序使用原始 JSONL 中该会话的真实轮次顺序；"
+                "证据账本的新记录必须为每条证据填写 kind：requirement 只引用 prompt，product 只引用 workspace，"
+                "process 只引用本轮 trajectory 的 tool_use 或 thinking，runtime 只引用 tool_result，"
+                "并通过 related_line 指回同一轮次中先发生且 tool id 匹配的 tool_use；"
                 "功能成功结论必须由目标轮次结束前写入原始 JSONL 的真实测试输出、实际服务交互或其他运行证据支撑，"
                 "不能只凭静态代码阅读、文件存在或最终回复判定；纯后端题不要求浏览器测试。"
-                "测试或实跑失败仍须生成交付记录，如实说明失败行为和影响并降低对应维度。"
+                "测试或实跑失败仍须生成交付记录，但必须先判断责任归属；只有模型自身代码、决策或工具使用造成的失败才能写入描述并降低对应维度。"
+                "宿主环境缺少命令或预装依赖、Docker 守护进程不可用、网络或镜像仓库失败、权限、证书、网关等外部问题只保留在原始轨迹中，"
+                "不得写入五维描述或其他问题，也不得据此扣分；模型写错 Dockerfile 或 Compose、已知外因后仍无效重试、虚假宣称成功仍可据实扣分。"
                 "五项评分描述必须各自保持单段、至少 45 个汉字且不超过 420 个字符；五项描述和非空的其他问题必须使用自然中文书面语，"
+                "行号、步骤、轮次等序号必须使用阿拉伯数字，例如第80行，不得写第八十行；"
                 "直接写文件、函数、命令、报错、测试结果、明确需求或原始轨迹动作等可核验证据，"
                 "不得出现评价者自述、评分质检、模型表现、生成过程、固定标签、套话开头或统一句式。"
                 "不得修改题目代码、轨迹或仓库，不得编造 SessionID、PromptID、评分证据。"

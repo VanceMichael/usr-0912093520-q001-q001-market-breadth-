@@ -1,4 +1,5 @@
 import os
+import subprocess
 import tempfile
 import threading
 import time
@@ -22,13 +23,14 @@ from tools.pipeline_daemon import (
     difficulty_distribution,
     difficulty_plan,
     load_runtime_env,
+    run_command,
     count_new_topics,
     maintain_ready_buffer,
     manual_jobs_active,
     pipeline_batch_timeout,
     recover_interrupted_authoring,
 )
-from tools.batch_pipeline import connect
+from tools.batch_pipeline import connect, prompt_hash
 from tools.scheduler_state import SchedulerStore
 
 
@@ -36,12 +38,14 @@ def test_runtime_env_loads_escaped_difficulty_weights() -> None:
     with tempfile.TemporaryDirectory() as raw:
         env_file = Path(raw) / ".env"
         env_file.write_text(
-            'CC_AUTHOR_DIFFICULTY_WEIGHTS="{\\"中等\\":50,\\"困难\\":30,\\"地狱\\":20}"\n',
+            'CC_AUTHOR_DIFFICULTY_WEIGHTS="{\\"中等\\":50,\\"困难\\":30,\\"地狱\\":20}"\n'
+            'CC_PIPELINE_MAX_ATTEMPTS=4\n',
             encoding="utf-8",
         )
         with mock.patch.dict(os.environ, {}, clear=True):
             load_runtime_env(env_file)
             plan = difficulty_plan()
+            assert os.environ["CC_PIPELINE_MAX_ATTEMPTS"] == "4"
         assert plan == {"中等": 50, "困难": 30, "地狱": 20}
         assert difficulty_distribution(10, plan) == "中等 5 道（50%）、困难 3 道（30%）、地狱 2 道（20%）"
 
@@ -51,6 +55,20 @@ def test_child_process_kwargs_use_windows_process_group_without_importing_fcntl(
         __import__("subprocess"), "CREATE_NEW_PROCESS_GROUP", 512, create=True
     ), mock.patch.object(__import__("subprocess"), "CREATE_NO_WINDOW", 2048, create=True):
         assert child_process_kwargs() == {"creationflags": 2560}
+
+
+def test_daemon_child_process_has_no_inherited_stdin() -> None:
+    process = mock.Mock(returncode=0)
+    process.poll.return_value = 0
+    with tempfile.TemporaryDirectory() as raw, mock.patch(
+        "tools.pipeline_daemon.subprocess.Popen", return_value=process
+    ) as popen:
+        result = run_command(
+            ["worker"], Path(raw), Path(raw) / "worker.log", timeout=10,
+        )
+
+    assert result == 0
+    assert popen.call_args.kwargs["stdin"] is subprocess.DEVNULL
 
 
 def test_cleanup_logs_removes_expired_files_only() -> None:
@@ -469,10 +487,14 @@ def test_authored_batch_must_have_every_question_ready() -> None:
                     "INSERT INTO questions(batch_id,question_no,task_id,folder_name,folder_path,title,prompt,"
                     "prompt_sha256,task_type,difficulty,languages,repo_url,initial_snapshot,local_initial_sha,"
                     "reproducibility,mechanical_qc,qc_decision,qc_prompt_sha256,status,created_at,updated_at) "
-                    "VALUES(?,?,?,?,?,'title','prompt','hash','0-1 代码生成','中等','Python',"
+                    "VALUES(?,?,?,?,?,'title','prompt',?,'0-1 代码生成','中等','[\"Python\",\"SQLite\"]',"
                     "'https://github.com/org/repo','https://github.com/org/repo/commit/sha','sha',"
-                    "'无外部依赖','pass','pass','hash',?,'now','now')",
-                    (batch_id, number, f"task-{number}", f"q{number}", str(root / f"q{number}"), status),
+                    "'无外部依赖','pass','pass',?,?,'now','now')",
+                    (
+                        batch_id, number, f"task-{number}", f"q{number}",
+                        str(root / f"q{number}"), prompt_hash("prompt"),
+                        prompt_hash("prompt"), status,
+                    ),
                 )
             connection.commit()
         assert authored_batch_result(database, "batch", 2) == (False, 2, 1)
