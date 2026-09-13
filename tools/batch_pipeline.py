@@ -904,6 +904,19 @@ def persistence_technologies(languages: list[str]) -> set[str]:
     return result
 
 
+def sqlite_only_technology_issues(languages: list[str]) -> list[str]:
+    """Reject non-SQLite persistence in automatically authored batches."""
+    stores = persistence_technologies(languages)
+    if not stores:
+        return ["自动出题题目必须声明 SQLite 持久化存储"]
+    external = sorted(stores - {"sqlite"})
+    if external:
+        return [
+            "自动出题批次禁止使用外部存储：" + "、".join(external)
+        ]
+    return []
+
+
 def technology_diversity_issues(
     language_sets: list[list[str]], policy: str = "diverse", fixed_reason: str = "",
 ) -> list[str]:

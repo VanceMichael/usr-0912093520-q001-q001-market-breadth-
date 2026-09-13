@@ -31,8 +31,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from tools.batch_pipeline import connect  # noqa: E402
-from tools.authoring_policy import backend_only_requirement  # noqa: E402
+from tools.batch_pipeline import connect, prompt_hash, sqlite_only_technology_issues  # noqa: E402
+from tools.authoring_policy import backend_only_requirement, sqlite_only_requirement  # noqa: E402
 from tools.news_topics import DEFAULT_FEEDS, configured_feeds, ingest, ingest_report  # noqa: E402
 from tools.orchestrator import clear_question_leases  # noqa: E402
 from tools.run_supervisor import write_supervisor_state  # noqa: E402
@@ -542,7 +542,7 @@ def author_prompt(topics: list[dict], batch: str, batch_size: int, distribution:
 批次名：{batch}
 题目数量：{batch_size}
 难度分配：{distribution}
-出题要求：业务关键词：从 {sources} 读取主题来进行出题，本轮必须按下方新闻主题清单的 question_no 将主题与题目一一绑定，每条新闻必须且只能生成一道题，不得遗漏、复用、合并主题或从同一主题派生多道题；技术关键词：需要 Docker，每道题的初始工程必须提供 Dockerfile，有外部依赖时同时提供 Docker Compose，并支持通过命令完成构建和验收；补充要求：在整批中合理覆盖 Node.js（JavaScript 或 TypeScript）、Python、Go、Java，每道题只选择其中一种主要后端技术栈。{backend_only_requirement()}每道题的 difficulty 字段必须严格按上述题数分配，不得擅自改变题数或难度。新闻只作为业务背景种子，不要复制新闻标题，不要把新闻事实当成实现要求，也不要使用新闻网站代码或受版权保护的正文。先检查 production.sqlite3 中已有题目，发现重复或模板化表达必须重写。
+出题要求：业务关键词：从 {sources} 读取主题来进行出题，本轮必须按下方新闻主题清单的 question_no 将主题与题目一一绑定，每条新闻必须且只能生成一道题，不得遗漏、复用、合并主题或从同一主题派生多道题；技术关键词：{sqlite_only_requirement()}补充要求：在整批中合理覆盖 Node.js（JavaScript 或 TypeScript）、Python、Go、Java，每道题只选择其中一种主要后端技术栈。{backend_only_requirement()}每道题的 difficulty 字段必须严格按上述题数分配，不得擅自改变题数或难度。新闻只作为业务背景种子，不要复制新闻标题，不要把新闻事实当成实现要求，也不要使用新闻网站代码或受版权保护的正文。先检查 production.sqlite3 中已有题目，发现重复或模板化表达必须重写。
 新闻主题清单：{context}
 严格遵守 项目规范.md。完成真实初始工程、GitHub 可访问快照和登记后，运行出题机械质检，并使用 $cc-usr-question-qc 完成重复、自然度和反模板质检；不要启动目标模型，也不要亲自调用 Claude 目标模型，出题会话正常结束后将由调度器自动接管后续模型流水线。不得读取、调用或修改 SchedulerStore、scheduler_state、scheduler_controls、调度器控制接口、守护进程状态或服务启停状态，也不得为了阻止目标模型而暂停、停止或重启调度器。全过程只修改本项目和题目工作区，完成后直接输出批次名、每题状态和任何阻塞原因。"""
 
@@ -566,13 +566,28 @@ def authored_batch_result(database: Path, batch: str, expected_count: int) -> tu
         total = int(connection.execute(
             "SELECT COUNT(*) FROM questions WHERE batch_id=?", (batch_row["id"],),
         ).fetchone()[0])
-        ready = int(connection.execute(
-            "SELECT COUNT(*) FROM questions WHERE batch_id=? AND status='approved' "
-            "AND mechanical_qc='pass' AND qc_decision='pass' "
-            "AND qc_prompt_sha256=prompt_sha256 AND repo_url<>'' "
-            "AND initial_snapshot<>'' AND local_initial_sha<>''",
+        rows = connection.execute(
+            "SELECT status,mechanical_qc,qc_decision,qc_prompt_sha256,prompt,repo_url,"
+            "initial_snapshot,local_initial_sha,languages FROM questions WHERE batch_id=?",
             (batch_row["id"],),
-        ).fetchone()[0])
+        ).fetchall()
+        ready = 0
+        for row in rows:
+            try:
+                languages = json.loads(row["languages"])
+            except (TypeError, json.JSONDecodeError):
+                languages = []
+            if (
+                row["status"] == "approved"
+                and row["mechanical_qc"] == "pass"
+                and row["qc_decision"] == "pass"
+                and row["qc_prompt_sha256"] == prompt_hash(row["prompt"])
+                and row["repo_url"]
+                and row["initial_snapshot"]
+                and row["local_initial_sha"]
+                and not sqlite_only_technology_issues(languages)
+            ):
+                ready += 1
         complete = (
             int(batch_row["question_count"]) == expected_count
             and total == expected_count

@@ -25,6 +25,7 @@ from tools.batch_pipeline import (  # noqa: E402
     prompt_style_issues,
     repeated_terminal_sentence,
     snapshot_content_issues,
+    sqlite_only_technology_issues,
     technology_diversity_issues,
 )
 
@@ -187,6 +188,12 @@ class BatchPipelineTests(unittest.TestCase):
             ["Java", "Quarkus", "PostgreSQL"],
         ]
         self.assertEqual(technology_diversity_issues(stacks), [])
+
+    def test_sqlite_only_technology_gate_rejects_external_stores(self):
+        self.assertEqual(sqlite_only_technology_issues(["Python", "FastAPI", "SQLite"]), [])
+        issues = sqlite_only_technology_issues(["Python", "FastAPI", "PostgreSQL"])
+        self.assertTrue(any("PostgreSQL".casefold() in issue.casefold() for issue in issues))
+        self.assertTrue(sqlite_only_technology_issues(["Go", "Chi"]))
 
     def test_fixed_technology_policy_requires_explicit_reason(self):
         stacks = [["Go", "SQLite"] for _ in range(10)]

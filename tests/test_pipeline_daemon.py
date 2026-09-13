@@ -106,7 +106,10 @@ def test_automatic_author_prompt_is_backend_only() -> None:
     assert "题目数量：10" in prompt
     assert "难度分配：中等 10 道（100%）" in prompt
     assert "业务关键词：从 https://news.example.com/ 读取主题来进行出题" in prompt
-    assert "技术关键词：需要 Docker" in prompt
+    assert "自动出题批次只允许使用 SQLite 作为持久化存储" in prompt
+    assert "不得使用 PostgreSQL、Redis、MongoDB、MySQL 或其他外部数据库和缓存服务" in prompt
+    assert "Dockerfile" not in prompt
+    assert "docker-compose" not in prompt
     assert "在整批中合理覆盖 Node.js（JavaScript 或 TypeScript）、Python、Go、Java" in prompt
     assert "每道题只选择其中一种主要后端技术栈" in prompt
     assert "每条新闻必须且只能生成一道题" in prompt

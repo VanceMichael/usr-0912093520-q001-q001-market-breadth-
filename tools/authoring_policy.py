@@ -12,6 +12,16 @@ BACKEND_LANGUAGES = (
 )
 
 
+def sqlite_only_requirement() -> str:
+    """Return the storage boundary for automatically authored batches."""
+    return (
+        "自动出题批次只允许使用 SQLite 作为持久化存储；不得使用 PostgreSQL、Redis、"
+        "MongoDB、MySQL 或其他外部数据库和缓存服务。数据库文件必须位于当前题目工作目录"
+        "或由环境变量配置，必须提供初始化/迁移命令和自动化测试命令，不得依赖共享服务、"
+        "固定账号、固定端口或外部网络。"
+    )
+
+
 def backend_only_requirement() -> str:
     languages = "、".join(BACKEND_LANGUAGES)
     return (
