@@ -69,6 +69,7 @@ def approve_and_submit(
     *,
     reviewer: str,
     max_attempts: int,
+    timeout: float,
 ) -> dict[str, object]:
     approved: list[str] = []
     approval_failures: list[dict[str, str]] = []
@@ -97,6 +98,7 @@ def approve_and_submit(
             record_ids={record_id},
             limit=1,
             max_attempts=max_attempts,
+            timeout=timeout,
             manual=False,
         )
         if record_id and not approval_failures
@@ -128,17 +130,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--origin", default="https://solo2.jzxhnh.com")
     parser.add_argument("--reviewer", default="gaoyong")
     parser.add_argument("--max-attempts", type=int, default=3)
+    parser.add_argument("--timeout", type=float, default=120.0)
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    if args.timeout <= 0 or args.timeout > 600:
+        raise SystemExit("--timeout must be between 0 and 600 seconds")
     result = approve_and_submit(
         args.db.resolve(),
         args.cookie_file.resolve(),
         args.origin,
         reviewer=args.reviewer,
         max_attempts=args.max_attempts,
+        timeout=args.timeout,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2))
     return 0 if result["ok"] else 1

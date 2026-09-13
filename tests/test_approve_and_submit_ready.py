@@ -52,6 +52,22 @@ class ApproveAndSubmitReadyTests(unittest.TestCase):
         self.assertEqual(worker._next_record(Path("db.sqlite3"), 3), ("ready", True))
         self.assertEqual(review_queue.call_count, 2)
 
+    @mock.patch.object(worker, "submit_records")
+    @mock.patch.object(worker, "_next_record", return_value=("record-1", False))
+    @mock.patch.object(worker, "connect")
+    def test_submit_passes_extended_timeout_and_single_record(self, connect, next_record, submit):
+        connection = connect.return_value.__enter__.return_value
+        connection.execute.return_value.fetchone.return_value = (0,)
+        submit.return_value = {"submitted": 0, "skipped": 0, "failed": 0, "results": []}
+
+        worker.approve_and_submit(
+            Path("db.sqlite3"), Path("cookies"), "https://solo2.jzxhnh.com",
+            reviewer="gaoyong", max_attempts=3, timeout=120,
+        )
+        submit.assert_called_once()
+        self.assertEqual(submit.call_args.kwargs["limit"], 1)
+        self.assertEqual(submit.call_args.kwargs["timeout"], 120)
+
 
 if __name__ == "__main__":
     unittest.main()
