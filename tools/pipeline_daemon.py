@@ -707,6 +707,7 @@ def run_batch(database: Path, args: argparse.Namespace, batch: str, store: Sched
             "--codex-concurrency", str(args.codex_concurrency),
             "--agent-timeout", str(args.agent_timeout),
             "--max-attempts", str(args.max_attempts),
+            "--delivery-max-attempts", str(args.delivery_max_attempts),
             "--gateway-max-attempts", str(args.gateway_max_attempts),
             "--gateway-backoff-base", str(args.gateway_backoff_base),
             "--gateway-backoff-max", str(args.gateway_backoff_max),
@@ -749,6 +750,7 @@ def run_global_queue(
             "--codex-concurrency", str(args.codex_concurrency),
             "--agent-timeout", str(args.agent_timeout),
             "--max-attempts", str(args.max_attempts),
+            "--delivery-max-attempts", str(args.delivery_max_attempts),
             "--gateway-max-attempts", str(args.gateway_max_attempts),
             "--gateway-backoff-base", str(args.gateway_backoff_base),
             "--gateway-backoff-max", str(args.gateway_backoff_max),
@@ -881,6 +883,7 @@ def cycle(args: argparse.Namespace, store: SchedulerStore | None = None) -> tupl
     args.global_idle_timeout = getattr(args, "global_idle_timeout", 1800)
     args.worker_timeout = getattr(args, "worker_timeout", 3600)
     args.max_attempts = getattr(args, "max_attempts", 2)
+    args.delivery_max_attempts = getattr(args, "delivery_max_attempts", 5)
     for field, default in (
         ("gateway_max_attempts", 3),
         ("gateway_backoff_base", 30),
@@ -930,6 +933,20 @@ def cycle(args: argparse.Namespace, store: SchedulerStore | None = None) -> tupl
     try:
         args.max_attempts = max(
             1, min(10, int(os.environ.get("CC_PIPELINE_MAX_ATTEMPTS", args.max_attempts)))
+        )
+    except ValueError:
+        pass
+    try:
+        args.delivery_max_attempts = max(
+            1,
+            min(
+                10,
+                int(
+                    os.environ.get(
+                        "CC_PIPELINE_DELIVERY_MAX_ATTEMPTS", args.delivery_max_attempts
+                    )
+                ),
+            ),
         )
     except ValueError:
         pass
@@ -1030,6 +1047,7 @@ def main() -> int:
     parser.add_argument("--concurrency", type=int, default=2)
     parser.add_argument("--codex-concurrency", type=int, default=1)
     parser.add_argument("--max-attempts", type=int, default=2)
+    parser.add_argument("--delivery-max-attempts", type=int, default=5)
     parser.add_argument("--gateway-max-attempts", type=int, default=3)
     parser.add_argument("--gateway-backoff-base", type=int, default=30)
     parser.add_argument("--gateway-backoff-max", type=int, default=300)

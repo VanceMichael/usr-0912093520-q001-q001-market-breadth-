@@ -1469,7 +1469,7 @@ def main() -> int:
     parser.add_argument("--all-active", action="store_true")
     parser.add_argument("--producer-sentinel", type=Path)
     parser.add_argument("--idle-timeout", type=int, default=30)
-    parser.add_argument("--delivery-max-attempts", type=int, default=2)
+    parser.add_argument("--delivery-max-attempts", type=int, default=5)
     parser.add_argument("--codex", default="codex")
     parser.add_argument("--codex-concurrency", type=int, default=1)
     parser.add_argument("--agent-timeout", type=int, default=3600)
@@ -1482,6 +1482,8 @@ def main() -> int:
         parser.error("--concurrency must be positive")
     if args.codex_concurrency < 1:
         parser.error("--codex-concurrency must be positive")
+    if not 1 <= args.delivery_max_attempts <= 10:
+        parser.error("--delivery-max-attempts must be between 1 and 10")
     if args.concurrency > 32 or args.codex_concurrency > 32:
         parser.error("concurrency must not exceed 32")
     if min(
