@@ -12,12 +12,28 @@ from tools.batch_pipeline import connect, create_batch, prompt_hash, set_reposit
 from webapp.server import (
     ConsoleData,
     codex_review_schema,
+    deliverable_repair_items,
     open_local_path,
     parse_codex_review,
     runtime_info,
     safe_console_print,
     secure_file,
 )
+
+
+class RepairPolicyTests(unittest.TestCase):
+    def test_filters_non_deliverable_repair_difficulties(self) -> None:
+        items = [
+            {"id": 1, "difficulty": "中等"},
+            {"id": 2, "difficulty": "困难"},
+            {"id": 3, "difficulty": "地狱"},
+            {"id": 4, "difficulty": ""},
+        ]
+
+        self.assertEqual(
+            [item["id"] for item in deliverable_repair_items(items)],
+            [2, 3],
+        )
 
 
 def question_spec(batch: str) -> dict:

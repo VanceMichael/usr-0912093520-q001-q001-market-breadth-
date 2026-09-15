@@ -73,6 +73,14 @@ AUTHOR_DIFFICULTIES = ("困难", "地狱")
 AUTHOR_JOB_OUTPUT_LIMIT = 200_000
 AUTHOR_JOB_STATUSES = {"queued", "running", "completed", "failed", "interrupted"}
 
+
+def deliverable_repair_items(items: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Keep only repair rows eligible under the current delivery policy."""
+    return [
+        item for item in items
+        if str(item.get("difficulty") or "").strip() in AUTHOR_DIFFICULTIES
+    ]
+
 sys.path.insert(0, str(PROJECT_ROOT))
 from tools.runtime_environment import docker_info, process_alive, repair_docker_engine  # noqa: E402
 from tools.capacity import concurrency_recommendation as scheduler_capacity  # noqa: E402
@@ -3439,6 +3447,9 @@ class ConsoleData:
             raise ValueError("SOLO2 待返修分页数量超过安全上限，请缩小平台筛选范围")
         for page in range(2, total_pages + 1):
             items.extend(client.list_submissions(stage="PENDING_FIX", page=page, page_size=100).get("items") or [])
+        remote_total = int(meta.get("total") or len(items))
+        items = deliverable_repair_items(items)
+        filtered_out = max(0, remote_total - len(items))
         timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
         with closing(self.connect_rw()) as connection:
             local_rows = connection.execute("SELECT record_id,session_id,turn_id FROM records").fetchall()
@@ -3490,7 +3501,15 @@ class ConsoleData:
                     )
             connection.commit()
             rows = connection.execute("SELECT * FROM solo2_repairs WHERE status='PENDING_FIX' ORDER BY updated_at DESC,remote_id DESC").fetchall()
-        return {"ok": True, "items": [dict(row) for row in rows], "meta": {"total": len(rows), "remote_total": int(meta.get("total") or len(items))}}
+        return {
+            "ok": True,
+            "items": [dict(row) for row in rows],
+            "meta": {
+                "total": len(rows),
+                "remote_total": remote_total,
+                "filtered_out": filtered_out,
+            },
+        }
 
     def solo2_repair_detail(self, remote_id: int) -> dict[str, object]:
         client = self._solo2_client()
