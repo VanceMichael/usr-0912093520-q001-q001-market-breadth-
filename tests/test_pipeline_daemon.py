@@ -46,8 +46,8 @@ def test_runtime_env_loads_escaped_difficulty_weights() -> None:
             load_runtime_env(env_file)
             plan = difficulty_plan()
             assert os.environ["CC_PIPELINE_MAX_ATTEMPTS"] == "4"
-        assert plan == {"中等": 50, "困难": 30, "地狱": 20}
-        assert difficulty_distribution(10, plan) == "中等 5 道（50%）、困难 3 道（30%）、地狱 2 道（20%）"
+        assert plan == {"困难": 30, "地狱": 20}
+        assert difficulty_distribution(10, plan) == "困难 6 道（60%）、地狱 4 道（40%）"
 
 
 def test_child_process_kwargs_use_windows_process_group_without_importing_fcntl() -> None:
@@ -122,7 +122,7 @@ def test_automatic_author_prompt_is_backend_only() -> None:
     assert prompt.startswith("使用 $cc-usr-question-author 创建批次。\n")
     assert "批次名：news-20260909-001" in prompt
     assert "题目数量：10" in prompt
-    assert "难度分配：中等 10 道（100%）" in prompt
+    assert "难度分配：困难 10 道（100%）" in prompt
     assert "业务关键词：从 https://news.example.com/ 读取主题来进行出题" in prompt
     assert "自动出题批次只允许使用 SQLite 作为持久化存储" in prompt
     assert "不得使用 PostgreSQL、Redis、MongoDB、MySQL 或其他外部数据库和缓存服务" in prompt
@@ -153,7 +153,7 @@ def test_author_prompt_lists_each_configured_news_source_once() -> None:
         {"source_url": "https://news.example.com/a", "title": "b"},
         {"source_url": "https://news.example.com/b", "title": "c"},
     ]
-    prompt = author_prompt(topics, "091001", 3, "中等 2 道（67%）、困难 1 道（33%）")
+    prompt = author_prompt(topics, "091001", 3, "困难 2 道（67%）、地狱 1 道（33%）")
     requirement = next(line for line in prompt.splitlines() if line.startswith("出题要求："))
     assert requirement.count("https://news.example.com/a") == 1
     assert requirement.count("https://news.example.com/b") == 1
@@ -368,7 +368,7 @@ def test_recover_interrupted_authoring_preserves_complete_batch() -> None:
                 "INSERT INTO questions(batch_id,question_no,task_id,folder_name,folder_path,title,prompt,prompt_sha256,"
                 "task_type,difficulty,languages,repo_url,initial_snapshot,local_initial_sha,reproducibility,"
                 "mechanical_qc,qc_decision,qc_prompt_sha256,status,created_at,updated_at) "
-                "VALUES(?,1,'task','q001',?,'title','prompt','hash','0-1 代码生成','中等','Python',"
+                "VALUES(?,1,'task','q001',?,'title','prompt','hash','0-1 代码生成','困难','Python',"
                 "'https://github.com/org/repo','https://github.com/org/repo/commit/sha','sha','ok',"
                 "'pass','pass','hash','approved','now','now')",
                 (batch_id, str(root / "q001")),
@@ -487,7 +487,7 @@ def test_authored_batch_must_have_every_question_ready() -> None:
                     "INSERT INTO questions(batch_id,question_no,task_id,folder_name,folder_path,title,prompt,"
                     "prompt_sha256,task_type,difficulty,languages,repo_url,initial_snapshot,local_initial_sha,"
                     "reproducibility,mechanical_qc,qc_decision,qc_prompt_sha256,status,created_at,updated_at) "
-                    "VALUES(?,?,?,?,?,'title','prompt',?,'0-1 代码生成','中等','[\"Python\",\"SQLite\"]',"
+                    "VALUES(?,?,?,?,?,'title','prompt',?,'0-1 代码生成','困难','[\"Python\",\"SQLite\"]',"
                     "'https://github.com/org/repo','https://github.com/org/repo/commit/sha','sha',"
                     "'无外部依赖','pass','pass',?,?,'now','now')",
                     (

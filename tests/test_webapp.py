@@ -339,7 +339,7 @@ class WebConsoleTests(unittest.TestCase):
             {1, 3, 4, 5},
         )
 
-    def test_export_passes_batch_runs_as_trajectory_root(self):
+    def test_export_uses_registered_run_roots_and_keeps_hash_gate_enabled(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             database = self.make_database(root)
@@ -350,9 +350,7 @@ class WebConsoleTests(unittest.TestCase):
                 ) as run_tool:
                     data.export("0911", None)
                 command = run_tool.call_args.args[0]
-                self.assertIn("--claude-root", command)
-                root_index = command.index("--claude-root") + 1
-                self.assertEqual(Path(command[root_index]), root / "0911" / ".runs")
+                self.assertNotIn("--claude-root", command)
             finally:
                 data.author_executor.shutdown(wait=True)
                 data.pipeline_executor.shutdown(wait=True)
@@ -698,34 +696,40 @@ class WebConsoleTests(unittest.TestCase):
                 "api_key": "api-secret",
                 "submitter": "提交人",
                 "github_token": token,
-                "author_difficulty_weights": {"中等": 50, "困难": 30, "地狱": 20},
+                "author_difficulty_weights": {"困难": 70, "地狱": 30},
                 "author_batch_size": 10,
             })
             self.assertEqual(
                 result["config"]["author_difficulty_weights"],
-                {"中等": 50, "困难": 30, "地狱": 20},
+                {"困难": 70, "地狱": 30},
             )
             self.assertEqual(result["config"]["author_batch_size"], 10)
             self.assertEqual(result["config"]["github_token_hint"], "已配置（末尾 7890）")
             self.assertNotIn(token, json.dumps(result["config"], ensure_ascii=False))
             content = (root / ".env").read_text(encoding="utf-8")
             self.assertIn(f'CC_GITHUB_TOKEN="{token}"', content)
-            self.assertIn('CC_AUTHOR_DIFFICULTY_WEIGHTS="{\\"中等\\":50,\\"困难\\":30,\\"地狱\\":20}"', content)
+            self.assertIn('CC_AUTHOR_DIFFICULTY_WEIGHTS="{\\"困难\\":70,\\"地狱\\":30}"', content)
             prompt = ConsoleData.author_prompt(
-                "batch", 10, "新闻", "", "", difficulty={"中等": 50, "困难": 30, "地狱": 20}
+                "batch", 10, "新闻", "", "", difficulty={"困难": 70, "地狱": 30}
             )
-            self.assertIn("难度分配：中等 5 道（50%）、困难 3 道（30%）、地狱 2 道（20%）", prompt)
+            self.assertIn("难度分配：困难 7 道（70%）、地狱 3 道（30%）", prompt)
             with self.assertRaisesRegex(ValueError, "合计必须等于 100"):
                 data.update_env({
                     "base_url": "https://relay.example.com/v1", "model": "claude-test",
                     "api_key": "", "submitter": "提交人",
-                    "author_difficulty_weights": {"中等": 50, "困难": 20},
+                    "author_difficulty_weights": {"困难": 50, "地狱": 20},
+                })
+            with self.assertRaisesRegex(ValueError, "只能选择困难或地狱"):
+                data.update_env({
+                    "base_url": "https://relay.example.com/v1", "model": "claude-test",
+                    "api_key": "", "submitter": "提交人",
+                    "author_difficulty_weights": {"中等": 10, "困难": 90},
                 })
 
     def test_author_prompts_restrict_zero_to_one_and_derived_tasks_to_backend(self):
         zero_to_one = ConsoleData.author_prompt(
             "backend-new", 10, "城市数据服务", "Python", "包含异步任务",
-            difficulty={"中等": 100},
+            difficulty={"困难": 100},
         )
         derived = ConsoleData.author_prompt(
             "backend-derived", 2, "", "", "", mode="derived", task_type="Feature 迭代",

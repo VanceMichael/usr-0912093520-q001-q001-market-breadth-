@@ -3,7 +3,9 @@ import unittest
 from pathlib import Path
 
 from tools.batch_pipeline import connect
-from tools.news_topics import FeedItems, ingest, ingest_report, parse_feed, parse_next_page
+from tools.news_topics import (
+    FeedItems, canonical_article_url, ingest, ingest_report, parse_feed, parse_next_page,
+)
 
 
 RSS = b'''<?xml version="1.0"?><rss><channel>
@@ -52,6 +54,37 @@ class NewsTopicTest(unittest.TestCase):
             news_topics.fetch = lambda *_args, **_kwargs: items
             self.assertEqual(ingest(database, ["https://example.test/rss"]), (1, []))
             self.assertEqual(ingest(database, ["https://example.test/rss"]), (0, []))
+
+    def test_tracking_url_and_mirrored_content_are_deduplicated(self):
+        first = FeedItems([{
+            "source_url": "https://news.example/list",
+            "article_url": "https://news.example/a?utm_source=feed&id=7#top",
+            "title": "A meaningful shared business event",
+            "summary": "The same business facts",
+            "published_at": "",
+        }])
+        mirror = FeedItems([{
+            "source_url": "https://mirror.example/list",
+            "article_url": "https://mirror.example/copied-a",
+            "title": "A meaningful shared business event",
+            "summary": "The same business facts",
+            "published_at": "",
+        }])
+        with tempfile.TemporaryDirectory() as raw:
+            database = Path(raw) / "production.sqlite3"
+            import tools.news_topics as news_topics
+            original_fetch = news_topics.fetch
+            try:
+                news_topics.fetch = lambda url, *_args, **_kwargs: first if "news.example" in url else mirror
+                report = ingest_report(database, ["https://news.example/list", "https://mirror.example/list"])
+            finally:
+                news_topics.fetch = original_fetch
+            self.assertEqual(report["added"], 1)
+            self.assertEqual(report["duplicates"], 1)
+        self.assertEqual(
+            canonical_article_url("HTTPS://News.Example/a?utm_source=feed&id=7#top"),
+            "https://news.example/a?id=7",
+        )
 
     def test_ingest_report_explains_duplicates_when_nothing_is_added(self):
         items = [{

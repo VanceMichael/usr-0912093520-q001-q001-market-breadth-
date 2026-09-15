@@ -31,7 +31,7 @@ class OrchestratorTest(unittest.TestCase):
                     "task_type,difficulty,languages,reproducibility,mechanical_qc,qc_decision,qc_prompt_sha256,status,created_at,updated_at) "
                     "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (batch_id, number, f"b-{number:03d}", folder.name, str(folder), "t", prompt,
-                     orchestrator.prompt_hash(prompt), "0-1 代码生成", "中等", "Python", "无外部依赖",
+                     orchestrator.prompt_hash(prompt), "0-1 代码生成", "困难", "Python", "无外部依赖",
                      "pass", "pass", orchestrator.prompt_hash(prompt), "approved", "now", "now"),
                 )
             connection.commit()
@@ -61,6 +61,17 @@ class OrchestratorTest(unittest.TestCase):
                 ).fetchone()
             self.assertEqual(tuple(row), ("", "", "", ""))
 
+    def test_global_model_never_claims_medium_question(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            db = root / "production.sqlite3"
+            row = self.make_question(root, db)[0]
+            with connect(db) as connection:
+                connection.execute("UPDATE questions SET difficulty='中等' WHERE id=?", (row["id"],))
+                connection.commit()
+            claimed = orchestrator._claim_rows(db, "worker", "model", 1, 300)
+            self.assertEqual(claimed, [])
+
     def test_two_workers_create_independent_runs_and_logs(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
@@ -77,7 +88,7 @@ class OrchestratorTest(unittest.TestCase):
                     connection.execute(
                         "INSERT INTO questions(batch_id,question_no,task_id,folder_name,folder_path,title,prompt,prompt_sha256,task_type,difficulty,languages,reproducibility,mechanical_qc,qc_decision,qc_prompt_sha256,status,created_at,updated_at) "
                         "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                        (batch_id, number, f"b-{number:03d}", folder.name, str(folder), "t", f"prompt {number}", orchestrator.prompt_hash(f"prompt {number}"), "0-1 代码生成", "中等", "Python", "无外部依赖", "pass", "pass", orchestrator.prompt_hash(f"prompt {number}"), "approved", "now", "now"),
+                        (batch_id, number, f"b-{number:03d}", folder.name, str(folder), "t", f"prompt {number}", orchestrator.prompt_hash(f"prompt {number}"), "0-1 代码生成", "困难", "Python", "无外部依赖", "pass", "pass", orchestrator.prompt_hash(f"prompt {number}"), "approved", "now", "now"),
                     )
                 connection.commit()
             env = root / ".env"
@@ -169,6 +180,14 @@ class OrchestratorTest(unittest.TestCase):
             orchestrator.classify_failure("failed", "worker failed", warning).kind,
             "worker_failure",
         )
+        self.assertEqual(
+            orchestrator.classify_failure("timeout", "API Error: 504 Gateway Time-out").kind,
+            "transient_gateway",
+        )
+        self.assertEqual(
+            orchestrator.classify_failure("failed", "Cannot connect to the Docker daemon").kind,
+            "environment",
+        )
 
     def test_gateway_backoff_has_independent_budget(self):
         with tempfile.TemporaryDirectory() as raw:
@@ -259,7 +278,7 @@ class OrchestratorTest(unittest.TestCase):
                     connection.execute(
                         "INSERT INTO questions(batch_id,question_no,task_id,folder_name,folder_path,title,prompt,prompt_sha256,"
                         "task_type,difficulty,languages,reproducibility,mechanical_qc,qc_decision,qc_prompt_sha256,status,created_at,updated_at) "
-                        "VALUES(?,1,?,?,?,'title',?,?,'0-1 代码生成','中等','Python','无外部依赖','pass','pass',?,'approved','now','now')",
+                        "VALUES(?,1,?,?,?,'title',?,?,'0-1 代码生成','困难','Python','无外部依赖','pass','pass',?,'approved','now','now')",
                         (batch_id, f"{batch}-001", "q001", str(root / batch / "q001"), prompt, digest, digest),
                     )
                 connection.commit()
@@ -374,7 +393,7 @@ class OrchestratorTest(unittest.TestCase):
                 connection.execute(
                     "INSERT INTO questions(batch_id,question_no,task_id,folder_name,folder_path,title,prompt,prompt_sha256,task_type,difficulty,languages,reproducibility,mechanical_qc,qc_decision,qc_prompt_sha256,status,created_at,updated_at) "
                     "VALUES(?,1,'b-001','q001',?,'t',?,?,?,?,?,'none','pass','pass',?,'approved','now','now')",
-                    (batch_id, str(folder), prompt, orchestrator.prompt_hash(prompt), "0-1 代码生成", "中等", "Python", orchestrator.prompt_hash(prompt)),
+                    (batch_id, str(folder), prompt, orchestrator.prompt_hash(prompt), "0-1 代码生成", "困难", "Python", orchestrator.prompt_hash(prompt)),
                 )
                 question_id = connection.execute("SELECT id FROM questions").fetchone()[0]
                 for attempt in (1, 2):
@@ -617,6 +636,7 @@ class OrchestratorTest(unittest.TestCase):
 
             def export(_codex, prompt, _log, _timeout):
                 self.assertIn("--select 1", prompt)
+                self.assertIn("不得使用 --claude-root", prompt)
                 (root / "b" / "CC_Codex-partial.xlsx").write_bytes(b"xlsx")
                 (root / "b" / "轨迹_record-1.jsonl").write_text("{}\n", encoding="utf-8")
                 return 0

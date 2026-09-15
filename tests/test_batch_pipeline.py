@@ -271,7 +271,7 @@ class BatchPipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             connection = connect(root / "production.sqlite3")
-            with self.assertRaisesRegex(ValueError, "must be 中等/困难/地狱"):
+            with self.assertRaisesRegex(ValueError, "must be 困难/地狱"):
                 create_batch(connection, root, self.write_spec(root, count=1, difficulty="简单"))
             self.assertFalse((root / "0911").exists())
             connection.close()

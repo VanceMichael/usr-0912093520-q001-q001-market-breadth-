@@ -19,7 +19,7 @@ from datetime import datetime
 from pathlib import Path
 
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 DEFAULT_NEWS_FEEDS = (
     "https://channel.chinanews.com.cn/cns/cl/gn-js.shtml",
     "https://channel.chinanews.com.cn/cns/cl/gn-kjww.shtml",
@@ -30,7 +30,7 @@ TASK_TYPES = {
     "代码重构", "工程化", "代码测试",
 }
 FIRST_TURN_TASK_TYPE = "0-1 代码生成"
-DIFFICULTIES = {"简单", "中等", "困难", "地狱"}
+DIFFICULTIES = {"困难", "地狱"}
 REPRODUCIBILITY = {
     "无外部依赖", "有外部依赖，未容器化", "已容器化，可一键起环境",
 }
@@ -271,6 +271,7 @@ CREATE TABLE IF NOT EXISTS records (
     raw_turn_id TEXT NOT NULL DEFAULT '',
     is_continuation INTEGER NOT NULL DEFAULT 0 CHECK (is_continuation IN (0, 1)),
     continuation_count INTEGER NOT NULL DEFAULT 0 CHECK (continuation_count >= 0),
+    quality_contract_version INTEGER NOT NULL DEFAULT 1 CHECK (quality_contract_version >= 1),
     created_at TEXT NOT NULL,
     UNIQUE (question_id, turn_no)
 );
@@ -476,7 +477,7 @@ RECORD_COLUMNS = (
     "delivery_qc_note", "delivery_qc_checked_at", "delivery_qc_changes",
     "evidence_ledger_sha256", "evidence_qc_report",
     "raw_user_prompt", "raw_turn_id", "is_continuation", "continuation_count",
-    "created_at",
+    "quality_contract_version", "created_at",
 )
 
 
@@ -551,6 +552,7 @@ def migrate_records_continuation_identity(connection: sqlite3.Connection) -> Non
                 raw_turn_id TEXT NOT NULL DEFAULT '',
                 is_continuation INTEGER NOT NULL DEFAULT 0 CHECK (is_continuation IN (0, 1)),
                 continuation_count INTEGER NOT NULL DEFAULT 0 CHECK (continuation_count >= 0),
+                quality_contract_version INTEGER NOT NULL DEFAULT 1 CHECK (quality_contract_version >= 1),
                 created_at TEXT NOT NULL,
                 UNIQUE (question_id, turn_no)
             )
@@ -771,6 +773,7 @@ def connect(database: Path) -> sqlite3.Connection:
         "evidence_checked_at": "TEXT NOT NULL DEFAULT ''",
         "history_gate_passed": "INTEGER NOT NULL DEFAULT 0 CHECK (history_gate_passed IN (0, 1))",
         "history_checked_at": "TEXT NOT NULL DEFAULT ''",
+        "quality_contract_version": "INTEGER NOT NULL DEFAULT 1 CHECK (quality_contract_version >= 1)",
     }
     for name, definition in record_migrations.items():
         if name not in record_columns:
@@ -958,7 +961,10 @@ def technology_diversity_issues(
             f"{dominant_primary} 占 {dominant_primary_count}/{count}"
         )
     max_persistence = math.ceil(count * 0.6)
-    if persistence:
+    # An explicit SQLite-only batch is valid even though one persistence
+    # technology necessarily appears in every question. Keep the cap for
+    # mixed-storage batches while allowing the mandated local-only policy.
+    if persistence and set(persistence) != {"sqlite"}:
         dominant_store, dominant_store_count = persistence.most_common(1)[0]
         if dominant_store_count > max_persistence:
             issues.append(
@@ -1325,8 +1331,8 @@ def create_batch(connection: sqlite3.Connection, workspace: Path, spec_path: Pat
             raise ValueError("selected mother is not ready for Bug 修复")
         if author_mode == "derived" and task_type == "Feature 迭代" and not mother["iteration_ready"]:
             raise ValueError("selected mother is not ready for Feature 迭代")
-        if difficulty not in DIFFICULTIES or difficulty == "简单":
-            raise ValueError(f"question {index} first-turn difficulty must be 中等/困难/地狱")
+        if difficulty not in DIFFICULTIES:
+            raise ValueError(f"question {index} first-turn difficulty must be 困难/地狱")
         if not isinstance(languages, list) or not languages or not all(
             isinstance(value, str) and value.strip() for value in languages
         ):
@@ -1418,8 +1424,8 @@ def check_question(connection: sqlite3.Connection, row: sqlite3.Row) -> dict:
     if "\n" in prompt or "\r" in prompt:
         errors.append("首轮 User Prompt 必须是一个自然语言段落")
     errors.extend(prompt_style_issues(prompt))
-    if row["difficulty"] == "简单":
-        errors.append("首轮题目不能是简单")
+    if row["difficulty"] not in DIFFICULTIES:
+        errors.append("甲方只接收困难或地狱难度，当前题目不可进入生产")
     banned = sorted(term for term in BANNED_TERMS if term in combined)
     if re.search(r"\bcli\b", combined):
         banned.append("CLI")

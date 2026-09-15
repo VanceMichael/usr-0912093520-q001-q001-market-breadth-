@@ -99,6 +99,38 @@ class TrajectoryGateTests(unittest.TestCase):
             with self.assertRaisesRegex(TrajectoryGateError, "工作区外的指令/配置"):
                 validate_effective_trajectory(root / "claude", prompt, repo, sha)
 
+    def test_external_environment_file_read_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, sha = self.make_repo(root)
+            prompt = "实现后端功能"
+            self.write_trajectory(root / "claude", prompt, useful=True)
+            trajectory = root / "claude" / "projects" / "-workspace" / "session-1.jsonl"
+            events = [json.loads(line) for line in trajectory.read_text(encoding="utf-8").splitlines()]
+            events[1]["message"]["content"][0]["input"] = {"file_path": "/project/.env.production"}
+            trajectory.write_text(
+                "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in events), encoding="utf-8",
+            )
+            (repo / "app.py").write_text("print('ok')\n", encoding="utf-8")
+            with self.assertRaisesRegex(TrajectoryGateError, "工作区外的指令/配置"):
+                validate_effective_trajectory(root / "claude", prompt, repo, sha)
+
+    def test_self_reported_previous_session_memory_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, sha = self.make_repo(root)
+            prompt = "实现后端功能"
+            self.write_trajectory(root / "claude", prompt, useful=True)
+            trajectory = root / "claude" / "projects" / "-workspace" / "session-1.jsonl"
+            events = [json.loads(line) for line in trajectory.read_text(encoding="utf-8").splitlines()]
+            events[-1]["message"]["content"][0]["text"] = "我已经记得这个项目，因此直接完成。"
+            trajectory.write_text(
+                "".join(json.dumps(event, ensure_ascii=False) + "\n" for event in events), encoding="utf-8",
+            )
+            (repo / "app.py").write_text("print('ok')\n", encoding="utf-8")
+            with self.assertRaisesRegex(TrajectoryGateError, "历史记忆"):
+                validate_effective_trajectory(root / "claude", prompt, repo, sha)
+
     def test_trajectory_without_workspace_changes_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

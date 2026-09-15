@@ -28,6 +28,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from tools.batch_pipeline import SNAPSHOT_RE, connect, prompt_hash, question_rows
+from tools.authoring_policy import DELIVERABLE_DIFFICULTIES
 from tools.capacity import adaptive_model_limit, detect_capacity
 from tools.text_encoding import read_portable_text
 from tools.trajectory_gate import TrajectoryGateError, validate_effective_trajectory
@@ -57,6 +58,12 @@ PERMANENT_AUTH_RE = re.compile(
 MODEL_CONFIG_RE = re.compile(
     r"(?i)(?:unsupported model|invalid model|model (?:is )?not found|"
     r"model .* does not exist|unknown model provider)"
+)
+ENVIRONMENT_FAILURE_RE = re.compile(
+    r"(?i)(?:cannot connect to the docker daemon|docker daemon[^\n]*(?:unavailable|not running)|"
+    r"executable file not found|no such image|pull access denied|manifest unknown|"
+    r"no space left on device|disk quota exceeded|read-only file system|"
+    r"failed before worker launch|cannot start docker worker|missing worker configuration)"
 )
 UNRECOGNIZED_MODEL_WARNING = "[claude-code:unrecognized_model]"
 HARNESS_VERSION_RE = re.compile(r"\d+(?:\.\d+)+")
@@ -148,7 +155,8 @@ def now() -> str:
 
 def ready(row: sqlite3.Row) -> bool:
     return bool(
-        row["mechanical_qc"] == "pass"
+        row["difficulty"] in DELIVERABLE_DIFFICULTIES
+        and row["mechanical_qc"] == "pass"
         and row["qc_decision"] == "pass"
         and row["qc_prompt_sha256"] == prompt_hash(row["prompt"])
         and row["status"] == "approved"
@@ -289,8 +297,6 @@ def classify_failure(status: str, error: str, diagnostics: str = "") -> FailureC
     without_catalog_warning = "\n".join(
         line for line in text.splitlines() if UNRECOGNIZED_MODEL_WARNING not in line
     )
-    if status == "timeout":
-        return FailureClassification("model_timeout", True)
     if "effective trajectory gate rejected run" in error:
         return FailureClassification("trajectory_gate", True)
     if "blocked_metadata" in error or "完成元数据" in error or "SessionID" in error:
@@ -301,10 +307,10 @@ def classify_failure(status: str, error: str, diagnostics: str = "") -> FailureC
         return FailureClassification("model_config", False)
     if TRANSIENT_GATEWAY_RE.search(without_catalog_warning):
         return FailureClassification("transient_gateway", True)
-    if any(marker in error for marker in (
-        "failed before worker launch", "cannot start docker worker", "missing worker configuration",
-    )):
+    if ENVIRONMENT_FAILURE_RE.search(without_catalog_warning):
         return FailureClassification("environment", False)
+    if status == "timeout":
+        return FailureClassification("model_timeout", True)
     return FailureClassification("worker_failure", True)
 
 
@@ -799,6 +805,8 @@ def record_counts(db: Path, question_id: int) -> tuple[int, int]:
 
 
 def delivery_needed(db: Path, row: sqlite3.Row) -> bool:
+    if row["difficulty"] not in DELIVERABLE_DIFFICULTIES:
+        return False
     with closing(connect(db)) as connection:
         succeeded = connection.execute(
             "SELECT 1 FROM runs WHERE question_id=? AND status='succeeded' LIMIT 1",
@@ -852,6 +860,7 @@ def _claim_rows(
             rows = connection.execute(
                 "SELECT q.* FROM questions q JOIN batches b ON b.id=q.batch_id "
                 "WHERE b.status IN ('ready','approved') AND q.maintenance_mode=0 "
+                "AND q.difficulty IN ('困难','地狱') "
                 "AND q.status='approved' AND q.mechanical_qc='pass' AND q.qc_decision='pass' "
                 "AND q.qc_prompt_sha256=q.prompt_sha256 "
                 "AND (q.model_lease_owner='' OR julianday(q.model_lease_expires_at)<julianday(?)) "
@@ -868,6 +877,7 @@ def _claim_rows(
             candidates = connection.execute(
                 "SELECT q.* FROM questions q JOIN batches b ON b.id=q.batch_id "
                 "WHERE q.maintenance_mode=0 AND q.status!='blocked' "
+                "AND q.difficulty IN ('困难','地狱') "
                 "AND (q.delivery_lease_owner='' OR julianday(q.delivery_lease_expires_at)<julianday(?)) "
                 "AND EXISTS(SELECT 1 FROM runs s WHERE s.question_id=q.id AND s.status='succeeded') "
                 "AND ((SELECT COUNT(*) FROM records r WHERE r.question_id=q.id)=0 "
@@ -919,8 +929,10 @@ def active_batch_names(db: Path) -> list[str]:
 def solo2_pending_available(db: Path, max_attempts: int) -> bool:
     with closing(connect(db)) as connection:
         return connection.execute(
-            "SELECT 1 FROM records r LEFT JOIN solo2_submissions s ON s.record_id=r.record_id "
+            "SELECT 1 FROM records r JOIN questions q ON q.id=r.question_id "
+            "LEFT JOIN solo2_submissions s ON s.record_id=r.record_id "
             "WHERE r.delivery_qc_passed=1 AND r.delivery_qc_note='质检通过' "
+            "AND q.difficulty IN ('困难','地狱') "
             "AND r.evidence_gate_passed=1 AND r.history_gate_passed=1 "
             "AND r.human_qc_approved=1 "
             "AND r.review_method='human' "
@@ -977,6 +989,9 @@ def deliver_one(
             "新证据账本必须为每项填写 kind：requirement/prompt、product/workspace、process/trajectory 或 runtime/trajectory；"
             "runtime 必须引用 tool_result，并用 related_line 关联本轮先发生且 id 匹配的 tool_use。"
             "五维描述必须各自为单段、至少 45 个汉字且不超过 420 个字符，序号使用阿拉伯数字，例如第80行。"
+            "满分必须写清具体验证动作、精确来源位置和客观结果；非满分必须写清具体文件、函数、命令或错误以及实际工程后果。"
+            "执行失败不得只写泛化的失败，必须保留准确命令、错误名、退出码或测试计数，并写清后续恢复和复验结果；"
+            "不要使用笼统的文件名称、清单、全部通过或要求均已覆盖等套话。"
             "不得修改题目代码、轨迹或仓库，"
             "不得处理其他题目；完成生产后停止，保持质检与最终复核字段未通过，不得执行交付质检或导出。"
         )
@@ -994,6 +1009,8 @@ def deliver_one(
             "环境缺命令或预装依赖、Docker 守护进程、网络、镜像仓库、权限、证书、网关等外部问题不得作为评价内容。"
             "对带 kind 的新证据账本检查来源语义，并确认 runtime 的 tool_result 与 related_line 指向的 tool_use 匹配。"
             "五维描述必须各自为单段、至少 45 个汉字且不超过 420 个字符，序号使用阿拉伯数字。依据可核验证据修正不合规字段，"
+            "满分必须有具体验证动作、精确来源位置和客观结果；非满分必须有具体文件、函数、命令或准确错误及工程后果。"
+            "执行失败必须给出命令、错误名、退出码或测试计数，并交代恢复与复验；禁止泛化位置、模糊清单和全部通过类套话。"
             f"显式使用 --select {number} 重新验证并执行 --finalize；不得修改目标模型代码，不得处理其他题目，"
             "不要导出 Excel。完成后停止。"
         )
@@ -1059,7 +1076,8 @@ def finalize_batch(
     trajectories_before = set(folder.glob("轨迹_*.jsonl"))
     prompt = (
         f"使用 $cc-usr-excel-exporter 只导出批次 {batch} 第 {selection} 题中已经通过事实证据、历史去重、交付质检和最终五维复核的完整记录，"
-        f"显式使用 --select {selection} 和 --claude-root {data_root.resolve()}，逐字节复制原始 JSONL，"
+        f"显式使用 --select {selection}，只从 SQLite 中已登记成功运行的 trajectory_root 定位权威轨迹，"
+        "重新核对证据账本和轨迹 SHA-256 质检回执后逐字节复制原始 JSONL；不得使用 --claude-root 跳过轨迹哈希复核，"
         "不得修改评分、记录或目标模型产物。完成后报告输出路径并停止。"
     )
     code = run_codex(codex, prompt, data_root / batch / "export.log", timeout)

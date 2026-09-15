@@ -11,6 +11,9 @@ BACKEND_LANGUAGES = (
     "Java",
 )
 
+# Shared delivery-contract boundary used by every production stage.
+DELIVERABLE_DIFFICULTIES = ("困难", "地狱")
+
 
 def sqlite_only_requirement() -> str:
     """Return the storage boundary for automatically authored batches."""

@@ -17,6 +17,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from tools.batch_pipeline import connect  # noqa: E402
 from tools.delivery_records import (  # noqa: E402
+    CURRENT_QUALITY_CONTRACT_VERSION,
     DIFFICULTIES,
     SCORE_PREFIXES,
     TASK_TYPES,
@@ -219,6 +220,7 @@ def build_record(
         "raw_turn_id": str(supplied.get("raw_turn_id") or supplied["turn_id"]),
         "is_continuation": bool(supplied.get("is_continuation", False)),
         "continuation_count": int(supplied.get("continuation_count") or 0),
+        "quality_contract_version": CURRENT_QUALITY_CONTRACT_VERSION,
         "created_at": now(),
     }
     for prefix in SCORE_PREFIXES:

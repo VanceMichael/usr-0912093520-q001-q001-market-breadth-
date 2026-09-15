@@ -20,6 +20,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from tools.batch_pipeline import connect, parse_selection, question_rows  # noqa: E402
 from tools.delivery_records import (  # noqa: E402
+    CURRENT_QUALITY_CONTRACT_VERSION,
     EXPORT_KEYS,
     load_records,
     validate_records,
@@ -653,11 +654,15 @@ def apply_fixes(
             "human_qc_approved_at=''",
             "human_qc_note=''",
             "review_method=''",
+            "quality_contract_version=?",
             "delivery_qc_changes=?",
         ])
         connection.execute(
             f"UPDATE records SET {', '.join(assignments)} WHERE record_id=?",
-            [*effective.values(), json.dumps(history, ensure_ascii=False), record_id],
+            [
+                *effective.values(), CURRENT_QUALITY_CONTRACT_VERSION,
+                json.dumps(history, ensure_ascii=False), record_id,
+            ],
         )
         changed_records += 1
 

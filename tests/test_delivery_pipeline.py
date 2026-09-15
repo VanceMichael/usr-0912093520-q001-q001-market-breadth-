@@ -15,7 +15,11 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from tools.batch_pipeline import connect, create_batch, set_repository  # noqa: E402
-from tools.delivery_records import EXPORT_HEADERS, validate_one  # noqa: E402
+from tools.delivery_records import (  # noqa: E402
+    EXPORT_HEADERS,
+    _score_description_errors,
+    validate_one,
+)
 from tools.delivery_quality import (  # noqa: E402
     validate_evidence_structure,
     verify_evidence_sources,
@@ -126,21 +130,22 @@ def automated_record(number: int = 1) -> dict:
         "turn_completed_at": "2026-09-07T10:00:00+08:00",
         "submitted_at": "2026-09-07T11:00:00+08:00",
         "human_authored": False,
+        "quality_contract_version": 2,
     }
     descriptions = {
-        "delivery": "接口、持久化和状态推送都已经落到可运行代码中，集成测试覆盖断线重连后继续接收事件。主要业务链路能够完整闭环，现有验证没有留下影响交付的缺口。",
-        "instruction": "题目指定的技术栈、目录边界和禁止事项均与提交内容一致，相关实现没有越过允许范围。各项显式要求都能在代码或测试中找到对应结果，交付行为与原始约束一致。",
-        "planning": "实现过程先固定数据流与状态约束，再完成服务端和页面之间的联调，最后集中执行测试验证。阶段之间有明确的前后依赖，遇到失败时也能回到对应环节继续处理。",
-        "reasoning": "顺序处理与重连恢复共用同一套游标语义，边界判断和测试场景能够相互印证。关键取舍保持前后一致，异常分支没有引入与正常流程冲突的状态解释。",
-        "execution": "文件检索、代码修改和验证命令都集中在目标模块，出现失败后能够根据错误位置及时修正。最终构建与完整测试均正常结束，没有重复执行无关操作拖慢交付。",
+        "delivery": "执行 `node --test` 后，事件接入、持久化与断线重连的8个接口用例全部通过。`src/store.js` 中的游标写入和恢复函数返回一致结果，主要业务链路已经形成可运行闭环。",
+        "instruction": "逐项核对原始要求与 `src/service.js` 的处理函数，指定技术栈、目录边界和顺序约束都有对应实现。再次运行同一测试命令，报告列出8个用例且失败数为0，显式要求的实际行为验证通过。",
+        "planning": "第1步检查数据流约束，第2步完成存储与状态推送，第3步运行 `node --test` 收尾验证。三个计划节点依次完成，测试报告中的失败数为0，阶段状态和前后依赖都能核对。",
+        "reasoning": "检查 `src/store.js` 的 `resumeCursor` 函数后，确认顺序处理与重连恢复共用同一游标前提。断线恢复用例返回连续事件编号，推断与实际测试结果一致，异常分支没有破坏正常状态。",
+        "execution": "先检索 `src` 目录并修改存储函数，随后执行 `node --test` 验证8个用例，再读取报告确认失败数为0。工具调用都围绕目标文件展开，最终构建和接口验证正常完成。",
     }
     if number % 2 == 0:
         descriptions = {
-            "delivery": "断线恢复、事件落库和订阅推送已经形成连续处理链路，验收过程覆盖了连接恢复后的增量消息。运行结果没有暴露会阻断主要业务路径的缺失项。",
-            "instruction": "实现范围保持在题目约定的后端服务和验证代码内，指定的持久化及顺序约束均有对应落点。原始要求中的限制没有被额外功能或越界修改破坏。",
-            "planning": "工作先梳理事件进入后的状态变化，再分别推进存储、订阅和恢复路径，收尾阶段统一核对异常场景。每个阶段都有对应进展反馈，前后步骤能够互相衔接。",
-            "reasoning": "重连后的游标延续被作为状态一致性的关键条件，并用恢复场景验证这一判断。正常传输和连接中断采用同一顺序语义，没有出现互相矛盾的处理分支。",
-            "execution": "检索范围围绕事件处理目录展开，修改完成后依次运行构建和验收脚本。命令遇到问题时先定位对应位置再修正，结束前的验证正常返回且没有无关重复调用。",
+            "delivery": "运行 `go test ./...` 后，断线恢复、事件落库和订阅推送的9个用例全部成功。`internal/store/recover.go` 的恢复方法返回连续游标，连接恢复后的增量消息可以完整交付。",
+            "instruction": "核对题目约束与 `internal/service` 目录后，持久化、顺序处理和后端范围都有对应实现。再次运行完整测试命令，结果显示所有软件包通过，没有出现越界依赖或遗漏指定行为。",
+            "planning": "第1步梳理事件状态，第2步实现存储和订阅，第3步检查恢复路径并运行 `go test ./...`。三个阶段均有完成结果，最终测试正常通过，前后步骤保持可追踪。",
+            "reasoning": "检查 `recoverCursor` 方法确认重连游标沿用既有顺序语义，再用恢复用例验证这一前提。测试返回预期的下一事件编号，正常传输和连接中断没有形成矛盾状态。",
+            "execution": "先检索 `internal/service` 目录并修改恢复方法，随后运行 `go test ./...`，再读取结果确认所有软件包通过。每次工具调用都有明确目标，最终验证正常结束且没有无关重复操作。",
         }
     for prefix in ("delivery", "instruction", "planning", "reasoning", "execution"):
         values[f"{prefix}_score"] = 5
@@ -298,6 +303,72 @@ class DeliveryPipelineTests(unittest.TestCase):
 
             self.assertNotEqual(result.returncode, 0, result.stdout)
             self.assertIn("must use Arabic digits for ordinals", result.stdout)
+
+    def test_score_description_gate_rejects_vague_perfect_claim(self):
+        errors = _score_description_errors(
+            5,
+            "delivery_description",
+            "所有要求均已覆盖，测试最终全部通过，服务功能已经完整交付并正常运行。",
+        )
+        self.assertTrue(any("精确来源位置" in error for error in errors), errors)
+
+    def test_score_description_gate_requires_exact_execution_failure(self):
+        errors = _score_description_errors(
+            3,
+            "execution_description",
+            "执行测试命令时服务启动失败，随后修改服务文件再复验，导致接口验证仍未完成。",
+        )
+        self.assertTrue(any("具体错误" in error for error in errors), errors)
+
+    def test_score_description_gate_accepts_attributable_execution_chain(self):
+        errors = _score_description_errors(
+            3,
+            "execution_description",
+            "第2次执行 node --test 时返回 tests 8、failed 1，随后修改 src/store.js 再复验，失败断言仍未恢复，导致事务回滚接口没有完成验证。",
+        )
+        self.assertEqual(errors, [])
+
+    def test_quality_contract_keeps_legacy_record_compatible(self):
+        record = automated_record()
+        record["quality_contract_version"] = 1
+        record["delivery_description"] = (
+            "所有要求均已覆盖，测试最终全部通过，服务功能已经完整交付并正常运行。"
+            "主要业务链路可以连续处理请求，现有结果没有暴露阻断交付的问题。"
+        )
+
+        errors, _warnings = validate_one(record)
+
+        self.assertFalse(any("精确来源位置" in error for error in errors), errors)
+
+    def test_quality_contract_applies_semantic_gate_to_new_record(self):
+        record = automated_record()
+        record["quality_contract_version"] = 2
+        record["delivery_description"] = (
+            "所有要求均已覆盖，测试最终全部通过，服务功能已经完整交付并正常运行。"
+            "主要业务链路可以连续处理请求，现有结果没有暴露阻断交付的问题。"
+        )
+
+        errors, _warnings = validate_one(record)
+
+        self.assertTrue(any("精确来源位置" in error for error in errors), errors)
+
+    def test_delivery_deadline_is_enforced_by_default(self):
+        record = automated_record()
+        record["submitted_at"] = "2026-09-09T11:00:00+08:00"
+
+        with mock.patch.dict("os.environ", {"CC_DELIVERY_ALLOW_LATE": "false"}):
+            errors, _warnings = validate_one(record)
+
+        self.assertTrue(any("submitted after project deadline" in error for error in errors))
+
+    def test_delivery_deadline_can_be_disabled_for_approved_backfill(self):
+        record = automated_record()
+        record["submitted_at"] = "2026-09-09T11:00:00+08:00"
+
+        with mock.patch.dict("os.environ", {"CC_DELIVERY_ALLOW_LATE": "true"}):
+            errors, _warnings = validate_one(record)
+
+        self.assertFalse(any("submitted after project deadline" in error for error in errors))
 
     def test_environment_failure_cannot_be_used_as_model_deduction(self):
         record = automated_record()
@@ -826,7 +897,9 @@ class DeliveryPipelineTests(unittest.TestCase):
             ])
             self.assertEqual(result.returncode, 0, result.stdout)
             connection = connect(database)
-            connection.execute("UPDATE records SET submitter='Codex'")
+            connection.execute(
+                "UPDATE records SET submitter='Codex',quality_contract_version=1"
+            )
             connection.commit()
             connection.close()
 
@@ -855,6 +928,7 @@ class DeliveryPipelineTests(unittest.TestCase):
             connection.close()
             self.assertEqual(fixed["submitter"], "测试提交人")
             self.assertEqual(fixed["delivery_qc_passed"], 0)
+            self.assertEqual(fixed["quality_contract_version"], 2)
             changes = json.loads(fixed["delivery_qc_changes"])
             self.assertEqual(changes[0]["changes"]["submitter"]["before"], "Codex")
             self.assertEqual(changes[0]["changes"]["submitter"]["after"], "测试提交人")

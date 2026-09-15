@@ -32,7 +32,11 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from tools.batch_pipeline import connect, prompt_hash, sqlite_only_technology_issues  # noqa: E402
-from tools.authoring_policy import backend_only_requirement, sqlite_only_requirement  # noqa: E402
+from tools.authoring_policy import (  # noqa: E402
+    DELIVERABLE_DIFFICULTIES,
+    backend_only_requirement,
+    sqlite_only_requirement,
+)
 from tools.news_topics import DEFAULT_FEEDS, configured_feeds, ingest, ingest_report  # noqa: E402
 from tools.orchestrator import clear_question_leases  # noqa: E402
 from tools.run_supervisor import write_supervisor_state  # noqa: E402
@@ -400,7 +404,7 @@ def difficulty_plan() -> dict[str, int]:
         parsed = {}
     plan: dict[str, int] = {}
     if isinstance(parsed, dict):
-        for difficulty in ("中等", "困难", "地狱"):
+        for difficulty in DELIVERABLE_DIFFICULTIES:
             try:
                 weight = int(parsed.get(difficulty, 0))
             except (TypeError, ValueError):
@@ -409,12 +413,12 @@ def difficulty_plan() -> dict[str, int]:
                 plan[difficulty] = weight
     if plan:
         return plan
-    legacy = os.environ.get("CC_AUTHOR_DIFFICULTY", "中等").strip()
-    return {legacy if legacy in {"中等", "困难", "地狱"} else "中等": 100}
+    legacy = os.environ.get("CC_AUTHOR_DIFFICULTY", "困难").strip()
+    return {legacy if legacy in DELIVERABLE_DIFFICULTIES else "困难": 100}
 
 
 def difficulty_distribution(count: int, plan: dict[str, int]) -> str:
-    order = ("中等", "困难", "地狱")
+    order = DELIVERABLE_DIFFICULTIES
     total = sum(plan.values())
     entries: list[list[object]] = []
     allocated = 0
@@ -482,6 +486,7 @@ def count_ready(database: Path) -> int:
         return int(connection.execute(
             "SELECT COUNT(*) FROM questions q JOIN batches b ON b.id=q.batch_id "
             "WHERE b.status NOT IN ('completed','partial','failed') "
+            "AND q.difficulty IN ('困难','地狱') AND q.maintenance_mode=0 "
             "AND q.status='approved' AND q.mechanical_qc='pass' AND q.qc_decision='pass' "
             "AND q.qc_prompt_sha256=q.prompt_sha256"
         ).fetchone()[0])
@@ -490,7 +495,10 @@ def count_ready(database: Path) -> int:
 def active_batches(database: Path) -> list[str]:
     with closing(connect(database.resolve())) as connection:
         return [str(row["name"]) for row in connection.execute(
-            "SELECT name FROM batches WHERE status NOT IN ('completed','partial','failed') ORDER BY created_at"
+            "SELECT b.name FROM batches b WHERE b.status NOT IN ('completed','partial','failed') "
+            "AND (NOT EXISTS(SELECT 1 FROM questions q0 WHERE q0.batch_id=b.id) "
+            "OR EXISTS(SELECT 1 FROM questions q WHERE q.batch_id=b.id "
+            "AND q.difficulty IN ('困难','地狱') AND q.maintenance_mode=0)) ORDER BY b.created_at"
         )]
 
 
@@ -568,7 +576,7 @@ def authored_batch_result(database: Path, batch: str, expected_count: int) -> tu
             "SELECT COUNT(*) FROM questions WHERE batch_id=?", (batch_row["id"],),
         ).fetchone()[0])
         rows = connection.execute(
-            "SELECT status,mechanical_qc,qc_decision,qc_prompt_sha256,prompt,repo_url,"
+            "SELECT status,mechanical_qc,qc_decision,qc_prompt_sha256,prompt,repo_url,difficulty,"
             "initial_snapshot,local_initial_sha,languages FROM questions WHERE batch_id=?",
             (batch_row["id"],),
         ).fetchall()
@@ -586,6 +594,7 @@ def authored_batch_result(database: Path, batch: str, expected_count: int) -> tu
                 and row["repo_url"]
                 and row["initial_snapshot"]
                 and row["local_initial_sha"]
+                and row["difficulty"] in DELIVERABLE_DIFFICULTIES
                 and not sqlite_only_technology_issues(languages)
             ):
                 ready += 1

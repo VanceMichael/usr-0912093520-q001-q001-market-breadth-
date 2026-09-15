@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 from collections import Counter, defaultdict
@@ -35,6 +36,7 @@ REPRODUCIBILITY = {
 HARNESSES = {"Claude Code", "Codex CLI"}
 OPERATING_SYSTEMS = {"MacOS/Linux", "Windows"}
 SCORE_PREFIXES = ("delivery", "instruction", "planning", "reasoning", "execution")
+CURRENT_QUALITY_CONTRACT_VERSION = 2
 SNAPSHOT_RE = re.compile(
     r"^https://github\.com/[^/]+/[^/]+/commit/[0-9a-fA-F]{40}$"
 )
@@ -60,6 +62,13 @@ EXPORT_KEYS = [
 SCORE_KEYS = {f"{prefix}_score" for prefix in SCORE_PREFIXES}
 MIN_DESCRIPTION_CHINESE = 45
 MAX_DESCRIPTION_CHARS = 420
+
+
+def late_delivery_allowed() -> bool:
+    """Return whether an operator explicitly enabled historical backfill."""
+    return os.environ.get("CC_DELIVERY_ALLOW_LATE", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
 DESCRIPTION_META_PATTERNS = (
     re.compile(r"(?i)(?:^|[^A-Za-z])AI\s*(?:分析|生成|评分|撰写|认为)"),
     re.compile(r"(?:由|作为|本)\s*(?:AI|Codex)\b", re.IGNORECASE),
@@ -84,6 +93,59 @@ DESCRIPTION_TEMPLATE_PATTERNS = (
     re.compile(r"[→➡]"),
     re.compile(r"【(?:第几步|哪个环节|具体行为|什么后果|根因|正确做法|哪个文件|哪个功能)】"),
 )
+NON_MAX_EVIDENCE_RE = re.compile(
+    r"(?:第\d+(?:至第?\d+)?(?:步|次|轮|行)|"
+    r"(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+|"
+    r"[A-Za-z][A-Za-z0-9_.-]+\.(?:go|java|py|ts|tsx|js|jsx|rs|sql|md)|"
+    r"文件|模块|函数|方法|类|配置|命令|脚本|测试|用例|接口|页面|"
+    r"数据库|数据表|仓储|服务|构建|编译|安装|迁移|事务|路由|规则|存储|查询|发布|调度|回执|状态机|依赖)"
+ )
+NON_MAX_IMPACT_RE = re.compile(
+    r"(?:导致|使得|造成|增加|延长|无法|不能|未能|风险|返工|中断|冲突|偏差|遗漏|落空|"
+    r"暴露|限制|不一致|重复|仍需|影响|缺少|缺失|不足|成本|代价|耗时|误判|重做|多轮|不存在|未完成|没有落地)"
+ )
+PRECISE_LOCATION_RE = re.compile(
+    r"(?:第\d+(?:至第?\d+)?(?:步|次|轮|行)|"
+    r"(?:目录|子目录)[^，。；]{0,30}(?:文件|模块)|"
+    r"名为[“\"'][^”\"']+[”\"']?(?:的)?(?:文件|源文件|测试|用例)|"
+    r"[^，。；]{1,24}(?:函数|方法|用例|断言|命令)(?:中|处|返回|报告|失败|通过|验证|检查))"
+ )
+GENERIC_LOCATION_RE = re.compile(
+    r"(?:启动文件|存储文件|网页接口文件|接口文件|服务文件|接口测试文件|服务测试文件|"
+    r"某次测试|某个文件|相关文件|命令目录|服务目录|主入口源文件|内部目录|存储源文件|结算目录)"
+ )
+VAGUE_LIST_RE = re.compile(r"(?:测试|检查|任务|步骤|验证)(?:项)?清单")
+LIST_ITEM_RE = re.compile(r"[^，。；]{2,}(?:、|，)[^，。；]{2,}(?:、|，)[^，。；]{2,}")
+VAGUE_FAILURE_RE = re.compile(r"(?:对象|服务|流程|构建|测试|命令)(?:创建|执行|运行|启动)?(?:失败|中断)")
+EXACT_FAILURE_RE = re.compile(
+    r"(?:[A-Za-z][A-Za-z0-9_.]*(?:Exception|Error)|TS\d{3,5}|"
+    r"exit(?:ed)?\s+(?:code\s+)?\d+|tests?\s+\d+|fail(?:ed)?\s+\d+|"
+    r"mvn(?:\s+-[A-Za-z]+)*\s+test|node\s+--test|tsc\s+--noEmit)"
+)
+OBJECTIVE_OUTCOME_RE = re.compile(
+    r"(?:构建|编译|测试|验证|运行|启动|请求|响应|接口|状态|数据|记录|功能|交付|断言|发布|迁移|事务|回执|任务)"
+    r"[^，。；]{0,24}(?:失败|中断|异常|错误|冲突|重复|丢失|倒退|未通过|未完成|未执行|无法|不能|缺失|遗漏|不一致|被覆盖|被取消|仍未)|"
+    r"(?:导致|使得|造成)[^，。；]{0,24}(?:失败|中断|异常|错误|冲突|重复|丢失|倒退|未通过|未完成|无法|不能|缺失|遗漏|不一致|被覆盖|被取消)"
+ )
+VAGUE_PERFECT_CLAIM_RE = re.compile(
+    r"(?:测试(?:最终)?(?:全部)?通过|均有(?:具体)?断言覆盖|没有遗漏(?:主要)?交付项|(?:明确|全部|所有)?要求均已覆盖|全部约束均已落实)"
+ )
+REASONING_WRONG_ATTRIBUTION_RE = re.compile(
+    r"(?:(?:环境|网络|外部依赖)[^，。；]{0,16}(?:限制|故障|不可用|没有|缺失)|(?:发现|补齐)[^，。；]{0,8}(?:较晚|太晚|过晚))"
+ )
+PERFECT_SCORE_CONTRADICTION_RE = re.compile(
+    r"(?:仍然?|依然|还)(?:存在|有|未|没有)|(?:未实现|未完成|未覆盖|未遵守|违反|遗漏了|漏掉了|缺少|缺失)[^，。；]{0,18}(?:要求|约束|功能|场景|验证|处理|能力)"
+ )
+PERFECT_ACTION_RE = re.compile(r"(?:核对|比对|断言|检查|读取|查询|执行|运行|复验|验证|构建|编译|测试)")
+PERFECT_RESULT_RE = re.compile(r"(?:通过|成功|正常|一致|返回|结束|拒绝|保留|生效|恢复|完成|符合|零失败|零错误)")
+PLANNING_EVIDENCE_RE = re.compile(r"(?:计划|规划|拆解|步骤|阶段|顺序|状态追踪|进度|收尾|歧义|节点|安排)")
+REASONING_PREMISE_RE = re.compile(
+    r"(?:假设|前提|推断|推导|误判|误以为|错误地(?:认为|认定|假设)|没有解释|未说明|没有区分|未区分|遗漏[^，。；]{0,12}(?:分支|条件|先后关系|边界)|(?:把|将)[^，。；]{0,48}(?:当作|当成))"
+ )
+EXECUTION_TOOL_ACTION_RE = re.compile(
+    r"(?:(?:使用|调用)[^，。；]{0,20}(?:工具|命令|脚本)|第\d+次[^，。；]{0,30}(?:读取|写入|修改|编辑|检索|搜索|执行|运行|重试|重跑|复验|验证|启动)|(?:读取|写入|修改|编辑|检索|搜索|执行|运行|重试|重跑|复验|验证|启动)[^，。；]{0,16}(?:工具|命令|脚本|文件|构建|测试))"
+ )
+EXECUTION_FOLLOWUP_RE = re.compile(r"(?:随后|之后|紧接着|又|再|直到|才|连续|重复|重试|重跑|复验|补充|修正|修改|覆盖|作废|转入后台)")
 CHINESE_ORDINAL_RE = re.compile(
     r"第[零〇一二两三四五六七八九十百千万]+"
     r"(?=(?:至第?[零〇一二两三四五六七八九十百千万]+)?"
@@ -99,6 +161,7 @@ def as_record(row: sqlite3.Row | dict) -> dict:
     record["history_gate_passed"] = bool(record.get("history_gate_passed"))
     record["delivery_qc_passed"] = bool(record.get("delivery_qc_passed"))
     record["is_continuation"] = bool(record.get("is_continuation"))
+    record["quality_contract_version"] = int(record.get("quality_contract_version") or 1)
     return record
 
 
@@ -172,6 +235,45 @@ def _description_style_errors(description: str, *, minimum: int = MIN_DESCRIPTIO
     return errors
 
 
+def _score_description_errors(score: object, field: str, description: str) -> list[str]:
+    """Apply evidence-specific rules shared by production, QC and export."""
+    if not isinstance(score, int) or isinstance(score, bool):
+        return []
+    errors: list[str] = []
+    if score == 5:
+        if PERFECT_SCORE_CONTRADICTION_RE.search(description):
+            errors.append("满分描述仍承认有要求、约束或功能未完成")
+        if not PERFECT_ACTION_RE.search(description) or not PERFECT_RESULT_RE.search(description):
+            errors.append("满分描述必须写明具体验证动作及客观结果")
+        if VAGUE_PERFECT_CLAIM_RE.search(description) and not PRECISE_LOCATION_RE.search(description):
+            errors.append("满分描述不能只写笼统的全部通过，必须给出精确来源位置")
+    elif score < 5:
+        if not NON_MAX_EVIDENCE_RE.search(description):
+            errors.append("非满分描述必须给出具体文件、函数、命令、测试或行号定位")
+        if not NON_MAX_IMPACT_RE.search(description):
+            errors.append("非满分描述必须说明可观察的工程后果")
+        if GENERIC_LOCATION_RE.search(description):
+            errors.append("非满分描述不能只写泛化的文件或测试位置")
+        if field == "planning_description" and VAGUE_LIST_RE.search(description) and not LIST_ITEM_RE.search(description):
+            errors.append("规划描述引用清单时必须点出清单中的具体项目")
+        if re.search(r"(?:耗时|成本|代价|返工|等待(?!者))", description) and not OBJECTIVE_OUTCOME_RE.search(description):
+            errors.append("不能只写耗时或成本，必须说明客观工程后果")
+        if field == "planning_description" and not PLANNING_EVIDENCE_RE.search(description):
+            errors.append("规划描述缺少计划、拆解或状态追踪证据")
+        if field == "reasoning_description" and not REASONING_PREMISE_RE.search(description):
+            errors.append("推理描述没有指出错误前提、推断或遗漏分支")
+        if field == "reasoning_description" and REASONING_WRONG_ATTRIBUTION_RE.search(description):
+            errors.append("推理描述不能把扣分归因于环境、网络或发现时机")
+        if field == "execution_description":
+            if not EXECUTION_TOOL_ACTION_RE.search(description):
+                errors.append("执行描述缺少具体工具或命令动作")
+            if not EXECUTION_FOLLOWUP_RE.search(description):
+                errors.append("执行描述缺少重试、恢复或复验过程")
+            if VAGUE_FAILURE_RE.search(description) and not EXACT_FAILURE_RE.search(description):
+                errors.append("执行描述报告失败时必须写出具体错误、命令或测试结果")
+    return errors
+
+
 def validate_one(
     record: dict,
     require_human_qc: bool = False,
@@ -181,6 +283,14 @@ def validate_one(
     record_id = str(record.get("record_id") or "<unknown>")
     errors: list[str] = []
     warnings: list[str] = []
+    quality_contract_version = record.get("quality_contract_version", 1)
+    if (
+        isinstance(quality_contract_version, bool)
+        or not isinstance(quality_contract_version, int)
+        or quality_contract_version < 1
+    ):
+        errors.append(f"{record_id}: quality_contract_version must be a positive integer")
+        quality_contract_version = 1
     required_text = (
         "record_id", "user_prompt", "session_id", "turn_id", "initial_snapshot",
         "trajectory_file", "harness_version", "languages", "submitter",
@@ -231,6 +341,11 @@ def validate_one(
         else:
             for style_error in _description_style_errors(description):
                 errors.append(f"{record_id}: {prefix}_description {style_error}")
+            if quality_contract_version >= CURRENT_QUALITY_CONTRACT_VERSION:
+                for score_error in _score_description_errors(
+                    record.get(f"{prefix}_score"), f"{prefix}_description", description
+                ):
+                    errors.append(f"{record_id}: {prefix}_description {score_error}")
     descriptions = [
         re.sub(r"\s+", "", str(record.get(f"{prefix}_description", "")))
         for prefix in SCORE_PREFIXES
@@ -352,7 +467,7 @@ def validate_one(
                 time(14, 0),
                 PROJECT_TIMEZONE,
             )
-        if submitted_local > deadline:
+        if submitted_local > deadline and not late_delivery_allowed():
             errors.append(
                 f"{record_id}: submitted after project deadline {deadline.isoformat()}"
             )

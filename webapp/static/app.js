@@ -309,14 +309,15 @@ function renderReviews() {
       const changes = JSON.parse(record.delivery_qc_changes || "[]");
       if (Array.isArray(changes) && changes.length) qcChanges = `<details class="qc-changes"><summary>自动质检修改记录（${changes.length}）</summary><pre>${escapeHtml(JSON.stringify(changes, null, 2))}</pre></details>`;
     } catch {}
-    const solo2Eligible = Boolean(record.can_solo2_submit || (
+    const acceptedDifficulty = ["困难", "地狱"].includes(record.difficulty);
+    const solo2Eligible = acceptedDifficulty && Boolean(record.can_solo2_submit || (
       record.delivery_qc_passed && record.delivery_qc_note === "质检通过" &&
       record.evidence_gate_passed && record.history_gate_passed &&
       !record.history_matches.length && record.human_qc_approved &&
       record.review_method === "human" &&
       !["succeeded", "submitting", "remote_pending_fix"].includes(record.solo2_status)
     ));
-    const solo2Preparable = record.ready_for_review &&
+    const solo2Preparable = acceptedDifficulty && record.ready_for_review &&
       !["succeeded", "submitting", "remote_pending_fix"].includes(record.solo2_status);
     const submitLabel = record.solo2_status === "succeeded" ? "已提交此条" :
       record.solo2_status === "submitting" ? "正在提交" :
@@ -582,7 +583,7 @@ function renderScheduler() {
   $("#scheduler-git").textContent = `${git.branch || "无分支"} @ ${git.commit || "未知"}${git.dirty ? " · 有未提交修改" : ""}`;
   const config = snapshot.config || {};
   const weights = Object.entries(config.difficulty_weights || {}).filter(([, value]) => Number(value) > 0).map(([key, value]) => `${key} ${value}%`).join(" / ");
-  $("#scheduler-config-summary").textContent = `每批 ${config.batch_size || 10} 道 · 并发 ${config.model_concurrency || 2} · ${weights || "中等 100%"}`;
+  $("#scheduler-config-summary").textContent = `每批 ${config.batch_size || 10} 道 · 并发 ${config.model_concurrency || 2} · ${weights || "困难 70% / 地狱 30%"}`;
   const containers = snapshot.containers || [];
   $("#scheduler-containers").innerHTML = containers.length ? containers.map((container) => `<div class="scheduler-container"><i data-lucide="box"></i><div><strong>${escapeHtml(container.name)}</strong><span>${escapeHtml(container.image)} · ${escapeHtml(container.status)}</span></div></div>`).join("") : `<div class="empty-state compact-empty"><strong>当前没有运行中的容器</strong></div>`;
   const cycles = snapshot.cycles || [];
@@ -778,7 +779,7 @@ function renderSettings() {
   $("#config-key-hint").textContent = state.config.api_key_hint || "";
   $("#config-github-token").value = "";
   $("#config-github-token-hint").textContent = state.config.github_token_hint || "";
-  renderDifficultyWeights(state.config.author_difficulty_weights || { 中等: 100 });
+  renderDifficultyWeights(state.config.author_difficulty_weights || { 困难: 70, 地狱: 30 });
   $("#config-author-batch-size").value = state.config.author_batch_size || 10;
   $("#config-model-mode").value = state.config.model_mode || "local";
   $("#config-docker-image").value = state.config.docker_image || "claude-cli:latest";
@@ -851,7 +852,7 @@ async function detectCapacity() {
 }
 
 function renderDifficultyWeights(weights) {
-  ["中等", "困难", "地狱"].forEach((difficulty) => {
+  ["困难", "地狱"].forEach((difficulty) => {
     const enabled = $(`.difficulty-enabled[data-difficulty="${difficulty}"]`);
     const input = $(`.difficulty-weight[data-difficulty="${difficulty}"]`);
     const weight = Number(weights[difficulty] || 0);
@@ -863,7 +864,7 @@ function renderDifficultyWeights(weights) {
 }
 
 function collectDifficultyWeights() {
-  return Object.fromEntries(["中等", "困难", "地狱"].map((difficulty) => {
+  return Object.fromEntries(["困难", "地狱"].map((difficulty) => {
     const enabled = $(`.difficulty-enabled[data-difficulty="${difficulty}"]`).checked;
     const weight = Number($(`.difficulty-weight[data-difficulty="${difficulty}"]`).value);
     return [difficulty, enabled ? weight : 0];
@@ -877,8 +878,8 @@ function updateDifficultyTotal() {
   element.classList.toggle("invalid", total !== 100);
 }
 
-function difficultySummary(count, weights = state.config?.author_difficulty_weights || { 中等: 100 }) {
-  const enabled = ["中等", "困难", "地狱"].filter((difficulty) => Number(weights[difficulty]) > 0);
+function difficultySummary(count, weights = state.config?.author_difficulty_weights || { 困难: 70, 地狱: 30 }) {
+  const enabled = ["困难", "地狱"].filter((difficulty) => Number(weights[difficulty]) > 0);
   const total = enabled.reduce((sum, difficulty) => sum + Number(weights[difficulty]), 0) || 1;
   const rows = enabled.map((difficulty, order) => {
     const raw = count * Number(weights[difficulty]) / total;

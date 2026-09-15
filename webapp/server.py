@@ -69,7 +69,7 @@ PIPELINE_ENV_KEYS = (
     "CC_SOLO2_MAX_ATTEMPTS",
 )
 NEWS_URL_MAX = 20
-AUTHOR_DIFFICULTIES = ("中等", "困难", "地狱")
+AUTHOR_DIFFICULTIES = ("困难", "地狱")
 AUTHOR_JOB_OUTPUT_LIMIT = 200_000
 AUTHOR_JOB_STATUSES = {"queued", "running", "completed", "failed", "interrupted"}
 
@@ -77,6 +77,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from tools.runtime_environment import docker_info, process_alive, repair_docker_engine  # noqa: E402
 from tools.capacity import concurrency_recommendation as scheduler_capacity  # noqa: E402
 from tools.batch_pipeline import SCHEMA_VERSION, connect as initialize_database  # noqa: E402
+from tools.delivery_records import CURRENT_QUALITY_CONTRACT_VERSION  # noqa: E402
 from tools.authoring_policy import backend_only_requirement  # noqa: E402
 from tools.scheduler_state import SchedulerStore  # noqa: E402
 from tools.run_supervisor import read_supervisor_state  # noqa: E402
@@ -621,7 +622,7 @@ class ConsoleData:
     @classmethod
     def author_prompt(cls, batch: str, count: int, business: str, technology: str, notes: str,
                       mode: str = "0-1", task_type: str = "0-1 代码生成", mother: dict | None = None,
-                      derived_notes: str = "", defect_tolerance: str = "", difficulty: object = "中等") -> str:
+                      derived_notes: str = "", defect_tolerance: str = "", difficulty: object = "困难") -> str:
         difficulty_plan = cls._author_difficulty_plan(difficulty)
         difficulty_text = cls._difficulty_prompt(count, difficulty_plan)
         technology_label = "Docker 要求" if technology in {"需要 Docker", "不需要 Docker"} else "技术关键词"
@@ -1136,7 +1137,7 @@ class ConsoleData:
                 mother = dict(row)
         env = self.read_env()
         difficulty = self._author_difficulty_plan(
-            env.get("CC_AUTHOR_DIFFICULTY_WEIGHTS", ""), env.get("CC_AUTHOR_DIFFICULTY", "中等")
+            env.get("CC_AUTHOR_DIFFICULTY_WEIGHTS", ""), env.get("CC_AUTHOR_DIFFICULTY", "困难")
         )
         prompt = self.author_prompt(batch, count, business, technology, notes, mode, task_type, mother, derived_notes, defect_tolerance, difficulty)
         timestamp = datetime.now().astimezone().isoformat(timespec="seconds")
@@ -1870,7 +1871,7 @@ class ConsoleData:
         return max(1, min(value, 20))
 
     @staticmethod
-    def _author_difficulty_plan(raw: object, legacy: object = "中等") -> dict[str, int]:
+    def _author_difficulty_plan(raw: object, legacy: object = "困难") -> dict[str, int]:
         """Normalize selected authoring difficulties to positive integer weights."""
         parsed: object = None
         if isinstance(raw, str) and raw.strip():
@@ -1881,7 +1882,7 @@ class ConsoleData:
         elif isinstance(raw, dict):
             parsed = raw
         if not isinstance(parsed, dict):
-            parsed = {str(legacy or "中等").strip() or "中等": 100}
+            parsed = {str(legacy or "困难").strip() or "困难": 100}
         plan: dict[str, int] = {}
         for difficulty in AUTHOR_DIFFICULTIES:
             value = parsed.get(difficulty, 0)
@@ -1891,7 +1892,7 @@ class ConsoleData:
                 weight = 0
             if weight > 0:
                 plan[difficulty] = weight
-        return plan or {"中等": 100}
+        return plan or {"困难": 100}
 
     @staticmethod
     def _difficulty_counts(count: int, plan: dict[str, int]) -> dict[str, int]:
@@ -1928,7 +1929,7 @@ class ConsoleData:
         key = values["CC_SWITCH_API_KEY"]
         github_token = values.get("CC_GITHUB_TOKEN", "")
         difficulty_plan = self._author_difficulty_plan(
-            values.get("CC_AUTHOR_DIFFICULTY_WEIGHTS", ""), values.get("CC_AUTHOR_DIFFICULTY", "中等")
+            values.get("CC_AUTHOR_DIFFICULTY_WEIGHTS", ""), values.get("CC_AUTHOR_DIFFICULTY", "困难")
         )
         def env_int(name: str, default: int) -> int:
             try:
@@ -2190,7 +2191,7 @@ class ConsoleData:
             "author_difficulty_weights": body.get(
                 "author_difficulty_weights",
                 self._author_difficulty_plan(
-                    current.get("CC_AUTHOR_DIFFICULTY_WEIGHTS", ""), current.get("CC_AUTHOR_DIFFICULTY", "中等")
+                    current.get("CC_AUTHOR_DIFFICULTY_WEIGHTS", ""), current.get("CC_AUTHOR_DIFFICULTY", "困难")
                 ),
             ),
             "author_batch_size": body.get("author_batch_size", current.get("CC_AUTHOR_BATCH_SIZE", "10") or "10"),
@@ -2207,6 +2208,12 @@ class ConsoleData:
         raw_difficulty_plan = incoming["author_difficulty_weights"]
         if not isinstance(raw_difficulty_plan, dict):
             raise ValueError("出题难度比例配置无效")
+        rejected = [
+            difficulty for difficulty in ("简单", "中等")
+            if str(raw_difficulty_plan.get(difficulty, 0)).strip() not in {"", "0"}
+        ]
+        if rejected:
+            raise ValueError("甲方已停止接收简单和中等题，出题难度只能选择困难或地狱")
         difficulty_plan: dict[str, int] = {}
         for difficulty in AUTHOR_DIFFICULTIES:
             raw_weight = raw_difficulty_plan.get(difficulty, 0)
@@ -2696,7 +2703,10 @@ class ConsoleData:
                     and not solo2_submitted and not bool(row["maintenance_mode"]),
                     "can_finish_takeover": bool(row["maintenance_mode"]),
                     "can_reset": run_count > 0 and not solo2_submitted,
-                    "can_solo2_submit": human_qc and not solo2_submitted,
+                    "can_solo2_submit": (
+                        row["difficulty"] in AUTHOR_DIFFICULTIES
+                        and human_qc and not solo2_submitted
+                    ),
                 })
 
         total = len(questions)
@@ -3118,7 +3128,8 @@ class ConsoleData:
                            "review_method=''", "delivery_qc_passed=0", "delivery_qc_note=''", "delivery_qc_checked_at=''",
                            "delivery_qc_changes='[]'", "evidence_gate_passed=0", "evidence_checked_at=''",
                            "history_gate_passed=0", "history_checked_at=''",
-                           "evidence_ledger_sha256=''", "evidence_qc_report='{}'"])
+                           "evidence_ledger_sha256=''", "evidence_qc_report='{}'",
+                           f"quality_contract_version={CURRENT_QUALITY_CONTRACT_VERSION}"])
             values = [candidate[f"{name}_score"] for name in dimensions] + [candidate[f"{name}_description"] for name in dimensions]
             values.extend([candidate["other_issues"], candidate["evidence_ledger"], candidate["requirement_coverage"], record_id])
             before = {
@@ -3396,11 +3407,9 @@ class ConsoleData:
             ).fetchone()
         if batch_row is None:
             raise ValueError("batch does not exist")
-        trajectory_root = Path(batch_row["folder_path"]).absolute() / ".runs"
         script = self.project_root / ".agents/skills/cc-usr-excel-exporter/scripts/export_xlsx.py"
         command = [
             sys.executable, str(script), "--db", str(self.database), "--batch", batch_name,
-            "--claude-root", str(trajectory_root),
         ]
         if selected:
             command.extend(["--select", ",".join(map(str, selected))])

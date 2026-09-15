@@ -19,7 +19,16 @@ SKILL_PATH_RE = re.compile(
 )
 CONFIG_PATH_RE = re.compile(
     r"(?i)(?:CLAUDE\.md|AGENTS\.md|\.claude[/\\]+settings(?:\.local)?\.json|"
-    r"\.codex[/\\]+config\.toml)"
+    r"\.codex[/\\]+config\.toml|(?:^|[/\\])\.env(?:\.[A-Za-z0-9_.-]+)?)"
+)
+MEMORY_CONTAMINATION_RE = re.compile(
+    r"(?i)(?:wrote[\"'”’]?\s+in\s+my\s+head|"
+    r"(?:remember|recall)(?:ed)?\s+(?:this|the)\s+(?:project|repo|task)\s+from\s+"
+    r"(?:a|the)?\s*previous\s+(?:session|conversation|run)|"
+    r"already\s+(?:knew|know)\s+(?:this|the)\s+(?:project|repo|task)\s+from\s+"
+    r"(?:a|the)?\s*previous\s+(?:session|conversation|run)|"
+    r"(?:上一次|上一轮|此前)(?:会话|对话|运行)(?:里|中)?(?:已经|曾经)?(?:写过|知道|记得)|"
+    r"(?:早就|已经)记得(?:这个|该)(?:项目|仓库|任务))"
 )
 
 
@@ -191,6 +200,13 @@ def _trajectory_metrics(
             continue
         if not isinstance(message, dict) or message.get("model") == "<synthetic>":
             continue
+        assistant_text = "\n".join(_event_strings(content))
+        memory_match = MEMORY_CONTAMINATION_RE.search(assistant_text)
+        if memory_match:
+            excerpt = re.sub(r"\s+", " ", memory_match.group(0)).strip()
+            raise TrajectoryGateError(
+                f"{path.name} 包含未经工作区验证的历史记忆表述：{excerpt}"
+            )
         meaningful = False
         for block in blocks:
             order += 1

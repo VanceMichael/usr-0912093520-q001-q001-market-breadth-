@@ -62,6 +62,7 @@ def _records(
     pending_only: bool = False,
 ) -> list[sqlite3.Row]:
     clauses = [
+        "q.difficulty IN ('困难','地狱')",
         "r.delivery_qc_passed=1", "r.delivery_qc_note='质检通过'",
         "r.evidence_gate_passed=1", "r.history_gate_passed=1",
         "r.human_qc_approved=1", "r.review_method='human'",

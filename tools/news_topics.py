@@ -14,7 +14,7 @@ import sqlite3
 import sys
 import urllib.request
 from html.parser import HTMLParser
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlsplit, urlunsplit
 import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
@@ -212,8 +212,21 @@ def fetch(source_url: str, timeout: int = 20) -> list[dict[str, str]]:
 
 
 def topic_hash(item: dict[str, str]) -> str:
-    value = re.sub(r"\s+", " ", f"{item['title']} {item['article_url']}".lower()).strip()
+    value = re.sub(
+        r"\s+", " ", f"{item.get('title', '')} {item.get('summary', '')}".lower()
+    ).strip()
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def canonical_article_url(value: str) -> str:
+    """Remove fragments and common tracking parameters before URL deduplication."""
+    parsed = urlsplit(value.strip())
+    query = urlencode([
+        (key, item) for key, item in parse_qsl(parsed.query, keep_blank_values=True)
+        if not key.casefold().startswith("utm_")
+        and key.casefold() not in {"spm", "from", "source", "src"}
+    ])
+    return urlunsplit((parsed.scheme.casefold(), parsed.netloc.casefold(), parsed.path, query, ""))
 
 
 def configured_feeds(database: Path, *, enabled_only: bool = True) -> list[str]:
@@ -259,10 +272,17 @@ def ingest_report(
                 parsed += len(items)
                 for item in items:
                     item = {**item, "source_url": source_url}
+                    item["article_url"] = canonical_article_url(str(item["article_url"]))
                     timestamp = now()
                     result = connection.execute(
-                        "INSERT OR IGNORE INTO news_topics(source_url,article_url,title,summary,published_at,topic_hash,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)",
-                        (item["source_url"], item["article_url"], item["title"], item["summary"], item["published_at"], topic_hash(item), timestamp, timestamp),
+                        "INSERT OR IGNORE INTO news_topics(source_url,article_url,title,summary,published_at,topic_hash,created_at,updated_at) "
+                        "SELECT ?,?,?,?,?,?,?,? WHERE NOT EXISTS("
+                        "SELECT 1 FROM news_topics WHERE article_url=? OR topic_hash=? LIMIT 1)",
+                        (
+                            item["source_url"], item["article_url"], item["title"], item["summary"],
+                            item["published_at"], topic_hash(item), timestamp, timestamp,
+                            item["article_url"], topic_hash(item),
+                        ),
                     )
                     if result.rowcount == 1:
                         added += 1

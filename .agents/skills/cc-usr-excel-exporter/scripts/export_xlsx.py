@@ -273,14 +273,16 @@ def registered_trajectory_roots(
         question_no = int(record["question_no"])
         row = connection.execute(
             "SELECT trajectory_root FROM runs WHERE question_id=? AND status='succeeded' "
-            "AND (session_id=? OR session_id='') "
-            "ORDER BY CASE WHEN session_id=? THEN 0 ELSE 1 END,id DESC LIMIT 1",
-            (record["question_id"], record["session_id"], record["session_id"]),
+            "AND session_id=? ORDER BY id DESC LIMIT 1",
+            (record["question_id"], record["session_id"]),
         ).fetchone()
         if row is not None and row["trajectory_root"]:
             roots.setdefault(question_no, []).append(Path(row["trajectory_root"]))
         else:
-            roots.setdefault(question_no, []).append(Path.home() / ".claude/projects")
+            raise ValueError(
+                f"record {record['record_id']} has no authoritative trajectory root "
+                "registered on its succeeded run"
+            )
     return roots
 
 
@@ -316,6 +318,10 @@ def main() -> int:
         connection = connect(args.db.resolve())
         batch = batch_row(connection, args.batch)
         records = load_database_records(connection, args.batch)
+        records = [
+            record for record in records
+            if str(record.get("difficulty") or "") in {"困难", "地狱"}
+        ]
         if args.select:
             selected_questions = parse_selection(
                 args.select, question_rows(connection, args.batch)

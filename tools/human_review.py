@@ -9,6 +9,7 @@ from contextlib import closing
 from pathlib import Path
 
 from tools.batch_pipeline import connect, now
+from tools.authoring_policy import DELIVERABLE_DIFFICULTIES
 from tools.delivery_quality import (
     DIMENSIONS,
     evidence_fingerprint,
@@ -52,7 +53,7 @@ def review_queue(
             where = "WHERE b.name=?"
             parameters.append(batch)
         rows = connection.execute(
-            "SELECT r.*,q.task_id,q.question_no,q.title,b.name AS batch_name,"
+            "SELECT r.*,q.task_id,q.question_no,q.title,q.difficulty,b.name AS batch_name,"
             "s.status AS solo2_status,s.attempt_count AS solo2_attempt_count,"
             "s.last_error AS solo2_last_error,s.remote_submission_id AS solo2_remote_id,"
             "s.updated_at AS solo2_updated_at "
@@ -98,7 +99,8 @@ def review_queue(
             record["solo2_remote_id"] = str(record.get("solo2_remote_id") or "")
             record["solo2_updated_at"] = str(record.get("solo2_updated_at") or "")
             record["can_solo2_submit"] = bool(
-                record["delivery_qc_passed"]
+                record["difficulty"] in DELIVERABLE_DIFFICULTIES
+                and record["delivery_qc_passed"]
                 and record.get("delivery_qc_note") == "质检通过"
                 and record["evidence_gate_passed"]
                 and record["history_gate_passed"]
